@@ -1,7 +1,8 @@
 use spin::Lazy;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
-use crate::io::interrupts::gdt;
-use crate::println;
+use crate::io::interrupts::{gdt, pic};
+use crate::io::interrupts::pic::InterruptIndex;
+use crate::{print, println};
 use crate::vga_buffer::{Color, ColorCode, WRITER};
 
 pub static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
@@ -11,6 +12,7 @@ pub static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
         idt.double_fault.set_handler_fn(double_fault_handler)
             .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
     };
+    idt[InterruptIndex::Timer.as_u8()].set_handler_fn(timer_interrupt_handler);
     idt
 });
 const EXCEPTION_COLOR: Lazy<ColorCode> = Lazy::new(|| {
@@ -49,4 +51,11 @@ extern "x86-interrupt" fn double_fault_handler(
 fn test_breakpoint_exception() {
     // invoke a breakpoint exception
     x86_64::instructions::interrupts::int3();
+}
+
+extern "x86-interrupt" fn timer_interrupt_handler(
+    _stack_frame: InterruptStackFrame)
+{
+    print!(".");
+    pic::notify_end_of_interrupt(&InterruptIndex::Timer);
 }

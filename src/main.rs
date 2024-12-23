@@ -19,9 +19,10 @@ pub extern "C" fn _start() -> ! {
     WRITER.lock().clear();
     println!("Hello, World!");
     WRITER.lock().set_color(ColorCode::new(Color::White, Color::Red));
-    println!("Hello, World!");
     // panic!("Some panic message");
-    loop {}
+    loop {
+        println!("Hello, World!");
+    }
 }
 
 #[cfg(test)]
