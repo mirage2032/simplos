@@ -5,24 +5,25 @@
 #![reexport_test_harness_main = "test_main"]
 
 use core::panic::PanicInfo;
+use bootloader::{entry_point, BootInfo};
 #[allow(unused_imports)]
 use simplos::{print, println, serial_print, serial_println};
 use simplos::io::video::vga_buffer::{Color, ColorCode, WRITER};
 
-#[unsafe(no_mangle)]
+entry_point!(kernel_main);
 #[allow(unreachable_code)]
-pub extern "C" fn _start() -> ! {
+fn kernel_main(boot_info: &'static BootInfo) -> ! {
     simplos::init();
     #[cfg(test)]
     test_main();
-    start();
+    start(boot_info);
 }
 
-fn start() -> ! {
-    let ptr = 0xdeadbeaf as *mut u8;
-    unsafe { *ptr = 42; }
+fn start(boot_info: &'static BootInfo) -> ! {
+    // let ptr = 0xdeadbeaf as *mut u8;
+    // unsafe { *ptr = 42; }
     WRITER.lock().set_color(ColorCode::new(Color::Yellow, Color::Black));
-    WRITER.lock().clear();
+    // WRITER.lock().clear();
     println!("Hello, World!");
     WRITER.lock().set_color(ColorCode::new(Color::White, Color::Red));
     // panic!("Some panic message");

@@ -1,3 +1,4 @@
+use pc_keyboard::KeyEvent;
 use spin::{Lazy, Mutex};
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 use crate::io::interrupts::{gdt, pic};
@@ -15,6 +16,7 @@ pub static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     };
     idt[InterruptIndex::Timer.as_u8()].set_handler_fn(timer_interrupt_handler);
     idt[InterruptIndex::Keyboard.as_u8()].set_handler_fn(keyboard_interrupt_handler);
+    idt[InterruptIndex::Ps2Mouse.as_u8()].set_handler_fn(mouse_interrupt_handler);
     idt
 });
 const EXCEPTION_COLOR: Lazy<ColorCode> = Lazy::new(|| {
@@ -58,8 +60,20 @@ fn test_breakpoint_exception() {
 extern "x86-interrupt" fn timer_interrupt_handler(
     _stack_frame: InterruptStackFrame)
 {
-    print!(".");
-    pic::notify_end_of_interrupt(&InterruptIndex::Timer);
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut writer = WRITER.lock();
+        use core::fmt::Write;
+        let mut pos = writer.get_size();
+        // write!(writer, ".k{:?}",pos).unwrap();
+        pos.0 = 0;
+        pos.1 -= 1;
+        let current = writer.get_at(pos.0,pos.1);
+        let old_bg_color_val:u8 = current.color_code.get_background().into();
+        let new_color_val = (old_bg_color_val+1)%16;
+        let new_color:ColorCode = ColorCode::new(Color::from(new_color_val), Color::from(new_color_val));
+        writer.write_byte_color_at(b' ', pos.0, pos.1, new_color);
+        pic::notify_end_of_interrupt(&InterruptIndex::Timer);
+    });
 }
 
 extern "x86-interrupt" fn keyboard_interrupt_handler(
@@ -95,4 +109,11 @@ extern "x86-interrupt" fn page_fault_handler(
     println!("Error Code: {:?}", error_code);
     println!("{:#?}", stack_frame);
     crate::hlt_loop();
+}
+
+extern "x86-interrupt" fn mouse_interrupt_handler(
+    _stack_frame: InterruptStackFrame)
+{
+    println!("MOUSE INTERRUPT");
+    pic::notify_end_of_interrupt(&InterruptIndex::Ps2Mouse);
 }

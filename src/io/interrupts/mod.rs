@@ -1,3 +1,5 @@
+use x86_64::instructions::port::Port;
+
 pub mod gdt;
 pub mod pic;
 pub mod idt;

@@ -49,6 +49,12 @@ impl From<u8> for Color {
     }
 }
 
+impl From<Color> for u8 {
+    fn from(value: Color) -> u8 {
+        value as u8
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(transparent)]
 pub struct ColorCode(u8);
@@ -69,11 +75,23 @@ impl ColorCode {
     }
 }
 
+impl From<u8> for ColorCode {
+    fn from(value: u8) -> Self {
+        ColorCode(value)
+    }
+}
+
+impl From<ColorCode> for u8 {
+    fn from(value: ColorCode) -> u8 {
+        value.0
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
-struct ScreenChar {
-    ascii_character: u8,
-    color_code: ColorCode,
+pub struct ScreenChar {
+    pub ascii_character: u8,
+    pub color_code: ColorCode,
 }
 
 const BUFFER_HEIGHT: usize = 25;
@@ -102,8 +120,8 @@ impl Writer {
         writer
     }
 
-    pub fn size(&self) -> (usize, usize) {
-        (self.width, self.height)
+    pub fn get_size(&self) -> (usize, usize) {
+        (self.height, self.width)
     }
 
     pub fn set_color(&mut self, color_code: ColorCode) {
@@ -120,6 +138,10 @@ impl Writer {
 
     pub fn write_byte_at(&mut self, byte: u8, row: usize, col: usize) {
         self.write_byte_color_at(byte, row, col, self.default_color_code)
+    }
+    
+    pub fn get_at(&self, row: usize, col: usize) -> ScreenChar {
+        self.buffer.chars[row][col].read()
     }
 
     pub fn write_byte_color_at(&mut self, byte: u8, row: usize, col: usize, color_code: ColorCode) {
