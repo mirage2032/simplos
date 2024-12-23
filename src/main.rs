@@ -15,14 +15,16 @@ pub extern "C" fn _start() -> ! {
     simplos::init();
     #[cfg(test)]
     test_main();
+    start();
+}
+
+fn start() -> ! {
     WRITER.lock().set_color(ColorCode::new(Color::Yellow, Color::Black));
     WRITER.lock().clear();
     println!("Hello, World!");
     WRITER.lock().set_color(ColorCode::new(Color::White, Color::Red));
     // panic!("Some panic message");
-    loop {
-        println!("Hello, World!");
-    }
+    simplos::hlt_loop();
 }
 
 #[cfg(test)]
