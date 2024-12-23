@@ -13,7 +13,7 @@ use core::panic::PanicInfo;
 use io::utils::qemu::{exit_qemu, QemuExitCode};
 
 pub fn init() {
-    io::interrupts::init_idt();
+    io::interrupts::init_interrupts();
 }
 
 #[cfg(test)]

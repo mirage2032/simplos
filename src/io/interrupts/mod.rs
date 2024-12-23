@@ -1,4 +1,5 @@
-use core::cell::OnceCell;
+mod gdt;
+
 use spin::Lazy;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
 use crate::println;
@@ -7,9 +8,14 @@ use crate::vga_buffer::{Color, ColorCode, WRITER};
 pub static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     let mut idt =InterruptDescriptorTable::new();
     idt.breakpoint.set_handler_fn(breakpoint_handler);
+    unsafe {
+        idt.double_fault.set_handler_fn(double_fault_handler)
+            .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
+    };
     idt
 });
-pub fn init_idt() {
+pub fn init_interrupts() {
+    gdt::init_gdt();
     IDT.load();
 }
 
@@ -26,6 +32,19 @@ extern "x86-interrupt" fn breakpoint_handler(
     println!("{:#?}", stack_frame);
     WRITER.lock().set_color(default_color);
     WRITER.lock().new_line();
+}
+
+extern "x86-interrupt" fn double_fault_handler(
+    stack_frame: InterruptStackFrame, _error_code: u64) -> !
+{
+    let default_color = WRITER.lock().get_color();
+    WRITER.lock().set_color(*EXCEPTION_COLOR);
+    WRITER.lock().new_line();
+    println!("EXCEPTION: DOUBLE FAULT");
+    println!("{:#?}", stack_frame);
+    WRITER.lock().set_color(default_color);
+    WRITER.lock().new_line();
+    loop {}
 }
 
 #[test_case]

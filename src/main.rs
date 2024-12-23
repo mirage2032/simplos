@@ -13,11 +13,17 @@ use simplos::io::video::vga_buffer::{Color, ColorCode, WRITER};
 #[allow(unreachable_code)]
 pub extern "C" fn _start() -> ! {
     simplos::init();
+    WRITER.lock().set_color(ColorCode::new(Color::Yellow, Color::Black));
+    WRITER.lock().clear();
+    fn dad(){
+        dad();
+    }
+    dad();
     println!("Hello, World!");
     #[cfg(test)]
     test_main();
-    x86_64::instructions::interrupts::int3();
     println!("Hello, World!");
+    panic!("Some panic message");
     loop {}
 }
 
@@ -36,7 +42,7 @@ fn panic(info: &PanicInfo) -> ! {
 #[allow(unreachable_code)]
 fn panic(info: &PanicInfo) -> ! {
     let title_color = ColorCode::new(Color::Yellow, Color::Red);
-    let message_color = ColorCode::new(Color::Yellow, Color::Blue);
+    let message_color = ColorCode::new(Color::Yellow, Color::DarkGray);
     WRITER.lock().set_color(title_color);
     WRITER.lock().new_line();
     println!("Kernel panic!");
