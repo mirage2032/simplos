@@ -1,4 +1,4 @@
-mod gdt;
+pub mod gdt;
 
 use spin::Lazy;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};

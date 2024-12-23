@@ -13,15 +13,11 @@ use simplos::io::video::vga_buffer::{Color, ColorCode, WRITER};
 #[allow(unreachable_code)]
 pub extern "C" fn _start() -> ! {
     simplos::init();
-    WRITER.lock().set_color(ColorCode::new(Color::Yellow, Color::Black));
-    WRITER.lock().clear();
-    fn dad(){
-        dad();
-    }
-    dad();
-    println!("Hello, World!");
     #[cfg(test)]
     test_main();
+    WRITER.lock().set_color(ColorCode::new(Color::Yellow, Color::Black));
+    WRITER.lock().clear();
+    println!("Hello, World!");
     println!("Hello, World!");
     panic!("Some panic message");
     loop {}
