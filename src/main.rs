@@ -18,8 +18,9 @@ pub extern "C" fn _start() -> ! {
     WRITER.lock().set_color(ColorCode::new(Color::Yellow, Color::Black));
     WRITER.lock().clear();
     println!("Hello, World!");
+    WRITER.lock().set_color(ColorCode::new(Color::White, Color::Red));
     println!("Hello, World!");
-    panic!("Some panic message");
+    // panic!("Some panic message");
     loop {}
 }
 
