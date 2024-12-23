@@ -19,6 +19,8 @@ pub extern "C" fn _start() -> ! {
 }
 
 fn start() -> ! {
+    let ptr = 0xdeadbeaf as *mut u8;
+    unsafe { *ptr = 42; }
     WRITER.lock().set_color(ColorCode::new(Color::Yellow, Color::Black));
     WRITER.lock().clear();
     println!("Hello, World!");
