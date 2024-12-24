@@ -1,6 +1,9 @@
+use bitfield_struct::bitfield;
 use pc_keyboard::KeyEvent;
 use spin::{Lazy, Mutex};
+use x86_64::instructions::port::Port;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
+use x86_64::structures::port::PortRead;
 use crate::io::interrupts::{gdt, pic};
 use crate::io::interrupts::pic::InterruptIndex;
 use crate::{print, println};
@@ -62,9 +65,7 @@ extern "x86-interrupt" fn timer_interrupt_handler(
 {
     x86_64::instructions::interrupts::without_interrupts(|| {
         let mut writer = WRITER.lock();
-        use core::fmt::Write;
         let mut pos = writer.get_size();
-        // write!(writer, ".k{:?}",pos).unwrap();
         pos.0 = 0;
         pos.1 -= 1;
         let current = writer.get_at(pos.0,pos.1);
@@ -111,9 +112,68 @@ extern "x86-interrupt" fn page_fault_handler(
     crate::hlt_loop();
 }
 
+
+#[bitfield(u8)]
+struct MouseFlags{
+    #[bits(1)]
+    left_button:bool,
+    #[bits(1)]
+    right_button:bool,
+    #[bits(1)]
+    middle_button:bool,
+    #[bits(1)]
+    valid:bool,
+    #[bits(1)]
+    x_sign:bool,
+    #[bits(1)]
+    y_sign:bool,
+    #[bits(1)]
+    x_overflow:bool,
+    #[bits(1)]
+    y_overflow:bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+struct MouseData{
+    flags:MouseFlags,
+    delta_x:i8,
+    delta_y:i8,
+    fourth:u8,
+}
+
+impl PortRead for MouseData{
+    unsafe fn read_from_port(port: u16) -> Self {
+        let mut port = Port::new(port);
+        let flags = MouseFlags(port.read());
+        let delta_x = port.read() as i8;
+        let delta_y = port.read() as i8;
+        let fourth: u8 = port.read();
+        // println!("Fourth:{}",fourth);
+        MouseData{
+            flags,
+            delta_x,
+            delta_y,
+            fourth
+        }
+    }
+}
 extern "x86-interrupt" fn mouse_interrupt_handler(
-    _stack_frame: InterruptStackFrame)
+    stack_frame: InterruptStackFrame)
 {
-    println!("MOUSE INTERRUPT");
+    let writer_color = WRITER.lock().get_color();
+    WRITER.lock().set_color(EXCEPTION_COLOR.clone());
+    let mut port:Port<MouseData> = Port::new(0x60);
+    unsafe {
+        let port_data = port.read();
+        if port_data.flags.valid() {
+            println!("Mouse Delta: {} - {}",port_data.delta_x,port_data.delta_y);
+            // println!("Valid mouse packet: left:{},right:{},middle:{} - {:#b}", port_data.flags.left_button(),port_data.flags.right_button(),port_data.flags.middle_button(), port_data.flags.0);
+        }
+        else{
+            // println!("Invalid mouse packet received")
+        }
+    }
+    WRITER.lock().set_color(writer_color);
     pic::notify_end_of_interrupt(&InterruptIndex::Ps2Mouse);
 }
