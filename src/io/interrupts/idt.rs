@@ -1,20 +1,22 @@
+use crate::io::interrupts::pic::InterruptIndex;
+use crate::io::interrupts::{gdt, pic};
+use crate::io::ps2::{PS2_CONTROLLER, Ps2InterruptCause};
+use crate::vga_buffer::{Color, ColorCode, WRITER};
+use crate::{print, println, serial_println};
 use bitfield_struct::bitfield;
 use pc_keyboard::KeyEvent;
 use spin::{Lazy, Mutex};
 use x86_64::instructions::port::Port;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 use x86_64::structures::port::PortRead;
-use crate::io::interrupts::{gdt, pic};
-use crate::io::interrupts::pic::InterruptIndex;
-use crate::{print, println};
-use crate::vga_buffer::{Color, ColorCode, WRITER};
 
 pub static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
-    let mut idt =InterruptDescriptorTable::new();
+    let mut idt = InterruptDescriptorTable::new();
     idt.breakpoint.set_handler_fn(breakpoint_handler);
     idt.page_fault.set_handler_fn(page_fault_handler);
     unsafe {
-        idt.double_fault.set_handler_fn(double_fault_handler)
+        idt.double_fault
+            .set_handler_fn(double_fault_handler)
             .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
     };
     idt[InterruptIndex::Timer.as_u8()].set_handler_fn(timer_interrupt_handler);
@@ -22,12 +24,9 @@ pub static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     idt[InterruptIndex::Ps2Mouse.as_u8()].set_handler_fn(mouse_interrupt_handler);
     idt
 });
-const EXCEPTION_COLOR: Lazy<ColorCode> = Lazy::new(|| {
-    ColorCode::new(Color::LightRed, Color::Black)
-});
-extern "x86-interrupt" fn breakpoint_handler(
-    stack_frame: InterruptStackFrame)
-{
+const EXCEPTION_COLOR: Lazy<ColorCode> =
+    Lazy::new(|| ColorCode::new(Color::LightRed, Color::Black));
+extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
     let default_color = WRITER.lock().get_color();
     WRITER.lock().set_color(*EXCEPTION_COLOR);
     WRITER.lock().new_line();
@@ -42,8 +41,9 @@ pub fn init_idt() {
 }
 
 extern "x86-interrupt" fn double_fault_handler(
-    stack_frame: InterruptStackFrame, _error_code: u64) -> !
-{
+    stack_frame: InterruptStackFrame,
+    _error_code: u64,
+) -> ! {
     let default_color = WRITER.lock().get_color();
     WRITER.lock().set_color(*EXCEPTION_COLOR);
     WRITER.lock().new_line();
@@ -60,44 +60,49 @@ fn test_breakpoint_exception() {
     x86_64::instructions::interrupts::int3();
 }
 
-extern "x86-interrupt" fn timer_interrupt_handler(
-    _stack_frame: InterruptStackFrame)
-{
-    x86_64::instructions::interrupts::without_interrupts(|| {
-        let mut writer = WRITER.lock();
-        let mut pos = writer.get_size();
-        pos.0 = 0;
-        pos.1 -= 1;
-        let current = writer.get_at(pos.0,pos.1);
-        let old_bg_color_val:u8 = current.color_code.get_background().into();
-        let new_color_val = (old_bg_color_val+1)%16;
-        let new_color:ColorCode = ColorCode::new(Color::from(new_color_val), Color::from(new_color_val));
+extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    let mut writer = WRITER.lock();
+    let mut pos = writer.get_size();
+    pos.0 = 0;
+    pos.1 -= 1;
+    unsafe {
+        static mut color: u8 = 0;
+        color = (color + 1) % 16;
+        let new_color: ColorCode = ColorCode::new(Color::from(color), Color::from(color));
         writer.write_byte_color_at(b' ', pos.0, pos.1, new_color);
-        pic::notify_end_of_interrupt(&InterruptIndex::Timer);
-    });
+    }
+    pic::notify_end_of_interrupt(&InterruptIndex::Timer);
 }
 
-extern "x86-interrupt" fn keyboard_interrupt_handler(
-    _stack_frame: InterruptStackFrame)
-{
-    use x86_64::instructions::port::Port;
-    use pc_keyboard::{layouts, DecodedKey, HandleControl, Keyboard, ScancodeSet1};
+extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    use pc_keyboard::{DecodedKey, HandleControl, Keyboard, ScancodeSet1, layouts};
 
+    // x86_64::instructions::interrupts::without_interrupts(|| {
     static KEYBOARD: Lazy<Mutex<Keyboard<layouts::Us104Key, ScancodeSet1>>> = Lazy::new(|| {
-        Mutex::new(Keyboard::new(ScancodeSet1::new(), layouts::Us104Key, HandleControl::Ignore))
+        Mutex::new(Keyboard::new(
+            ScancodeSet1::new(),
+            layouts::Us104Key,
+            HandleControl::Ignore,
+        ))
     });
-    let mut keyboard = KEYBOARD.lock();
-    let mut port = Port::new(0x60);
-    let scancode: u8 = unsafe { port.read() };
-    if let Ok(Some(key_event)) = keyboard.add_byte(scancode) {
-        if let Some(key) = keyboard.process_keyevent(key_event) {
-            match key {
-                DecodedKey::Unicode(character) => print!("{}", character),
-                DecodedKey::RawKey(key) => print!("{:?}", key),
+    let mut controller = PS2_CONTROLLER.lock();
+    let data_available = controller.output_has_data();
+    let from_keyboard = controller.interrupt_cause() == Ps2InterruptCause::Keyboard;
+    if data_available && from_keyboard {
+        let mut keyboard = KEYBOARD.lock();
+        if let Ok(scancode) = controller.controller_mut().read_data() {
+            if let Ok(Some(key_event)) = keyboard.add_byte(scancode) {
+                if let Some(key) = keyboard.process_keyevent(key_event) {
+                    match key {
+                        DecodedKey::Unicode(character) => print!("{}", character),
+                        DecodedKey::RawKey(key) => print!("{:?}", key),
+                    }
+                }
             }
         }
     }
     pic::notify_end_of_interrupt(&InterruptIndex::Keyboard);
+    // });
 }
 extern "x86-interrupt" fn page_fault_handler(
     stack_frame: InterruptStackFrame,
@@ -111,69 +116,25 @@ extern "x86-interrupt" fn page_fault_handler(
     println!("{:#?}", stack_frame);
     crate::hlt_loop();
 }
-
-
-#[bitfield(u8)]
-struct MouseFlags{
-    #[bits(1)]
-    left_button:bool,
-    #[bits(1)]
-    right_button:bool,
-    #[bits(1)]
-    middle_button:bool,
-    #[bits(1)]
-    valid:bool,
-    #[bits(1)]
-    x_sign:bool,
-    #[bits(1)]
-    y_sign:bool,
-    #[bits(1)]
-    x_overflow:bool,
-    #[bits(1)]
-    y_overflow:bool,
-}
-
-#[derive(Debug, Clone, Copy)]
-#[repr(C)]
-struct MouseData{
-    flags:MouseFlags,
-    delta_x:i8,
-    delta_y:i8,
-    fourth:u8,
-}
-
-impl PortRead for MouseData{
-    unsafe fn read_from_port(port: u16) -> Self {
-        let mut port = Port::new(port);
-        let flags = MouseFlags(port.read());
-        let delta_x = port.read() as i8;
-        let delta_y = port.read() as i8;
-        let fourth: u8 = port.read();
-        // println!("Fourth:{}",fourth);
-        MouseData{
-            flags,
-            delta_x,
-            delta_y,
-            fourth
-        }
-    }
-}
-extern "x86-interrupt" fn mouse_interrupt_handler(
-    stack_frame: InterruptStackFrame)
-{
+extern "x86-interrupt" fn mouse_interrupt_handler(stack_frame: InterruptStackFrame) {
+    // x86_64::instructions::interrupts::without_interrupts(|| {
     let writer_color = WRITER.lock().get_color();
-    WRITER.lock().set_color(EXCEPTION_COLOR.clone());
-    let mut port:Port<MouseData> = Port::new(0x60);
-    unsafe {
-        let port_data = port.read();
-        if port_data.flags.valid() {
-            println!("Mouse Delta: {} - {}",port_data.delta_x,port_data.delta_y);
-            // println!("Valid mouse packet: left:{},right:{},middle:{} - {:#b}", port_data.flags.left_button(),port_data.flags.right_button(),port_data.flags.middle_button(), port_data.flags.0);
-        }
-        else{
-            // println!("Invalid mouse packet received")
+    WRITER.lock().set_color(*EXCEPTION_COLOR);
+    let mut controller = PS2_CONTROLLER.lock();
+    let data_available = controller.output_has_data();
+    let from_mouse = controller.interrupt_cause() == Ps2InterruptCause::Mouse;
+    if data_available && from_mouse {
+        match controller.controller_mut().mouse().read_data_packet() {
+            Ok((flags, x, y)) => {
+                println!("x:{},y:{}", x, y);
+            }
+            Err(err) => {
+                // FIXME: WHY also getting a bad response
+                println!("DAFUQ:{:?}", err);
+            }
         }
     }
     WRITER.lock().set_color(writer_color);
     pic::notify_end_of_interrupt(&InterruptIndex::Ps2Mouse);
+    // });
 }

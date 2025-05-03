@@ -7,5 +7,4 @@ pub fn init_interrupts() {
     gdt::init_gdt();
     idt::init_idt();
     pic::init_pics();
-    pic::enable_interrupts();
 }

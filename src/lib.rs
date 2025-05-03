@@ -15,6 +15,9 @@ use io::utils::qemu::{exit_qemu, QemuExitCode};
 
 pub fn init() {
     io::interrupts::init_interrupts();
+    io::ps2::ps2_controller_init();
+    io::interrupts::pic::config_pics();
+    x86_64::instructions::interrupts::enable();
 }
 
 #[cfg(test)]
