@@ -10,8 +10,15 @@ pub use io::video::vga_buffer;
 pub use io::serial;
 
 use core::panic::PanicInfo;
-use bootloader::{entry_point, BootInfo};
+use bootloader_api::{entry_point, BootInfo};
 use io::utils::qemu::{exit_qemu, QemuExitCode};
+use bootloader_api::config::{BootloaderConfig, Mapping};
+
+pub static BOOTLOADER_CONFIG: BootloaderConfig = {
+    let mut config = BootloaderConfig::new_default();
+    config.mappings.physical_memory = Some(Mapping::Dynamic);
+    config
+};
 
 pub fn init() {
     io::interrupts::init_interrupts();
@@ -21,9 +28,9 @@ pub fn init() {
 }
 
 #[cfg(test)]
-entry_point!(test_kernel_main);
+entry_point!(test_kernel_main, config = &BOOTLOADER_CONFIG);
 #[cfg(test)]
-fn test_kernel_main(boot_info: &'static BootInfo) -> ! {
+fn test_kernel_main(boot_info: &'static mut BootInfo) -> ! {
     init();
     test_main();
     hlt_loop()
