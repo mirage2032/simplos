@@ -50,20 +50,20 @@ pub fn init_pics() {
 
 pub fn config_pics(){
     // Read the current interrupt masks
-    let mut masks = unsafe { PICS.lock().read_masks() };
-    println!("{:#b}-{:#b}",masks[0],masks[1]);
-
-    // Unmask IRQ2 on PIC1 (cascade line) and IRQ12 on PIC2 (mouse interrupt)
-    let pic2_bit = !(1 << 2);  // Bit 2 corresponds to IRQ2
-    let mouse_bit = !(1 << (12 % 8)); // Bit 4 corresponds to IRQ12
-    masks[0] &= pic2_bit;      // Clear the mask for IRQ2 on PIC1
-    masks[1] &= mouse_bit;     // Clear the mask for IRQ12 on PIC2
-    masks[0] |= 0b11111001;
-    masks[1] |= 0b11101111;
-    println!("{:#b}-{:#b}",masks[0],masks[1]);
-
-    // Write the updated masks back to the PICs
-    unsafe { PICS.lock().write_masks(masks[0], masks[1]) };
+    // let mut masks = unsafe { PICS.lock().read_masks() };
+    // println!("{:#b}-{:#b}",masks[0],masks[1]);
+    // 
+    // // Unmask IRQ2 on PIC1 (cascade line) and IRQ12 on PIC2 (mouse interrupt)
+    // let pic2_bit = !(1 << 2);  // Bit 2 corresponds to IRQ2
+    // let mouse_bit = !(1 << (12 % 8)); // Bit 4 corresponds to IRQ12
+    // masks[0] &= pic2_bit;      // Clear the mask for IRQ2 on PIC1
+    // masks[1] &= mouse_bit;     // Clear the mask for IRQ12 on PIC2
+    // masks[0] |= 0b11111001;
+    // masks[1] |= 0b11101111;
+    // println!("{:#b}-{:#b}",masks[0],masks[1]);
+    // 
+    // // Write the updated masks back to the PICs
+    // unsafe { PICS.lock().write_masks(masks[0], masks[1]) };
 }
 
 pub fn disable_interrupts() {

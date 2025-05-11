@@ -27,6 +27,7 @@ impl Ps2Controller {
 
         // Step 5: Set config
         let mut config = controller.read_config()?;
+        // Disable interrupts and scancode translation
         config.set(
             ControllerConfigFlags::ENABLE_KEYBOARD_INTERRUPT
                 | ControllerConfigFlags::ENABLE_MOUSE_INTERRUPT
@@ -37,16 +38,19 @@ impl Ps2Controller {
 
         // Step 6: Controller self-test
         controller.test_controller()?;
+        // Write config again in case of controller reset
         controller.write_config(config)?;
 
         // Step 7: Determine if there are 2 devices
         let has_mouse = if config.contains(ControllerConfigFlags::DISABLE_MOUSE) {
             controller.enable_mouse()?;
             config = controller.read_config()?;
+            // If mouse is working, this should now be unset
             !config.contains(ControllerConfigFlags::DISABLE_MOUSE)
         } else {
             false
         };
+        // Disable mouse. If there's no mouse, this is ignored
         controller.disable_mouse()?;
 
         // Step 8: Interface tests
@@ -56,17 +60,23 @@ impl Ps2Controller {
         // Step 9 - 10: Enable and reset devices
         config = controller.read_config()?;
         if keyboard_works {
-            if let Err(_)=Self::initialize_keyboard(&mut controller, &mut config){
-                panic!("Failed to initialize keyboard");
-            }
+            controller.enable_keyboard()?;
+            config.set(ControllerConfigFlags::DISABLE_KEYBOARD, false);
+            config.set(ControllerConfigFlags::ENABLE_KEYBOARD_INTERRUPT, true);
+            controller.keyboard().reset_and_self_test().unwrap();
         }
         if mouse_works {
-            if let Err(_)=Self::initialize_mouse(&mut controller, &mut config){
-                panic!("Failed to initialize mouse");
-            }
+            controller.enable_mouse()?;
+            config.set(ControllerConfigFlags::DISABLE_MOUSE, false);
+            config.set(ControllerConfigFlags::ENABLE_MOUSE_INTERRUPT, true);
+            controller.mouse().reset_and_self_test().unwrap();
+            // This will start streaming events from the mouse
+            controller.mouse().enable_data_reporting().unwrap();
         }
 
+        // Write last configuration to enable devices and interrupts
         controller.write_config(config)?;
+
         Ok(Ps2Controller { controller })
     }
 
