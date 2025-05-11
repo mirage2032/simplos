@@ -3,10 +3,27 @@ use std::path::PathBuf;
 fn main() {
     // set by cargo, build scripts should use this directory for output files
     let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
-    // set by cargo's artifact dependency feature, see
+    // set by cargo's artifact dependency feature, see0x8000008490
     // https://doc.rust-lang.org/nightly/cargo/reference/unstable.html#artifact-dependencies
-    let kernel = PathBuf::from(std::env::var_os("CARGO_BIN_FILE_KERNEL_kernel").unwrap());
-
+    //panic with all env vars
+    // panic!("env vars: {:?}", std::env::vars());
+    // "/home/alx/simplos/target/x86_64-unknown-none/debug/deps/artifact/simplos-b1fd25d037f61c13/bin/simplos-b1fd25d037f61c13"
+    let kernel = PathBuf::from(std::env::var_os("CARGO_BIN_FILE_SIMPLOS_simplos").unwrap());
+    //manifest dir
+    let manifest_dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    let gdbinit_path = manifest_dir.join(".gdbinit");
+    let gdbinit_content = format!(
+        "file /home/alx/simplos/target/x86_64-unknown-none/debug/deps/artifact/simplos-b1fd25d037f61c13/bin/simplos-b1fd25d037f61c13\n\
+        add-symbol-file {} -o 0x8000000000",
+         kernel.to_string_lossy()
+    );
+    std::fs::write(&gdbinit_path, gdbinit_content).unwrap();
+    let lldbinit_path = manifest_dir.join(".lldbinit");
+    let lldbinit_content = format!(
+        "target modules load --file {} --slide 0x8000000000",
+            kernel.to_string_lossy()
+    );
+    std::fs::write(&lldbinit_path, lldbinit_content).unwrap();
     // create an UEFI disk image (optional)
     let uefi_path = out_dir.join("uefi.img");
     bootloader::UefiBoot::new(&kernel).create_disk_image(&uefi_path).unwrap();

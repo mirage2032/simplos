@@ -13,6 +13,7 @@ use simplos::io::video::vga_buffer::{Color, ColorCode, WRITER};
 
 entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 #[allow(unreachable_code)]
+#[unsafe(no_mangle)]
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     simplos::init();
     #[cfg(test)]
@@ -20,6 +21,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     start(boot_info);
 }
 
+#[unsafe(no_mangle)]
 fn start(boot_info: &'static mut BootInfo) -> ! {
     // let ptr = 0xdeadbeaf as *mut u8;
     // unsafe { *ptr = 42; }

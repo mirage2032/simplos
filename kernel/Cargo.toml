@@ -10,7 +10,7 @@ panic = "abort"
 panic = "abort"
 
 [dependencies]
-bootloader = { version = "0.9.29", features = ["map_physical_memory"]}
+bootloader_api = {git = "https://github.com/rust-osdev/bootloader.git"}
 volatile = "0.2.6"
 spin = "0.9.8"
 x86_64 = "0.15.1"

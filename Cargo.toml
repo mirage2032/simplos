@@ -1,9 +1,10 @@
 [package]
 name = "simplos-os"         # or any other name
 version = "0.1.0"
+edition = "2024"
 
 [build-dependencies]
-bootloader = "0.11"
+bootloader = {git = "https://github.com/rust-osdev/bootloader.git"}
 simplos = {path="kernel",artifact = "bin", target = "x86_64-unknown-none" }
 [dependencies]
 # used for UEFI booting in QEMU

@@ -17,6 +17,7 @@ use bootloader_api::config::{BootloaderConfig, Mapping};
 pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
     config.mappings.physical_memory = Some(Mapping::Dynamic);
+    config.mappings.kernel_base = Mapping::FixedAddress(0x8000000000);
     config
 };
 

@@ -66,15 +66,8 @@ dependencies = [
 
 [[package]]
 name = "bootloader"
-version = "0.9.31"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "974e79cf1b0b737839f01330fb5393095daf1124d52693696494e32523ae9ef5"
-
-[[package]]
-name = "bootloader"
 version = "0.11.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "718ebb60a92a2e37f9c6c6ab26f0adfd117aa6f1a8cd08d07bbd5a7762ff0812"
+source = "git+https://github.com/rust-osdev/bootloader.git#6fa89e7be42fbe324a657362daa3f45ed13aaa3c"
 dependencies = [
  "anyhow",
  "bootloader-boot-config",
@@ -89,11 +82,15 @@ dependencies = [
 [[package]]
 name = "bootloader-boot-config"
 version = "0.11.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a4ff46e7fd938aa06b17d44dce17f605105da3df01b1ae8a7f02d248c9b12f6"
+source = "git+https://github.com/rust-osdev/bootloader.git#6fa89e7be42fbe324a657362daa3f45ed13aaa3c"
 dependencies = [
  "serde",
 ]
+
+[[package]]
+name = "bootloader_api"
+version = "0.11.10"
+source = "git+https://github.com/rust-osdev/bootloader.git#6fa89e7be42fbe324a657362daa3f45ed13aaa3c"
 
 [[package]]
 name = "byteorder"
@@ -391,7 +388,7 @@ name = "simplos"
 version = "0.1.0"
 dependencies = [
  "bitfield-struct",
- "bootloader 0.9.31",
+ "bootloader_api",
  "pc-keyboard",
  "pic8259",
  "ps2",
@@ -405,7 +402,7 @@ dependencies = [
 name = "simplos-os"
 version = "0.1.0"
 dependencies = [
- "bootloader 0.11.10",
+ "bootloader",
  "ovmf-prebuilt",
  "simplos",
 ]

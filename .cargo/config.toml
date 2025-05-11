@@ -1,2 +1,4 @@
+[build]
+rustflags=["-g"]
 [unstable]
 bindeps=true

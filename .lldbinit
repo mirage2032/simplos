@@ -1,0 +1,1 @@
+target modules load --file /home/alx/simplos/target/x86_64-unknown-none/debug/deps/artifact/simplos-17956fcf3937cdb1/bin/simplos-17956fcf3937cdb1 --slide 0x8000000000
