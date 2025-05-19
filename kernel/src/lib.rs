@@ -4,15 +4,22 @@
 #![feature(abi_x86_interrupt)]
 #![test_runner(crate::test_runner)]
 #![reexport_test_harness_main = "test_main"]
+extern crate alloc;
 
 pub mod io;
-pub use io::video::vga_buffer;
+pub mod memory;
+mod allocator;
+
+// pub use io::video::vga_buffer;
 pub use io::serial;
 
 use core::panic::PanicInfo;
 use bootloader_api::{entry_point, BootInfo};
 use io::utils::qemu::{exit_qemu, QemuExitCode};
 use bootloader_api::config::{BootloaderConfig, Mapping};
+use x86_64::VirtAddr;
+use crate::io::init_io;
+use crate::memory::BootInfoFrameAllocator;
 
 pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
@@ -21,18 +28,20 @@ pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     config
 };
 
-pub fn init() {
-    io::interrupts::init_interrupts();
-    io::ps2::ps2_controller_init();
-    io::interrupts::pic::config_pics();
-    x86_64::instructions::interrupts::enable();
+pub fn pre_init(boot_info: &'static mut BootInfo){
+    let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.take().expect("No physical memory offset found"));
+    let mut mapper = unsafe { memory::init(phys_mem_offset) };
+    let mut frame_allocator = unsafe { BootInfoFrameAllocator::init(&boot_info.memory_regions) };
+    allocator::init_heap(&mut mapper, &mut frame_allocator).expect("heap initialization failed");
+    let fb = boot_info.framebuffer.take().expect("No framebuffer found");
+    init_io(fb);
 }
 
 #[cfg(test)]
 entry_point!(test_kernel_main, config = &BOOTLOADER_CONFIG);
 #[cfg(test)]
 fn test_kernel_main(boot_info: &'static mut BootInfo) -> ! {
-    init();
+    pre_init(boot_info);
     test_main();
     hlt_loop()
 }

@@ -14,16 +14,20 @@ fn main() {
     let gdbinit_path = manifest_dir.join(".gdbinit");
     let gdbinit_content = format!(
         "file /home/alx/simplos/target/x86_64-unknown-none/debug/deps/artifact/simplos-b1fd25d037f61c13/bin/simplos-b1fd25d037f61c13\n\
-        add-symbol-file {} -o 0x8000000000",
+        add-symbol-file {} -o 0x8000000000\
+        ",
          kernel.to_string_lossy()
     );
+    println!("cargo:rerun-if-changed={}", gdbinit_path.display());
     std::fs::write(&gdbinit_path, gdbinit_content).unwrap();
     let lldbinit_path = manifest_dir.join(".lldbinit");
     let lldbinit_content = format!(
-        "target modules load --file {} --slide 0x8000000000",
+        "target modules load --file {} --slide 0x8000000000\
+        ",
             kernel.to_string_lossy()
     );
     std::fs::write(&lldbinit_path, lldbinit_content).unwrap();
+    println!("cargo:rerun-if-changed={}", lldbinit_path.display());
     // create an UEFI disk image (optional)
     let uefi_path = out_dir.join("uefi.img");
     bootloader::UefiBoot::new(&kernel).create_disk_image(&uefi_path).unwrap();

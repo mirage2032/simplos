@@ -2,7 +2,7 @@ use ps2::error::{ControllerError, KeyboardError, MouseError};
 use ps2::flags::ControllerConfigFlags;
 use ps2::{Controller, Mouse, MouseType};
 use spin::{Lazy, Mutex};
-use crate::{println, serial_println};
+// use crate::{println, serial_println};
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub enum Ps2InterruptCause {

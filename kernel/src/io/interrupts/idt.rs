@@ -1,8 +1,8 @@
 use crate::io::interrupts::pic::InterruptIndex;
 use crate::io::interrupts::{gdt, pic};
 use crate::io::ps2::{PS2_CONTROLLER, Ps2InterruptCause};
-use crate::vga_buffer::{Color, ColorCode, WRITER};
-use crate::{print, println, serial_println};
+// use crate::vga_buffer::{Color, ColorCode, WRITER};
+// use crate::{print, println, serial_println};
 use bitfield_struct::bitfield;
 use pc_keyboard::KeyEvent;
 use spin::{Lazy, Mutex};
@@ -24,16 +24,17 @@ pub static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     idt[InterruptIndex::Ps2Mouse.as_u8()].set_handler_fn(mouse_interrupt_handler);
     idt
 });
-const EXCEPTION_COLOR: Lazy<ColorCode> =
-    Lazy::new(|| ColorCode::new(Color::LightRed, Color::Black));
+// const EXCEPTION_COLOR: Lazy<ColorCode> =
+//     Lazy::new(|| ColorCode::new(Color::LightRed, Color::Black));
 extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
-    let default_color = WRITER.lock().get_color();
-    WRITER.lock().set_color(*EXCEPTION_COLOR);
-    WRITER.lock().new_line();
-    println!("EXCEPTION: BREAKPOINT");
-    println!("{:#?}", stack_frame);
-    WRITER.lock().set_color(default_color);
-    WRITER.lock().new_line();
+    // let default_color = WRITER.lock().get_color();
+    // WRITER.lock().set_color(*EXCEPTION_COLOR);
+    // WRITER.lock().new_line();
+    // println!("EXCEPTION: BREAKPOINT");
+    // println!("{:#?}", stack_frame);
+    // WRITER.lock().set_color(default_color);
+    // WRITER.lock().new_line();
+    panic!("EXCEPTION: BREAKPOINT");
 }
 
 pub fn init_idt() {
@@ -44,13 +45,13 @@ extern "x86-interrupt" fn double_fault_handler(
     stack_frame: InterruptStackFrame,
     _error_code: u64,
 ) -> ! {
-    let default_color = WRITER.lock().get_color();
-    WRITER.lock().set_color(*EXCEPTION_COLOR);
-    WRITER.lock().new_line();
-    println!("EXCEPTION: DOUBLE FAULT");
-    println!("{:#?}", stack_frame);
-    WRITER.lock().set_color(default_color);
-    WRITER.lock().new_line();
+    // let default_color = WRITER.lock().get_color();
+    // WRITER.lock().set_color(*EXCEPTION_COLOR);
+    // WRITER.lock().new_line();
+    // println!("EXCEPTION: DOUBLE FAULT");
+    // println!("{:#?}", stack_frame);
+    // WRITER.lock().set_color(default_color);
+    // WRITER.lock().new_line();
     loop {}
 }
 
@@ -61,16 +62,16 @@ fn test_breakpoint_exception() {
 }
 
 extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
-    let mut writer = WRITER.lock();
-    let mut pos = writer.get_size();
-    pos.0 = 0;
-    pos.1 -= 1;
-    unsafe {
-        static mut color: u8 = 0;
-        color = (color + 1) % 16;
-        let new_color: ColorCode = ColorCode::new(Color::from(color), Color::from(color));
-        writer.write_byte_color_at(b' ', pos.0, pos.1, new_color);
-    }
+    // let mut writer = WRITER.lock();
+    // let mut pos = writer.get_size();
+    // pos.0 = 0;
+    // pos.1 -= 1;
+    // unsafe {
+    //     static mut color: u8 = 0;
+    //     color = (color + 1) % 16;
+    //     let new_color: ColorCode = ColorCode::new(Color::from(color), Color::from(color));
+    //     writer.write_byte_color_at(b' ', pos.0, pos.1, new_color);
+    // }
     pic::notify_end_of_interrupt(&InterruptIndex::Timer);
 }
 
@@ -93,10 +94,10 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
         if let Ok(scancode) = controller.controller_mut().read_data() {
             if let Ok(Some(key_event)) = keyboard.add_byte(scancode) {
                 if let Some(key) = keyboard.process_keyevent(key_event) {
-                    match key {
-                        DecodedKey::Unicode(character) => print!("{}", character),
-                        DecodedKey::RawKey(key) => print!("{:?}", key),
-                    }
+                    // match key {
+                    //     DecodedKey::Unicode(character) => print!("{}", character),
+                    //     DecodedKey::RawKey(key) => print!("{:?}", key),
+                    // }
                 }
             }
         }
@@ -110,31 +111,31 @@ extern "x86-interrupt" fn page_fault_handler(
 ) {
     use x86_64::registers::control::Cr2;
 
-    println!("EXCEPTION: PAGE FAULT");
-    println!("Accessed Address: {:?}", Cr2::read());
-    println!("Error Code: {:?}", error_code);
-    println!("{:#?}", stack_frame);
+    // println!("EXCEPTION: PAGE FAULT");
+    // println!("Accessed Address: {:?}", Cr2::read());
+    // println!("Error Code: {:?}", error_code);
+    // println!("{:#?}", stack_frame);
     crate::hlt_loop();
 }
 extern "x86-interrupt" fn mouse_interrupt_handler(stack_frame: InterruptStackFrame) {
     // x86_64::instructions::interrupts::without_interrupts(|| {
-    let writer_color = WRITER.lock().get_color();
-    WRITER.lock().set_color(*EXCEPTION_COLOR);
+    // let writer_color = WRITER.lock().get_color();
+    // WRITER.lock().set_color(*EXCEPTION_COLOR);
     let mut controller = PS2_CONTROLLER.lock();
     let data_available = controller.output_has_data();
     let from_mouse = controller.interrupt_cause() == Ps2InterruptCause::Mouse;
     if data_available && from_mouse {
         match controller.controller_mut().mouse().read_data_packet() {
             Ok((flags, x, y)) => {
-                println!("x:{},y:{}", x, y);
+                // println!("x:{},y:{}", x, y);
             }
             Err(err) => {
                 // FIXME: WHY also getting a bad response
-                println!("DAFUQ:{:?}", err);
+                // println!("DAFUQ:{:?}", err);
             }
         }
     }
-    WRITER.lock().set_color(writer_color);
+    // WRITER.lock().set_color(writer_color);
     pic::notify_end_of_interrupt(&InterruptIndex::Ps2Mouse);
     // });
 }
