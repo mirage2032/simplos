@@ -9,6 +9,8 @@ use spin::{Lazy, Mutex};
 use x86_64::instructions::port::Port;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 use x86_64::structures::port::PortRead;
+use crate::BOOT_INFO;
+use crate::io::video::VIDEO;
 
 pub static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     let mut idt = InterruptDescriptorTable::new();
@@ -62,16 +64,21 @@ fn test_breakpoint_exception() {
 }
 
 extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
-    // let mut writer = WRITER.lock();
-    // let mut pos = writer.get_size();
-    // pos.0 = 0;
-    // pos.1 -= 1;
-    // unsafe {
-    //     static mut color: u8 = 0;
-    //     color = (color + 1) % 16;
-    //     let new_color: ColorCode = ColorCode::new(Color::from(color), Color::from(color));
-    //     writer.write_byte_color_at(b' ', pos.0, pos.1, new_color);
-    // }
+    {
+        let video = VIDEO.lock();
+        let video_buffer = video.get_buffer();
+        unsafe { 
+            let mut fb = (*BOOT_INFO).framebuffer.as_mut().expect("Could not get boot info");
+            let mut buf = fb.buffer_mut();
+            //memcpy from buffer to buf
+            let mut i = 0;
+            while i < video_buffer.len() {
+                buf[i] = video_buffer[i];
+                i += 1;
+            }
+        };
+        
+    }
     pic::notify_end_of_interrupt(&InterruptIndex::Timer);
 }
 

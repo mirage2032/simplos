@@ -5,6 +5,7 @@
 #![reexport_test_harness_main = "test_main"]
 extern crate alloc;
 
+use alloc::fmt::format;
 use alloc::format;
 use alloc::string::ToString;
 use core::ops::DerefMut;
@@ -14,7 +15,9 @@ use embedded_graphics::Drawable;
 use embedded_graphics::geometry::{Dimensions, Point};
 use embedded_graphics::mono_font::ascii::FONT_10X20;
 use embedded_graphics::mono_font::MonoTextStyle;
-use embedded_graphics::pixelcolor::{BinaryColor, Rgb888};
+use embedded_graphics::pixelcolor::{BinaryColor, Rgb888, RgbColor};
+use embedded_graphics::prelude::Primitive;
+use embedded_graphics::primitives::PrimitiveStyleBuilder;
 use embedded_graphics::text::{Alignment, Text};
 #[allow(unused_imports)]
 use simplos::BOOTLOADER_CONFIG;
@@ -34,21 +37,20 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 #[unsafe(no_mangle)]
 fn start() -> ! {
     {
-        let mut v = VIDEO.lock();
-        let mut val = 0;
-        loop {
-            if let Some(ref mut buffers) = v.buffers {
-                buffers.framebuffer.lock().clear(&Rgb888::new(val, val, val));
-                let character_style = MonoTextStyle::new(&FONT_10X20, BinaryColor::On);
-                let pos = buffers.textbuffer.lock().bounding_box().center();
-                Text::with_alignment(
-                    "Banana",
-                        pos,
-                        character_style,
-                        Alignment::Center,
-                ).draw(buffers.textbuffer.lock().deref_mut()).unwrap();
-            }
-            val = val.wrapping_add(1);
+        let mut video = VIDEO.lock();
+        let clear_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::BLUE).build();
+        let text_pospos = video.bounding_box().center();
+        let character_style = MonoTextStyle::new(&FONT_10X20, Rgb888::WHITE);
+        let mut val =0;
+        loop{
+            video.bounding_box().into_styled(clear_style).draw(video.deref_mut()).expect("Failed to clear screen");
+            Text::with_alignment(
+                &format!("Banana {val}"),
+                text_pospos,
+                character_style,
+                Alignment::Center,
+            ).draw(video.deref_mut()).expect("Failed to draw text");
+            val += 1;
         }
     }
     // let ptr = 0xdeadbeaf as *mut u8;

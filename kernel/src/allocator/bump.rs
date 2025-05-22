@@ -11,7 +11,7 @@ pub struct BumpAllocator {
 
 impl BumpAllocator {
     /// Creates a new empty bump allocator.
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         BumpAllocator {
             heap_start: 0,
             heap_end: 0,

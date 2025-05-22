@@ -11,21 +11,24 @@ fn main() {
     let kernel = PathBuf::from(std::env::var_os("CARGO_BIN_FILE_SIMPLOS_simplos").unwrap());
     //manifest dir
     let manifest_dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
-    let gdbinit_path = manifest_dir.join(".gdbinit");
+    let gdbinit_path = manifest_dir.join("../.gdbinit");
     let gdbinit_content = format!(
         "file {}\n\
-        add-symbol-file {} -o 0x8000000000\
+        set architecture i386:x86-64\n\
+        add-symbol-file {} -o 0x8000000000\n\
         ",
          kernel.to_string_lossy(),
          kernel.to_string_lossy()
     );
     println!("cargo:rerun-if-changed={}", gdbinit_path.display());
     std::fs::write(&gdbinit_path, gdbinit_content).unwrap();
-    let lldbinit_path = manifest_dir.join(".lldbinit");
+    let lldbinit_path = manifest_dir.join("../.lldbinit");
     let lldbinit_content = format!(
-        "target modules load --file {} --slide 0x8000000000\
+        "target create {}\n\
+        target modules load --file {} --slide 0x8000000000\n\
         ",
-            kernel.to_string_lossy()
+        kernel.to_string_lossy(),
+        kernel.to_string_lossy()
     );
     std::fs::write(&lldbinit_path, lldbinit_content).unwrap();
     println!("cargo:rerun-if-changed={}", lldbinit_path.display());
