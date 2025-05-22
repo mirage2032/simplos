@@ -7,9 +7,15 @@ extern crate alloc;
 
 use alloc::format;
 use alloc::string::ToString;
+use core::ops::DerefMut;
 use core::panic::PanicInfo;
 use bootloader_api::{entry_point, BootInfo};
-use embedded_graphics::pixelcolor::{Rgb888};
+use embedded_graphics::Drawable;
+use embedded_graphics::geometry::{Dimensions, Point};
+use embedded_graphics::mono_font::ascii::FONT_10X20;
+use embedded_graphics::mono_font::MonoTextStyle;
+use embedded_graphics::pixelcolor::{BinaryColor, Rgb888};
+use embedded_graphics::text::{Alignment, Text};
 #[allow(unused_imports)]
 use simplos::BOOTLOADER_CONFIG;
 use simplos::io::video::VIDEO;
@@ -33,6 +39,14 @@ fn start() -> ! {
         loop {
             if let Some(ref mut buffers) = v.buffers {
                 buffers.framebuffer.lock().clear(&Rgb888::new(val, val, val));
+                let character_style = MonoTextStyle::new(&FONT_10X20, BinaryColor::On);
+                let pos = buffers.textbuffer.lock().bounding_box().center();
+                Text::with_alignment(
+                    "Banana",
+                        pos,
+                        character_style,
+                        Alignment::Center,
+                ).draw(buffers.textbuffer.lock().deref_mut()).unwrap();
             }
             val = val.wrapping_add(1);
         }

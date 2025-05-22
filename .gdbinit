@@ -1,2 +1,2 @@
-file /home/alx/simplos/target/x86_64-unknown-none/debug/deps/artifact/simplos-b1fd25d037f61c13/bin/simplos-b1fd25d037f61c13
+file /home/alx/simplos/target/x86_64-unknown-none/debug/deps/artifact/simplos-fbdb55eb0c3dfd28/bin/simplos-fbdb55eb0c3dfd28
 add-symbol-file /home/alx/simplos/target/x86_64-unknown-none/debug/deps/artifact/simplos-fbdb55eb0c3dfd28/bin/simplos-fbdb55eb0c3dfd28 -o 0x8000000000

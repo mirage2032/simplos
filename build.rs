@@ -13,9 +13,10 @@ fn main() {
     let manifest_dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let gdbinit_path = manifest_dir.join(".gdbinit");
     let gdbinit_content = format!(
-        "file /home/alx/simplos/target/x86_64-unknown-none/debug/deps/artifact/simplos-b1fd25d037f61c13/bin/simplos-b1fd25d037f61c13\n\
+        "file {}\n\
         add-symbol-file {} -o 0x8000000000\
         ",
+         kernel.to_string_lossy(),
          kernel.to_string_lossy()
     );
     println!("cargo:rerun-if-changed={}", gdbinit_path.display());

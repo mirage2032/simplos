@@ -34,7 +34,7 @@ impl DrawTarget for Textbuffer {
                 BinaryColor::Off => Rgb888::new(255, 255, 255),
             };
             self.framebuffer.upgrade().expect("No framebuffer for text buffer")
-                .lock().borrow_mut().set_pixel(coord.x as usize, coord.y as usize, &col);
+                .lock().borrow_mut().set_pixel(coord.y as usize, coord.x as usize, &col);
         }
         Ok(())
     }
