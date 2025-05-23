@@ -20,7 +20,7 @@ use bootloader_api::{entry_point, BootInfo};
 use io::utils::qemu::{exit_qemu, QemuExitCode};
 use bootloader_api::config::{BootloaderConfig, Mapping};
 use x86_64::VirtAddr;
-use crate::io::init_io;
+use crate::io::{init_io, video};
 use crate::memory::BootInfoFrameAllocator;
 
 pub static BOOTLOADER_CONFIG: BootloaderConfig = {
@@ -33,12 +33,13 @@ pub static mut BOOT_INFO: *mut BootInfo = 0 as *mut BootInfo;
 pub fn pre_init(boot_info: &'static mut BootInfo){
     unsafe {
         BOOT_INFO = boot_info;
+        init_io();
         let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.take().expect("No physical memory offset found"));
         let mut mapper = unsafe { memory::init(phys_mem_offset) };
         let mut frame_allocator = unsafe { BootInfoFrameAllocator::init(&boot_info.memory_regions) };
         allocator::init_heap(&mut mapper, &mut frame_allocator).expect("heap initialization failed");
         let fb = boot_info.framebuffer.take().expect("No framebuffer found");
-        init_io(fb);
+        video::init_video(&fb);
     }
 }
 

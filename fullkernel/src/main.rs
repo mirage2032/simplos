@@ -9,14 +9,24 @@ fn main() {
     let mut cmd = std::process::Command::new("qemu-system-x86_64");
     if uefi {
         cmd.arg("-bios").arg(ovmf_prebuilt::ovmf_pure_efi());
-        cmd.arg("-drive").arg(format!("format=raw,file={uefi_path}")).arg("-accel").arg("kvm");
+        cmd.arg("-drive").arg(format!("format=raw,file={uefi_path}"));
     } else {
-        cmd.arg("-drive").arg(format!("format=raw,file={bios_path}")).arg("-accel").arg("kvm");
+        cmd.arg("-drive").arg(format!("format=raw,file={bios_path}"));
     }
     //append env args to cmd
+    let mut use_accel_kvm = true;
     std::env::args().skip(1).for_each(|arg| {
-        cmd.arg(arg);
+        if arg == "--debug" {
+            cmd.arg("-s").arg("-S");
+            use_accel_kvm = false;
+        }
+        else {
+            cmd.arg(&arg);
+        }
     });
+    if use_accel_kvm {
+        cmd.arg("-accel").arg("kvm");
+    }
     let mut child = cmd.spawn().unwrap();
     child.wait().unwrap();
 }

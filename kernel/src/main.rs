@@ -37,20 +37,20 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 #[unsafe(no_mangle)]
 fn start() -> ! {
     {
-        let mut video = VIDEO.lock();
         let clear_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::BLUE).build();
-        let text_pospos = video.bounding_box().center();
         let character_style = MonoTextStyle::new(&FONT_10X20, Rgb888::WHITE);
         let mut val =0;
         loop{
-            video.bounding_box().into_styled(clear_style).draw(video.deref_mut()).expect("Failed to clear screen");
-            Text::with_alignment(
-                &format!("Banana {val}"),
-                text_pospos,
-                character_style,
-                Alignment::Center,
-            ).draw(video.deref_mut()).expect("Failed to draw text");
-            val += 1;
+            // let mut video = VIDEO.lock();
+            // let text_pospos = video.bounding_box().center();
+            // video.bounding_box().into_styled(clear_style).draw(video.deref_mut()).expect("Failed to clear screen");
+            // Text::with_alignment(
+            //     &format!("Banana {val}"),
+            //     text_pospos,
+            //     character_style,
+            //     Alignment::Center,
+            // ).draw(video.deref_mut()).expect("Failed to draw text");
+            // val += 1;
         }
     }
     // let ptr = 0xdeadbeaf as *mut u8;

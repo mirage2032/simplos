@@ -64,21 +64,21 @@ fn test_breakpoint_exception() {
 }
 
 extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
-    {
-        let video = VIDEO.lock();
-        let video_buffer = video.get_buffer();
-        unsafe { 
-            let mut fb = (*BOOT_INFO).framebuffer.as_mut().expect("Could not get boot info");
-            let mut buf = fb.buffer_mut();
-            //memcpy from buffer to buf
-            let mut i = 0;
-            while i < video_buffer.len() {
-                buf[i] = video_buffer[i];
-                i += 1;
-            }
-        };
-        
-    }
+    // {
+    //     let video = VIDEO.lock();
+    //     let video_buffer = video.get_buffer();
+    //     unsafe { 
+    //         let mut fb = (*BOOT_INFO).framebuffer.as_mut().expect("Could not get boot info");
+    //         let mut buf = fb.buffer_mut();
+    //         //memcpy from buffer to buf
+    //         let mut i = 0;
+    //         while i < video_buffer.len() {
+    //             buf[i] = video_buffer[i];
+    //             i += 1;
+    //         }
+    //     };
+    //     
+    // }
     pic::notify_end_of_interrupt(&InterruptIndex::Timer);
 }
 

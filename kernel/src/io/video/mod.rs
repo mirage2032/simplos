@@ -43,25 +43,24 @@ impl VideoBuffer {
     ){
         self.width = width;
         self.height = height;
-        self.buffer = vec![0; (width * height * bytes_per_pixel) as usize];
+        let bufsize = (width * height * bytes_per_pixel) as usize;
+        let smallvec = vec![0; 200];
+        self.buffer = vec![0; bufsize];
         self.bytes_per_pixel = bytes_per_pixel;
         self.pixel_format = pixel_format;
     }
     fn set_bgr(&mut self,mut index:u32,color:&Rgb888) {
-        index = index * self.bytes_per_pixel;
         self.buffer[index as usize] = color.b();
         self.buffer[index as usize + 1] = color.g();
         self.buffer[index as usize + 2] = color.r();
     }
     fn set_rgb(&mut self,mut index:u32,color:&Rgb888) {
-        index = index * self.bytes_per_pixel;
         self.buffer[index as usize] = color.r();
         self.buffer[index as usize + 1] = color.g();
         self.buffer[index as usize + 2] = color.b();
     }
 
     fn set_u8(&mut self,mut index:u32,color:&Rgb888) {
-        index = index * self.bytes_per_pixel;
         let r = color.r() >> 5;
         let g = color.g() >> 5;
         let b = color.b() >> 6;
@@ -99,6 +98,9 @@ impl DrawTarget for VideoBuffer {
     {
         for Pixel(coord, color) in pixels {
             let index = (coord.y as u32 * self.width + coord.x as u32) * self.bytes_per_pixel;
+            if index >= (self.width * self.height * self.bytes_per_pixel) {
+                continue;
+            }
             match self.pixel_format{
                 PixelFormat::Bgr => {
                     self.set_bgr(index, &color);
@@ -120,7 +122,7 @@ impl DrawTarget for VideoBuffer {
 
 pub static VIDEO: Lazy<IMutex<VideoBuffer>> = Lazy::new(|| IMutex::<VideoBuffer>::new(VideoBuffer::default()));
 
-pub fn init_video(fb: bootloader_api::info::FrameBuffer) {
+pub fn init_video(fb:& bootloader_api::info::FrameBuffer) {
     let fb_info = fb.info();
     VIDEO.lock().init(
         fb_info.width as u32,

@@ -9,7 +9,7 @@ use core::{
 ///
 /// The sizes must each be power of 2 because they are also used as
 /// the block alignment (alignments must be always powers of 2).
-const BLOCK_SIZES: &[usize] = &[8, 16, 32, 64, 128, 256, 512, 1024, 2048];
+const BLOCK_SIZES: &[usize] = &[8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096];
 
 /// Choose an appropriate block size for the given layout.
 ///
@@ -45,6 +45,8 @@ impl FixedSizeBlockAllocator {
     /// called only once.
     pub unsafe fn init(&mut self, heap_start: usize, heap_size: usize) {
         unsafe {
+            //convert heap_start to *mut u8
+            let heap_start = heap_start as *mut u8;
             self.fallback_allocator.init(heap_start, heap_size);
         }
     }

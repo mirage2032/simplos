@@ -5,6 +5,7 @@
       <sourceFolder url="file://$MODULE_DIR$/kernel/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/kernel/tests" isTestSource="true" />
       <sourceFolder url="file://$MODULE_DIR$/fullkernel/src" isTestSource="false" />
+      <excludeFolder url="file://$MODULE_DIR$/kernel/target" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
     </content>
     <orderEntry type="inheritedJdk" />
