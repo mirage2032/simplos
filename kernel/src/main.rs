@@ -5,22 +5,18 @@
 #![reexport_test_harness_main = "test_main"]
 extern crate alloc;
 
-use alloc::fmt::format;
 use alloc::format;
-use alloc::string::ToString;
 use core::ops::DerefMut;
 use core::panic::PanicInfo;
 use bootloader_api::{entry_point, BootInfo};
-use embedded_graphics::Drawable;
-use embedded_graphics::geometry::{Dimensions, Point};
 use embedded_graphics::mono_font::ascii::FONT_10X20;
 use embedded_graphics::mono_font::MonoTextStyle;
 use embedded_graphics::pixelcolor::{BinaryColor, Rgb888, RgbColor};
-use embedded_graphics::prelude::Primitive;
+use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::PrimitiveStyleBuilder;
 use embedded_graphics::text::{Alignment, Text};
-#[allow(unused_imports)]
 use simplos::BOOTLOADER_CONFIG;
+use simplos::io::interrupts::idt::TIMER_COUNTER;
 use simplos::io::video::VIDEO;
 use simplos::pre_init;
 
@@ -37,20 +33,22 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 #[unsafe(no_mangle)]
 fn start() -> ! {
     {
-        let clear_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::BLUE).build();
-        let character_style = MonoTextStyle::new(&FONT_10X20, Rgb888::WHITE);
+        let clear_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(23,114,243)).build();
+        let character_style = MonoTextStyle::new(&FONT_10X20, Rgb888::new(94, 243, 23));
         let mut val =0;
         loop{
-            // let mut video = VIDEO.lock();
-            // let text_pospos = video.bounding_box().center();
-            // video.bounding_box().into_styled(clear_style).draw(video.deref_mut()).expect("Failed to clear screen");
-            // Text::with_alignment(
-            //     &format!("Banana {val}"),
-            //     text_pospos,
-            //     character_style,
-            //     Alignment::Center,
-            // ).draw(video.deref_mut()).expect("Failed to draw text");
-            // val += 1;
+            let bounding_box = VIDEO.lock().bounding_box();
+            let text_pospos = bounding_box.center();
+            let timer_counter = *TIMER_COUNTER.lock();
+            bounding_box.into_styled(clear_style).draw(VIDEO.lock().deref_mut()).expect("Failed to clear screen");
+            Text::with_alignment(
+                format!("Update: {val}\n Timer: {timer_counter}").as_str(),
+                text_pospos,
+                character_style,
+                Alignment::Center,
+            ).draw(VIDEO.lock().deref_mut()).expect("Failed to draw text");
+            VIDEO.lock().swap_buffers();
+            val += 1;
         }
     }
     // let ptr = 0xdeadbeaf as *mut u8;

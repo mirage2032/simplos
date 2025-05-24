@@ -14,7 +14,8 @@ use crate::utils::imutex::IMutex;
 pub struct VideoBuffer {
     width:u32,
     height:u32,
-    buffer: Vec<u8>,
+    front_buffer: Vec<u8>,
+    back_buffer: Vec<u8>,
     bytes_per_pixel: u32,
     pixel_format: PixelFormat,
 }
@@ -29,7 +30,8 @@ impl VideoBuffer {
         VideoBuffer {
             width,
             height,
-            buffer: vec![0; (width * height * bytes_per_pixel) as usize],
+            front_buffer: vec![0; (width * height * bytes_per_pixel) as usize],
+            back_buffer: vec![0; (width * height * bytes_per_pixel) as usize],
             bytes_per_pixel,
             pixel_format,
         }
@@ -44,31 +46,35 @@ impl VideoBuffer {
         self.width = width;
         self.height = height;
         let bufsize = (width * height * bytes_per_pixel) as usize;
-        let smallvec = vec![0; 200];
-        self.buffer = vec![0; bufsize];
+        self.front_buffer = vec![0; bufsize];
+        self.back_buffer = vec![0; bufsize];
         self.bytes_per_pixel = bytes_per_pixel;
         self.pixel_format = pixel_format;
     }
     fn set_bgr(&mut self,mut index:u32,color:&Rgb888) {
-        self.buffer[index as usize] = color.b();
-        self.buffer[index as usize + 1] = color.g();
-        self.buffer[index as usize + 2] = color.r();
+        self.back_buffer[index as usize] = color.b();
+        self.back_buffer[index as usize + 1] = color.g();
+        self.back_buffer[index as usize + 2] = color.r();
     }
     fn set_rgb(&mut self,mut index:u32,color:&Rgb888) {
-        self.buffer[index as usize] = color.r();
-        self.buffer[index as usize + 1] = color.g();
-        self.buffer[index as usize + 2] = color.b();
+        self.back_buffer[index as usize] = color.r();
+        self.back_buffer[index as usize + 1] = color.g();
+        self.back_buffer[index as usize + 2] = color.b();
     }
 
     fn set_u8(&mut self,mut index:u32,color:&Rgb888) {
         let r = color.r() >> 5;
         let g = color.g() >> 5;
         let b = color.b() >> 6;
-        self.buffer[index as usize] = (r << 5) | (g << 2) | b;
+        self.back_buffer[index as usize] = (r << 5) | (g << 2) | b;
     }
 
     pub fn get_buffer(&self) -> &Vec<u8> {
-        &self.buffer
+        &self.front_buffer
+    }
+    
+    pub fn swap_buffers(&mut self) {
+        core::mem::swap(&mut self.front_buffer, &mut self.back_buffer);
     }
 }
 

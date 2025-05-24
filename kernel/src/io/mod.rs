@@ -10,5 +10,4 @@ pub fn init_io() {
     interrupts::init_interrupts();
     ps2::ps2_controller_init();
     interrupts::pic::config_pics();
-    x86_64::instructions::interrupts::enable();
 }

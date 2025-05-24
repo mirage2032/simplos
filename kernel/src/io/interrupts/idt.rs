@@ -9,8 +9,9 @@ use spin::{Lazy, Mutex};
 use x86_64::instructions::port::Port;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 use x86_64::structures::port::PortRead;
-use crate::BOOT_INFO;
+use crate::{FRAMEBUFFER};
 use crate::io::video::VIDEO;
+use crate::utils::imutex::IMutex;
 
 pub static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     let mut idt = InterruptDescriptorTable::new();
@@ -62,26 +63,29 @@ fn test_breakpoint_exception() {
     // invoke a breakpoint exception
     x86_64::instructions::interrupts::int3();
 }
-
+pub static TIMER_COUNTER:Lazy<IMutex<usize>> = Lazy::new(||IMutex::new(0));
 extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
-    // {
-    //     let video = VIDEO.lock();
-    //     let video_buffer = video.get_buffer();
-    //     unsafe { 
-    //         let mut fb = (*BOOT_INFO).framebuffer.as_mut().expect("Could not get boot info");
-    //         let mut buf = fb.buffer_mut();
-    //         //memcpy from buffer to buf
-    //         let mut i = 0;
-    //         while i < video_buffer.len() {
-    //             buf[i] = video_buffer[i];
-    //             i += 1;
-    //         }
-    //     };
-    //     
-    // }
+    unsafe {
+        let video = VIDEO.force_lock();
+        let video_buffer = video.get_buffer();
+        {
+            let mut timer_counter = TIMER_COUNTER.force_lock();
+            *timer_counter += 1;
+        }
+
+        unsafe {
+            #[allow(static_mut_refs)]
+            let mut fb_lock = FRAMEBUFFER.lock();
+            if let Some(fb) = fb_lock.as_mut() {
+                let buffer = fb.buffer_mut();
+                buffer.copy_from_slice(video_buffer);
+            } else {
+                panic!("Framebuffer not initialized");
+            }
+        }
+    }
     pic::notify_end_of_interrupt(&InterruptIndex::Timer);
 }
-
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
     use pc_keyboard::{DecodedKey, HandleControl, Keyboard, ScancodeSet1, layouts};
 

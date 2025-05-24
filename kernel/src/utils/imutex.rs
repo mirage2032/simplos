@@ -14,9 +14,14 @@ impl<T> IMutex<T>{
     pub fn lock(&self)-> IMutexGuard<T>{
         let are_interrupts = x86_64::instructions::interrupts::are_enabled();
         if are_interrupts{
-            // x86_64::instructions::interrupts::disable();
+            x86_64::instructions::interrupts::disable();
         }
         IMutexGuard::new(self.mutex.lock(), are_interrupts)
+    }
+    
+    pub unsafe fn force_lock(&self)-> IMutexGuard<T>{
+        unsafe { self.mutex.force_unlock() }
+        self.lock()
     }
 }
 

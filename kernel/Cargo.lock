@@ -55,6 +55,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
 
 [[package]]
+name = "cfg-if"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"
+
+[[package]]
 name = "embedded-graphics"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -115,6 +121,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "log"
+version = "0.4.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13dc2df351e3202783a1fe0d44375f7295ffb4049267b0f3018346dc122a1d94"
+
+[[package]]
 name = "micromath"
 version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -164,6 +176,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "ptr_meta"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe9e76f66d3f9606f44e45598d155cb13ecf09f4a28199e48daf8c8fc937ea90"
+dependencies = [
+ "ptr_meta_derive",
+]
+
+[[package]]
+name = "ptr_meta_derive"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ca414edb151b4c8d125c12566ab0d74dc9cdba36fb80eb7b848c15f495fd32d1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "qemu-exit"
+version = "3.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8bb0fd6580eeed0103c054e3fba2c2618ff476943762f28a645b63b8692b21c9"
+
+[[package]]
 name = "quote"
 version = "1.0.40"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -207,6 +245,7 @@ dependencies = [
  "ps2",
  "spin 0.10.0",
  "uart_16550",
+ "uefi",
  "volatile 0.6.1",
  "x86_64 0.15.2",
 ]
@@ -256,6 +295,59 @@ dependencies = [
  "rustversion",
  "x86",
 ]
+
+[[package]]
+name = "ucs2"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df79298e11f316400c57ec268f3c2c29ac3c4d4777687955cd3d4f3a35ce7eba"
+dependencies = [
+ "bit_field",
+]
+
+[[package]]
+name = "uefi"
+version = "0.35.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da7569ceafb898907ff764629bac90ac24ba4203c38c33ef79ee88c74aa35b11"
+dependencies = [
+ "bitflags 2.9.1",
+ "cfg-if",
+ "log",
+ "ptr_meta",
+ "qemu-exit",
+ "ucs2",
+ "uefi-macros",
+ "uefi-raw",
+ "uguid",
+]
+
+[[package]]
+name = "uefi-macros"
+version = "0.18.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b3dad47b3af8f99116c0f6d4d669c439487d9aaf1c8d9480d686cda6f3a8aa23"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "uefi-raw"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7cad96b8baaf1615d3fdd0f03d04a0b487d857c1b51b19dcbfe05e2e3c447b78"
+dependencies = [
+ "bitflags 2.9.1",
+ "uguid",
+]
+
+[[package]]
+name = "uguid"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab14ea9660d240e7865ce9d54ecdbd1cd9fa5802ae6f4512f093c7907e921533"
 
 [[package]]
 name = "unicode-ident"
