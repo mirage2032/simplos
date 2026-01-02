@@ -4,12 +4,14 @@
 #![test_runner(simplos::test_runner)]
 #![reexport_test_harness_main = "test_main"]
 extern crate alloc;
-
 use alloc::format;
+use alloc::string::ToString;
 use core::ops::DerefMut;
 use core::panic::PanicInfo;
 use bootloader_api::{entry_point, BootInfo};
-use embedded_graphics::mono_font::ascii::FONT_10X20;
+use embedded_graphics::mono_font::ascii::FONT_7X13;
+// use embedded_graphics::mono_font::ascii::FONT_7X13;
+// use haxorfont::FONT_HAX_ITALICRMEDIUM11;
 use embedded_graphics::mono_font::MonoTextStyle;
 use embedded_graphics::pixelcolor::{BinaryColor, Rgb888, RgbColor};
 use embedded_graphics::prelude::*;
@@ -19,6 +21,9 @@ use simplos::BOOTLOADER_CONFIG;
 use simplos::io::interrupts::idt::TIMER_COUNTER;
 use simplos::io::video::VIDEO;
 use simplos::pre_init;
+use x86_rtc::Rtc;
+use x86;
+use simplos::badoo;
 
 entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 #[allow(unreachable_code)]
@@ -33,16 +38,28 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 #[unsafe(no_mangle)]
 fn start() -> ! {
     {
-        let clear_style = PrimitiveStyleBuilder::new().fill_color(Rgb888::new(23,114,243)).build();
-        let character_style = MonoTextStyle::new(&FONT_10X20, Rgb888::new(94, 243, 23));
+        let character_style = MonoTextStyle::new(&FONT_7X13, Rgb888::new(94, 243, 23));
         let mut val =0;
+        let mut rtc = Rtc::new();
+        let _ = core::hint::black_box(badoo());
         loop{
+            let _ = core::hint::black_box(badoo());
             let bounding_box = VIDEO.lock().bounding_box();
             let text_pospos = bounding_box.center();
             let timer_counter = *TIMER_COUNTER.lock();
-            bounding_box.into_styled(clear_style).draw(VIDEO.lock().deref_mut()).expect("Failed to clear screen");
+            VIDEO.lock().clear(Rgb888::new(23,114,243)).expect("Failed to clear screen");
+            let time = rtc.get_unix_timestamp();
+            let cpu_id = x86::cpuid::CpuId::new();
+            let cpu_brand = cpu_id.get_processor_brand_string().expect("Failed to get cpu brand string").as_str().to_string();
+            let cpu_vendor = cpu_id.get_vendor_info().expect("No vendor info for CPU").as_str().to_string();
             Text::with_alignment(
-                format!("Update: {val}\n Timer: {timer_counter}").as_str(),
+                format!("\
+                Update: {val}\n\
+                Timer: {timer_counter}\n\
+                RTC: {time}\n\
+                CPU BRAND: {cpu_brand}\n\
+                CPU VENDOR: {cpu_vendor}\n\
+                ").as_str(),
                 text_pospos,
                 character_style,
                 Alignment::Center,

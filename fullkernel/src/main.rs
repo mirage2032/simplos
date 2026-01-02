@@ -4,7 +4,7 @@ fn main() {
     let bios_path = env!("BIOS_PATH");
 
     // choose whether to start the UEFI or BIOS image
-    let uefi = false;
+    let uefi = true;
 
     let mut cmd = std::process::Command::new("qemu-system-x86_64");
     if uefi {
@@ -14,19 +14,21 @@ fn main() {
         cmd.arg("-drive").arg(format!("format=raw,file={bios_path}"));
     }
     //append env args to cmd
-    let mut use_accel_kvm = true;
+    // let mut use_accel_kvm = true;
+    cmd.arg("-s");
     std::env::args().skip(1).for_each(|arg| {
         if arg == "--debug" {
-            cmd.arg("-s").arg("-S");
-            use_accel_kvm = false;
+            cmd.arg("-S");
+            // use_accel_kvm = false;
         }
         else {
             cmd.arg(&arg);
         }
     });
-    if use_accel_kvm {
+    // if use_accel_kvm {
         cmd.arg("-accel").arg("kvm");
-    }
+    // }
+    cmd.arg("-cpu").arg("host");
     let mut child = cmd.spawn().unwrap();
     child.wait().unwrap();
 }

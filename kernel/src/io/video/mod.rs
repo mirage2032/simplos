@@ -2,12 +2,14 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
+use core::ops::DerefMut;
 use bootloader_api::info::PixelFormat;
 use embedded_graphics::draw_target::DrawTarget;
 use embedded_graphics::geometry::{Dimensions, Point, Size};
 use embedded_graphics::pixelcolor::{Rgb888, RgbColor};
-use embedded_graphics::primitives::Rectangle;
-use embedded_graphics::Pixel;
+use embedded_graphics::primitives::{PrimitiveStyleBuilder, Rectangle};
+use embedded_graphics::{Drawable, Pixel};
+use embedded_graphics::prelude::Primitive;
 use spin::{Lazy};
 use crate::utils::imutex::IMutex;
 
@@ -75,6 +77,11 @@ impl VideoBuffer {
     
     pub fn swap_buffers(&mut self) {
         core::mem::swap(&mut self.front_buffer, &mut self.back_buffer);
+    }
+    
+    pub fn clean(&mut self,color: Rgb888) -> Result<(), &str> {
+        let clear_style = PrimitiveStyleBuilder::new().fill_color(color).build();
+        self.bounding_box().into_styled(clear_style).draw(self).map_err(|_| "Failed to clear screen")
     }
 }
 

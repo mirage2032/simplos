@@ -1,0 +1,20 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Attach to QEMU",
+            "type": "lldb",
+            "request": "launch",
+            "stopOnEntry": true,
+            "program": "/bin/false",
+            "targetCreateCommands": [
+                "command source ${workspaceFolder}/.lldbinit",
+            ],
+            "processCreateCommands": [
+                "gdb-remote localhost:1234",
+                "script [bp.SetEnabled(False) for bp in lldb.target.breakpoint_iter()]",
+                "script [bp.SetEnabled(True) for bp in lldb.target.breakpoint_iter()]"
+            ]
+        }
+    ]
+}

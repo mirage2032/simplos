@@ -26,6 +26,7 @@ fn main() {
     let lldbinit_content = format!(
         "target create {}\n\
         target modules load --file {} --slide 0x8000000000\n\
+        process handle SIGTRAP -s false\n\
         ",
         kernel.to_string_lossy(),
         kernel.to_string_lossy()

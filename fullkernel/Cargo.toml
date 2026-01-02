@@ -9,3 +9,11 @@ simplos = {path= "../kernel",artifact = "bin", target = "x86_64-unknown-none" }
 [dependencies]
 # used for UEFI booting in QEMU
 ovmf-prebuilt = "0.1.0-alpha.1"
+
+[profile.dev]
+opt-level = 0
+debug = 2
+
+[profile.dev.build-override]
+opt-level = 0
+debug = 2

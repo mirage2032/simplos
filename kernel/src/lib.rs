@@ -106,3 +106,12 @@ pub fn hlt_loop() -> ! {
         x86_64::instructions::hlt();
     }
 }
+
+
+#[unsafe(no_mangle)]
+pub fn badoo() {
+    let a = 1;
+    let b = 2;
+    let c = a + b;
+    core::hint::black_box(c);
+}

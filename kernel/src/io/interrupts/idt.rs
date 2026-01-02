@@ -1,18 +1,14 @@
 use crate::io::interrupts::pic::InterruptIndex;
 use crate::io::interrupts::{gdt, pic};
-use crate::io::ps2::{PS2_CONTROLLER, Ps2InterruptCause};
-// use crate::vga_buffer::{Color, ColorCode, WRITER};
-// use crate::{print, println, serial_println};
-use bitfield_struct::bitfield;
-use pc_keyboard::KeyEvent;
-use spin::{Lazy, Mutex};
-use x86_64::instructions::port::Port;
-use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
-use x86_64::structures::port::PortRead;
-use crate::{FRAMEBUFFER};
+use crate::io::ps2::{Ps2InterruptCause, PS2_CONTROLLER};
 use crate::io::video::VIDEO;
 use crate::utils::imutex::IMutex;
-
+// use crate::vga_buffer::{Color, ColorCode, WRITER};
+// use crate::{print, println, serial_println};
+use crate::FRAMEBUFFER;
+use spin::{Lazy, Mutex};
+use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
+use crate::badoo;
 pub static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     let mut idt = InterruptDescriptorTable::new();
     idt.breakpoint.set_handler_fn(breakpoint_handler);
@@ -63,31 +59,29 @@ fn test_breakpoint_exception() {
     // invoke a breakpoint exception
     x86_64::instructions::interrupts::int3();
 }
-pub static TIMER_COUNTER:Lazy<IMutex<usize>> = Lazy::new(||IMutex::new(0));
+
+pub static TIMER_COUNTER: Lazy<IMutex<usize>> = Lazy::new(|| IMutex::new(0));
 extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
     unsafe {
         let video = VIDEO.force_lock();
-        let video_buffer = video.get_buffer();
         {
             let mut timer_counter = TIMER_COUNTER.force_lock();
             *timer_counter += 1;
         }
 
-        unsafe {
-            #[allow(static_mut_refs)]
-            let mut fb_lock = FRAMEBUFFER.lock();
-            if let Some(fb) = fb_lock.as_mut() {
-                let buffer = fb.buffer_mut();
-                buffer.copy_from_slice(video_buffer);
-            } else {
-                panic!("Framebuffer not initialized");
-            }
+        #[allow(static_mut_refs)]
+        let mut fb_lock = FRAMEBUFFER.lock();
+        if let Some(fb) = fb_lock.as_mut() {
+            let buffer = fb.buffer_mut();
+            buffer.copy_from_slice(video.get_buffer());
+        } else {
+            panic!("Framebuffer not initialized");
         }
     }
     pic::notify_end_of_interrupt(&InterruptIndex::Timer);
 }
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
-    use pc_keyboard::{DecodedKey, HandleControl, Keyboard, ScancodeSet1, layouts};
+    use pc_keyboard::{layouts, HandleControl, Keyboard, ScancodeSet1};
 
     // x86_64::instructions::interrupts::without_interrupts(|| {
     static KEYBOARD: Lazy<Mutex<Keyboard<layouts::Us104Key, ScancodeSet1>>> = Lazy::new(|| {
@@ -120,8 +114,6 @@ extern "x86-interrupt" fn page_fault_handler(
     stack_frame: InterruptStackFrame,
     error_code: PageFaultErrorCode,
 ) {
-    use x86_64::registers::control::Cr2;
-
     // println!("EXCEPTION: PAGE FAULT");
     // println!("Accessed Address: {:?}", Cr2::read());
     // println!("Error Code: {:?}", error_code);

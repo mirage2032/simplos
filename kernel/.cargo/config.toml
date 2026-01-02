@@ -1,6 +1,7 @@
 [build]
 #target = "x86_64-simplos.json"
-rustflags=["-g"]
+#rustflags=["-g"]
+#rustflags = ["-C", "debuginfo=2"]
 [unstable]
 #bindeps=true
 build-std-features = ["compiler-builtins-mem"]

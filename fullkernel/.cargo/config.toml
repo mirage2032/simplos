@@ -1,6 +1,6 @@
 [build]
-rustflags=["-g"]
+#rustflags=["-g"]
 [target.x86_64-unknown-none]
-rustflags = ["-g"]
+#rustflags = ["-g"]
 [unstable]
 bindeps=true
