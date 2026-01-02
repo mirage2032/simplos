@@ -11,19 +11,16 @@ pub mod io;
 pub mod memory;
 pub mod utils;
 
-use core::ops::{Deref, DerefMut};
 // pub use io::video::vga_buffer;
 pub use io::serial;
+pub use io::video::DISPLAY;
 
 use crate::io::{init_io, video};
 use crate::memory::BootInfoFrameAllocator;
-use crate::utils::imutex::IMutex;
 use bootloader_api::config::{BootloaderConfig, Mapping};
-use bootloader_api::info::FrameBuffer;
 use bootloader_api::{entry_point, BootInfo};
 use core::panic::PanicInfo;
 use io::utils::qemu::{exit_qemu, QemuExitCode};
-use spin::Lazy;
 use x86_64::VirtAddr;
 
 pub static BOOTLOADER_CONFIG: BootloaderConfig = {
@@ -32,7 +29,7 @@ pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     config.mappings.kernel_base = Mapping::FixedAddress(0x8000000000);
     config
 };
-pub static mut FRAMEBUFFER: Lazy<IMutex<Option<FrameBuffer>>> = Lazy::new(|| IMutex::new(None));
+
 pub fn pre_init(boot_info: &'static mut BootInfo) {
     unsafe {
         init_io();
@@ -47,8 +44,10 @@ pub fn pre_init(boot_info: &'static mut BootInfo) {
             unsafe { BootInfoFrameAllocator::init(&boot_info.memory_regions) };
         allocator::init_heap(&mut mapper, &mut frame_allocator)
             .expect("heap initialization failed");
+        
+        // Initialize display with framebuffer
         let fb = boot_info.framebuffer.take().expect("No framebuffer found");
-        video::init_video(&fb);
+        video::init_display(fb);
         
         // Initialize HPET for high-precision timing
         if let Some(rsdp_addr) = boot_info.rsdp_addr.take() {
@@ -58,10 +57,6 @@ pub fn pre_init(boot_info: &'static mut BootInfo) {
             }
         }
         
-        #[allow(static_mut_refs)]
-        FRAMEBUFFER
-            .lock()
-            .replace(fb);
         x86_64::instructions::interrupts::enable();
     }
 }

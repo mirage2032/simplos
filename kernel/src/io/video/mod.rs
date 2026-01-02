@@ -2,106 +2,114 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
-use core::ops::DerefMut;
-use bootloader_api::info::PixelFormat;
+use bootloader_api::info::{FrameBuffer, PixelFormat};
 use embedded_graphics::draw_target::DrawTarget;
 use embedded_graphics::geometry::{Dimensions, Point, Size};
 use embedded_graphics::pixelcolor::{Rgb888, RgbColor};
 use embedded_graphics::primitives::{PrimitiveStyleBuilder, Rectangle};
 use embedded_graphics::{Drawable, Pixel};
 use embedded_graphics::prelude::Primitive;
-use spin::{Lazy};
-use crate::utils::imutex::IMutex;
+use spin::{Lazy, Mutex};
 
-pub struct VideoBuffer {
-    width:u32,
-    height:u32,
-    front_buffer: Vec<u8>,
-    back_buffer: Vec<u8>,
+/// Unified display driver that owns the hardware framebuffer and a back buffer
+pub struct Display {
+    width: u32,
+    height: u32,
     bytes_per_pixel: u32,
     pixel_format: PixelFormat,
+    back_buffer: Vec<u8>,
+    framebuffer: Option<FrameBuffer>,
 }
 
-impl VideoBuffer {
-    pub fn new(
-        width: u32,
-        height: u32,
-        bytes_per_pixel: u32,
-        pixel_format: PixelFormat,
-    ) -> VideoBuffer{
-        VideoBuffer {
-            width,
-            height,
-            front_buffer: vec![0; (width * height * bytes_per_pixel) as usize],
-            back_buffer: vec![0; (width * height * bytes_per_pixel) as usize],
-            bytes_per_pixel,
-            pixel_format,
+impl Display {
+    /// Create a new uninitialized display
+    pub fn new() -> Display {
+        Display {
+            width: 0,
+            height: 0,
+            bytes_per_pixel: 0,
+            pixel_format: PixelFormat::Unknown {
+                red_position: 0,
+                green_position: 0,
+                blue_position: 0,
+            },
+            back_buffer: Vec::new(),
+            framebuffer: None,
         }
     }
-    pub fn init(
-        &mut self,
-        width: u32,
-        height: u32,
-        bytes_per_pixel: u32,
-        pixel_format: PixelFormat,
-    ){
-        self.width = width;
-        self.height = height;
-        let bufsize = (width * height * bytes_per_pixel) as usize;
-        self.front_buffer = vec![0; bufsize];
+
+    /// Initialize the display with a framebuffer from the bootloader
+    pub fn init(&mut self, framebuffer: FrameBuffer) {
+        let info = framebuffer.info();
+        self.width = info.width as u32;
+        self.height = info.height as u32;
+        self.bytes_per_pixel = info.bytes_per_pixel as u32;
+        self.pixel_format = info.pixel_format;
+        
+        let bufsize = (self.width * self.height * self.bytes_per_pixel) as usize;
         self.back_buffer = vec![0; bufsize];
-        self.bytes_per_pixel = bytes_per_pixel;
-        self.pixel_format = pixel_format;
-    }
-    fn set_bgr(&mut self,mut index:u32,color:&Rgb888) {
-        self.back_buffer[index as usize] = color.b();
-        self.back_buffer[index as usize + 1] = color.g();
-        self.back_buffer[index as usize + 2] = color.r();
-    }
-    fn set_rgb(&mut self,mut index:u32,color:&Rgb888) {
-        self.back_buffer[index as usize] = color.r();
-        self.back_buffer[index as usize + 1] = color.g();
-        self.back_buffer[index as usize + 2] = color.b();
+        self.framebuffer = Some(framebuffer);
     }
 
-    fn set_u8(&mut self,mut index:u32,color:&Rgb888) {
-        let r = color.r() >> 5;
-        let g = color.g() >> 5;
-        let b = color.b() >> 6;
-        self.back_buffer[index as usize] = (r << 5) | (g << 2) | b;
+    /// Check if the display is initialized
+    pub fn is_initialized(&self) -> bool {
+        self.framebuffer.is_some()
     }
 
-    pub fn get_buffer(&self) -> &Vec<u8> {
-        &self.front_buffer
+    /// Present the back buffer to the screen (copy to hardware framebuffer)
+    pub fn present(&mut self) {
+        if let Some(fb) = self.framebuffer.as_mut() {
+            fb.buffer_mut().copy_from_slice(&self.back_buffer);
+        }
     }
-    
-    pub fn swap_buffers(&mut self) {
-        core::mem::swap(&mut self.front_buffer, &mut self.back_buffer);
-    }
-    
-    pub fn clean(&mut self,color: Rgb888) -> Result<(), &str> {
+
+    /// Clear the back buffer with a color
+    pub fn clear(&mut self, color: Rgb888) -> Result<(), &str> {
         let clear_style = PrimitiveStyleBuilder::new().fill_color(color).build();
-        self.bounding_box().into_styled(clear_style).draw(self).map_err(|_| "Failed to clear screen")
+        self.bounding_box()
+            .into_styled(clear_style)
+            .draw(self)
+            .map_err(|_| "Failed to clear screen")
+    }
+
+    fn set_pixel(&mut self, index: usize, color: &Rgb888) {
+        match self.pixel_format {
+            PixelFormat::Bgr => {
+                self.back_buffer[index] = color.b();
+                self.back_buffer[index + 1] = color.g();
+                self.back_buffer[index + 2] = color.r();
+            }
+            PixelFormat::Rgb => {
+                self.back_buffer[index] = color.r();
+                self.back_buffer[index + 1] = color.g();
+                self.back_buffer[index + 2] = color.b();
+            }
+            PixelFormat::U8 => {
+                let r = color.r() >> 5;
+                let g = color.g() >> 5;
+                let b = color.b() >> 6;
+                self.back_buffer[index] = (r << 5) | (g << 2) | b;
+            }
+            _ => {
+                panic!("Unsupported pixel format");
+            }
+        }
     }
 }
 
-impl Default for VideoBuffer {
+impl Default for Display {
     fn default() -> Self {
-        VideoBuffer::new(0, 0, 0, PixelFormat::Unknown {
-            red_position: 0,
-            green_position: 0,
-            blue_position: 0,
-        })
+        Display::new()
     }
 }
 
-impl Dimensions for VideoBuffer {
+impl Dimensions for Display {
     fn bounding_box(&self) -> Rectangle {
         Rectangle::new(Point::new(0, 0), Size::new(self.width, self.height))
     }
 }
 
-impl DrawTarget for VideoBuffer {
+impl DrawTarget for Display {
     type Color = Rgb888;
     type Error = core::convert::Infallible;
 
@@ -109,38 +117,22 @@ impl DrawTarget for VideoBuffer {
     where
         I: IntoIterator<Item = Pixel<Self::Color>>,
     {
+        let max_index = (self.width * self.height * self.bytes_per_pixel) as usize;
+        
         for Pixel(coord, color) in pixels {
-            let index = (coord.y as u32 * self.width + coord.x as u32) * self.bytes_per_pixel;
-            if index >= (self.width * self.height * self.bytes_per_pixel) {
-                continue;
-            }
-            match self.pixel_format{
-                PixelFormat::Bgr => {
-                    self.set_bgr(index, &color);
-                }
-                PixelFormat::Rgb => {
-                    self.set_rgb(index, &color);
-                }
-                PixelFormat::U8 => {
-                    self.set_u8(index, &color);
-                }
-                _ => {
-                    panic!("Unsupported pixel format");
-                }
+            let index = ((coord.y as u32 * self.width + coord.x as u32) * self.bytes_per_pixel) as usize;
+            if index < max_index {
+                self.set_pixel(index, &color);
             }
         }
         Ok(())
     }
 }
 
-pub static VIDEO: Lazy<IMutex<VideoBuffer>> = Lazy::new(|| IMutex::<VideoBuffer>::new(VideoBuffer::default()));
+/// Global display instance
+pub static DISPLAY: Lazy<Mutex<Display>> = Lazy::new(|| Mutex::new(Display::new()));
 
-pub fn init_video(fb:& bootloader_api::info::FrameBuffer) {
-    let fb_info = fb.info();
-    VIDEO.lock().init(
-        fb_info.width as u32,
-        fb_info.height as u32,
-        fb_info.bytes_per_pixel  as u32,
-        fb_info.pixel_format,
-    );
+/// Initialize the display with a framebuffer from the bootloader
+pub fn init_display(framebuffer: FrameBuffer) {
+    DISPLAY.lock().init(framebuffer);
 }

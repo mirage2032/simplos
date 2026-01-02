@@ -18,8 +18,8 @@ use embedded_graphics::pixelcolor::{Rgb888};
 use embedded_graphics::prelude::*;
 use embedded_graphics::text::{Alignment, Text};
 use simplos::BOOTLOADER_CONFIG;
+use simplos::DISPLAY;
 use simplos::io::interrupts::idt::TIMER_COUNTER;
-use simplos::io::video::VIDEO;
 use simplos::io::hpet;
 use simplos::pre_init;
 use x86_rtc::Rtc;
@@ -41,14 +41,14 @@ fn start() -> ! {
     {
         let character_style = MonoTextStyle::new(&FONT_7X13, Rgb888::new(94, 243, 23));
         let mut val =0;
-        let mut rtc = Rtc::new();
+        let rtc = Rtc::new();
         let _ = core::hint::black_box(badoo());
         loop{
             let _ = core::hint::black_box(badoo());
-            let bounding_box = VIDEO.lock().bounding_box();
+            let bounding_box = DISPLAY.lock().bounding_box();
             let text_pospos = bounding_box.center();
             let timer_counter = TIMER_COUNTER.load(Ordering::Relaxed);
-            VIDEO.lock().clear(Rgb888::new(23,114,243)).expect("Failed to clear screen");
+            DISPLAY.lock().clear(Rgb888::new(23,114,243)).expect("Failed to clear screen");
             let time = rtc.get_unix_timestamp();
             let hpet_ms = hpet::elapsed_millis().unwrap_or(0);
             let hpet_secs = hpet_ms / 1000;
@@ -68,8 +68,11 @@ fn start() -> ! {
                 text_pospos,
                 character_style,
                 Alignment::Center,
-            ).draw(VIDEO.lock().deref_mut()).expect("Failed to draw text");
-            VIDEO.lock().swap_buffers();
+            ).draw(DISPLAY.lock().deref_mut()).expect("Failed to draw text");
+            
+            // Present back buffer to screen
+            DISPLAY.lock().present();
+            
             val += 1;
         }
     }

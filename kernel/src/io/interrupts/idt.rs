@@ -1,10 +1,6 @@
 use crate::io::interrupts::pic::InterruptIndex;
 use crate::io::interrupts::{gdt, pic};
 use crate::io::ps2::{Ps2InterruptCause, PS2_CONTROLLER};
-use crate::io::video::VIDEO;
-// use crate::vga_buffer::{Color, ColorCode, WRITER};
-// use crate::{print, println, serial_println};
-use crate::FRAMEBUFFER;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::{Lazy, Mutex};
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
@@ -63,19 +59,6 @@ pub static TIMER_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
     TIMER_COUNTER.fetch_add(1, Ordering::Relaxed);
-    
-    unsafe {
-        let video = VIDEO.force_lock();
-        
-        #[allow(static_mut_refs)]
-        let mut fb_lock = FRAMEBUFFER.lock();
-        if let Some(fb) = fb_lock.as_mut() {
-            let buffer = fb.buffer_mut();
-            buffer.copy_from_slice(video.get_buffer());
-        } else {
-            panic!("Framebuffer not initialized");
-        }
-    }
     pic::notify_end_of_interrupt(&InterruptIndex::Timer);
 }
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
