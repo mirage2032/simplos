@@ -14,6 +14,7 @@ pub mod utils;
 // pub use io::video::vga_buffer;
 pub use io::serial;
 pub use io::video::DISPLAY;
+pub use io::console::CONSOLE;
 
 use crate::io::{init_io, video};
 use crate::memory::BootInfoFrameAllocator;

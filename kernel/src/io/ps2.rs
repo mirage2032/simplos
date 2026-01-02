@@ -27,13 +27,14 @@ impl Ps2Controller {
 
         // Step 5: Set config
         let mut config = controller.read_config()?;
-        // Disable interrupts and scancode translation
+        // Disable interrupts initially, but ENABLE translation (Set 2 -> Set 1)
         config.set(
             ControllerConfigFlags::ENABLE_KEYBOARD_INTERRUPT
-                | ControllerConfigFlags::ENABLE_MOUSE_INTERRUPT
-                | ControllerConfigFlags::ENABLE_TRANSLATE,
+                | ControllerConfigFlags::ENABLE_MOUSE_INTERRUPT,
             false,
         );
+        // Enable translation so we get Scancode Set 1
+        config.set(ControllerConfigFlags::ENABLE_TRANSLATE, true);
         controller.write_config(config)?;
 
         // Step 6: Controller self-test

@@ -62,9 +62,10 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
     pic::notify_end_of_interrupt(&InterruptIndex::Timer);
 }
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
-    use pc_keyboard::{layouts, HandleControl, Keyboard, ScancodeSet1};
+    use pc_keyboard::{layouts, HandleControl, Keyboard, ScancodeSet1, DecodedKey};
+    use crate::io::console::CONSOLE;
+    use alloc::format;
 
-    // x86_64::instructions::interrupts::without_interrupts(|| {
     static KEYBOARD: Lazy<Mutex<Keyboard<layouts::Us104Key, ScancodeSet1>>> = Lazy::new(|| {
         Mutex::new(Keyboard::new(
             ScancodeSet1::new(),
@@ -72,6 +73,7 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
             HandleControl::Ignore,
         ))
     });
+    
     let mut controller = PS2_CONTROLLER.lock();
     let data_available = controller.output_has_data();
     let from_keyboard = controller.interrupt_cause() == Ps2InterruptCause::Keyboard;
@@ -80,16 +82,20 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
         if let Ok(scancode) = controller.controller_mut().read_data() {
             if let Ok(Some(key_event)) = keyboard.add_byte(scancode) {
                 if let Some(key) = keyboard.process_keyevent(key_event) {
-                    // match key {
-                    //     DecodedKey::Unicode(character) => print!("{}", character),
-                    //     DecodedKey::RawKey(key) => print!("{:?}", key),
-                    // }
+                    // Log key to console buffer (interrupt-safe!)
+                    match key {
+                        DecodedKey::Unicode(c) => {
+                            CONSOLE.push(&format!("{}", c));
+                        }
+                        DecodedKey::RawKey(k) => {
+                            CONSOLE.push(&format!("{:?}", k));
+                        }
+                    }
                 }
             }
         }
     }
     pic::notify_end_of_interrupt(&InterruptIndex::Keyboard);
-    // });
 }
 extern "x86-interrupt" fn page_fault_handler(
     stack_frame: InterruptStackFrame,

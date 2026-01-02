@@ -13,22 +13,25 @@ fn main() {
     } else {
         cmd.arg("-drive").arg(format!("format=raw,file={bios_path}"));
     }
-    //append env args to cmd
-    // let mut use_accel_kvm = true;
+    
+    // Always enable gdb server
     cmd.arg("-s");
+    
+    // Serial output to terminal for debugging
+    cmd.arg("-serial").arg("stdio");
+    
+    // Process command line args
     std::env::args().skip(1).for_each(|arg| {
         if arg == "--debug" {
-            cmd.arg("-S");
-            // use_accel_kvm = false;
-        }
-        else {
+            cmd.arg("-S"); // Wait for debugger
+        } else {
             cmd.arg(&arg);
         }
     });
-    // if use_accel_kvm {
-        cmd.arg("-accel").arg("kvm");
-    // }
+    
+    cmd.arg("-accel").arg("kvm");
     cmd.arg("-cpu").arg("host");
+    
     let mut child = cmd.spawn().unwrap();
     child.wait().unwrap();
 }
