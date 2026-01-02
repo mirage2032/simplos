@@ -50,6 +50,14 @@ pub fn pre_init(boot_info: &'static mut BootInfo) {
         let fb = boot_info.framebuffer.take().expect("No framebuffer found");
         video::init_video(&fb);
         
+        // Initialize HPET for high-precision timing
+        if let Some(rsdp_addr) = boot_info.rsdp_addr.take() {
+            if let Err(e) = io::hpet::init_hpet(rsdp_addr, phys_mem_offset) {
+                // HPET init failed, continue without it
+                serial_println!("HPET init failed: {}", e);
+            }
+        }
+        
         #[allow(static_mut_refs)]
         FRAMEBUFFER
             .lock()

@@ -12,6 +12,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "acpi"
+version = "5.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "94476c7ef97af4c4d998b3f422c1b01d5211aad57c80ed200baf148d1f1efab6"
+dependencies = [
+ "bit_field",
+ "bitflags 2.9.1",
+ "log",
+]
+
+[[package]]
 name = "anyhow"
 version = "1.0.98"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -543,6 +554,7 @@ dependencies = [
 name = "simplos"
 version = "0.1.0"
 dependencies = [
+ "acpi",
  "bitfield-struct",
  "bootloader_api",
  "embedded-graphics 0.8.1",

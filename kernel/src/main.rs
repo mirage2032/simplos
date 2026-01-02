@@ -8,18 +8,19 @@ use alloc::format;
 use alloc::string::ToString;
 use core::ops::DerefMut;
 use core::panic::PanicInfo;
+use core::sync::atomic::Ordering;
 use bootloader_api::{entry_point, BootInfo};
 use embedded_graphics::mono_font::ascii::FONT_7X13;
 // use embedded_graphics::mono_font::ascii::FONT_7X13;
 // use haxorfont::FONT_HAX_ITALICRMEDIUM11;
 use embedded_graphics::mono_font::MonoTextStyle;
-use embedded_graphics::pixelcolor::{BinaryColor, Rgb888, RgbColor};
+use embedded_graphics::pixelcolor::{Rgb888};
 use embedded_graphics::prelude::*;
-use embedded_graphics::primitives::PrimitiveStyleBuilder;
 use embedded_graphics::text::{Alignment, Text};
 use simplos::BOOTLOADER_CONFIG;
 use simplos::io::interrupts::idt::TIMER_COUNTER;
 use simplos::io::video::VIDEO;
+use simplos::io::hpet;
 use simplos::pre_init;
 use x86_rtc::Rtc;
 use x86;
@@ -46,9 +47,12 @@ fn start() -> ! {
             let _ = core::hint::black_box(badoo());
             let bounding_box = VIDEO.lock().bounding_box();
             let text_pospos = bounding_box.center();
-            let timer_counter = *TIMER_COUNTER.lock();
+            let timer_counter = TIMER_COUNTER.load(Ordering::Relaxed);
             VIDEO.lock().clear(Rgb888::new(23,114,243)).expect("Failed to clear screen");
             let time = rtc.get_unix_timestamp();
+            let hpet_ms = hpet::elapsed_millis().unwrap_or(0);
+            let hpet_secs = hpet_ms / 1000;
+            let hpet_frac = hpet_ms % 1000;
             let cpu_id = x86::cpuid::CpuId::new();
             let cpu_brand = cpu_id.get_processor_brand_string().expect("Failed to get cpu brand string").as_str().to_string();
             let cpu_vendor = cpu_id.get_vendor_info().expect("No vendor info for CPU").as_str().to_string();
@@ -57,6 +61,7 @@ fn start() -> ! {
                 Update: {val}\n\
                 Timer: {timer_counter}\n\
                 RTC: {time}\n\
+                HPET: {hpet_secs}.{hpet_frac:03}\n\
                 CPU BRAND: {cpu_brand}\n\
                 CPU VENDOR: {cpu_vendor}\n\
                 ").as_str(),

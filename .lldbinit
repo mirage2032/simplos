@@ -1,3 +1,3 @@
-target create /home/alx/simplos/fullkernel/target/x86_64-unknown-none/debug/deps/artifact/simplos-273dfd5b2ba66951/bin/simplos-273dfd5b2ba66951
-target modules load --file /home/alx/simplos/fullkernel/target/x86_64-unknown-none/debug/deps/artifact/simplos-273dfd5b2ba66951/bin/simplos-273dfd5b2ba66951 --slide 0x8000000000
+target create /home/alx/simplos/fullkernel/target/x86_64-unknown-none/debug/deps/artifact/simplos-71a57052ea39ce71/bin/simplos-71a57052ea39ce71
+target modules load --file /home/alx/simplos/fullkernel/target/x86_64-unknown-none/debug/deps/artifact/simplos-71a57052ea39ce71/bin/simplos-71a57052ea39ce71 --slide 0x8000000000
 process handle SIGTRAP -s false

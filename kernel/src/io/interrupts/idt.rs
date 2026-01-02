@@ -2,13 +2,12 @@ use crate::io::interrupts::pic::InterruptIndex;
 use crate::io::interrupts::{gdt, pic};
 use crate::io::ps2::{Ps2InterruptCause, PS2_CONTROLLER};
 use crate::io::video::VIDEO;
-use crate::utils::imutex::IMutex;
 // use crate::vga_buffer::{Color, ColorCode, WRITER};
 // use crate::{print, println, serial_println};
 use crate::FRAMEBUFFER;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::{Lazy, Mutex};
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
-use crate::badoo;
 pub static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     let mut idt = InterruptDescriptorTable::new();
     idt.breakpoint.set_handler_fn(breakpoint_handler);
@@ -60,15 +59,14 @@ fn test_breakpoint_exception() {
     x86_64::instructions::interrupts::int3();
 }
 
-pub static TIMER_COUNTER: Lazy<IMutex<usize>> = Lazy::new(|| IMutex::new(0));
+pub static TIMER_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
 extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    TIMER_COUNTER.fetch_add(1, Ordering::Relaxed);
+    
     unsafe {
         let video = VIDEO.force_lock();
-        {
-            let mut timer_counter = TIMER_COUNTER.force_lock();
-            *timer_counter += 1;
-        }
-
+        
         #[allow(static_mut_refs)]
         let mut fb_lock = FRAMEBUFFER.lock();
         if let Some(fb) = fb_lock.as_mut() {
