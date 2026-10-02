@@ -65,8 +65,8 @@ checksum = "1b8e56985ec62d17e9c1001dc89c88ecd7dc08e47eba5ec7c29c7b5eeecde967"
 
 [[package]]
 name = "bootloader_api"
-version = "0.11.10"
-source = "git+https://github.com/rust-osdev/bootloader.git#6fa89e7be42fbe324a657362daa3f45ed13aaa3c"
+version = "0.11.17"
+source = "git+https://github.com/rust-osdev/bootloader.git#3d7f72e36d4101ecf78b70cef2475d700bb01721"
 
 [[package]]
 name = "byteorder"
@@ -79,6 +79,12 @@ name = "cfg-if"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"
+
+[[package]]
+name = "const_fn"
+version = "0.4.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "413d67b29ef1021b4d60f4aa1e925ca031751e213832b4b1d588fae623c05c60"
 
 [[package]]
 name = "embedded-graphics"
@@ -238,7 +244,7 @@ version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "62d9a86c292b165f757e47e7fd66855def189b2564609bc4203727b27c33db22"
 dependencies = [
- "x86_64 0.15.2",
+ "x86_64",
 ]
 
 [[package]]
@@ -253,11 +259,9 @@ dependencies = [
 [[package]]
 name = "ps2"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dfef03bb1362e6a23a211efe8c72e2eeb6888f51fb329cdfa07bb470986ea7d0"
 dependencies = [
  "bitflags 1.3.2",
- "x86_64 0.14.13",
+ "x86_64",
 ]
 
 [[package]]
@@ -319,7 +323,7 @@ dependencies = [
  "uart_16550",
  "volatile 0.6.1",
  "x86",
- "x86_64 0.15.2",
+ "x86_64",
  "x86_rtc",
 ]
 
@@ -406,24 +410,13 @@ dependencies = [
 
 [[package]]
 name = "x86_64"
-version = "0.14.13"
+version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c101112411baafbb4bf8d33e4c4a80ab5b02d74d2612331c61e8192fc9710491"
+checksum = "be4ec631e1a81d50e46c35a4a00322bd076c47491b64c2fb10a7ffa89002c697"
 dependencies = [
  "bit_field",
  "bitflags 2.9.1",
- "rustversion",
- "volatile 0.4.6",
-]
-
-[[package]]
-name = "x86_64"
-version = "0.15.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0f042214de98141e9c8706e8192b73f56494087cc55ebec28ce10f26c5c364ae"
-dependencies = [
- "bit_field",
- "bitflags 2.9.1",
+ "const_fn",
  "rustversion",
  "volatile 0.4.6",
 ]
@@ -435,5 +428,5 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d1a42420da20c01d82e5d42231570efa3b9e16a5515eaaf9ee4e964f49cc1313"
 dependencies = [
  "cfg-if",
- "x86_64 0.15.2",
+ "x86_64",
 ]

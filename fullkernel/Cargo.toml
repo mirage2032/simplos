@@ -17,3 +17,5 @@ debug = 2
 [profile.dev.build-override]
 opt-level = 0
 debug = 2
+[patch.crates-io]
+ps2 = { path = "../vendor/ps2" }

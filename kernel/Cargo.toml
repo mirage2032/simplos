@@ -34,3 +34,9 @@ harness = false
 [[test]]
 name = "stack_overflow"
 harness = false
+
+[patch.crates-io]
+# ps2 0.2.0 (latest release) pins x86_64 ^0.14, which no longer compiles on
+# current nightly (unstable `Step` trait gained new required methods).
+# Local copy only bumps that dependency to 0.15.
+ps2 = { path = "../vendor/ps2" }
