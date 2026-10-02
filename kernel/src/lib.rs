@@ -19,8 +19,10 @@ pub use io::console::CONSOLE;
 use crate::io::{init_io, video};
 use crate::memory::BootInfoFrameAllocator;
 use bootloader_api::config::{BootloaderConfig, Mapping};
+use bootloader_api::info::{MemoryRegionKind, MemoryRegions};
 use bootloader_api::{entry_point, BootInfo};
 use core::panic::PanicInfo;
+use core::sync::atomic::{AtomicU8, Ordering};
 use io::utils::qemu::{exit_qemu, QemuExitCode};
 use x86_64::VirtAddr;
 
@@ -31,9 +33,56 @@ pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     config
 };
 
+/// Firmware the bootloader handed us off from.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BootMode {
+    Uefi,
+    Bios,
+    Unknown,
+}
+
+impl BootMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BootMode::Uefi => "UEFI",
+            BootMode::Bios => "BIOS",
+            BootMode::Unknown => "unknown",
+        }
+    }
+}
+
+static BOOT_MODE: AtomicU8 = AtomicU8::new(BootMode::Unknown as u8);
+
+/// Boot mode detected during `pre_init`.
+pub fn boot_mode() -> BootMode {
+    match BOOT_MODE.load(Ordering::Relaxed) {
+        x if x == BootMode::Uefi as u8 => BootMode::Uefi,
+        x if x == BootMode::Bios as u8 => BootMode::Bios,
+        _ => BootMode::Unknown,
+    }
+}
+
+/// The boot info carries no firmware field, but the memory map does: regions the
+/// bootloader could not classify keep their origin tag, which only one of the two
+/// firmware paths ever produces.
+fn detect_boot_mode(regions: &MemoryRegions) -> BootMode {
+    for region in regions.iter() {
+        match region.kind {
+            MemoryRegionKind::UnknownUefi(_) => return BootMode::Uefi,
+            MemoryRegionKind::UnknownBios(_) => return BootMode::Bios,
+            _ => {}
+        }
+    }
+    BootMode::Unknown
+}
+
 pub fn pre_init(boot_info: &'static mut BootInfo) {
     unsafe {
         init_io();
+        BOOT_MODE.store(
+            detect_boot_mode(&boot_info.memory_regions) as u8,
+            Ordering::Relaxed,
+        );
         let phys_mem_offset = VirtAddr::new(
             boot_info
                 .physical_memory_offset

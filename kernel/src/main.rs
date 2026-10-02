@@ -18,6 +18,7 @@ use embedded_graphics::pixelcolor::{Rgb888};
 use embedded_graphics::prelude::*;
 use embedded_graphics::text::{Alignment, Text};
 use alloc::string::String;
+use simplos::boot_mode;
 use simplos::BOOTLOADER_CONFIG;
 use simplos::DISPLAY;
 use simplos::CONSOLE;
@@ -67,10 +68,12 @@ fn start() -> ! {
             let cpu_id = x86::cpuid::CpuId::new();
             let cpu_brand = cpu_id.get_processor_brand_string().expect("Failed to get cpu brand string").as_str().to_string();
             let cpu_vendor = cpu_id.get_vendor_info().expect("No vendor info for CPU").as_str().to_string();
+            let firmware = boot_mode().as_str();
             
             Text::with_alignment(
                 format!("\
                 Update: {val}\n\
+                Boot: {firmware}\n\
                 Timer: {timer_counter}\n\
                 RTC: {time}\n\
                 HPET: {hpet_secs}.{hpet_frac:03}\n\

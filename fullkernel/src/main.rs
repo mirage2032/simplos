@@ -3,8 +3,9 @@ fn main() {
     let uefi_path = env!("UEFI_PATH");
     let bios_path = env!("BIOS_PATH");
 
-    // choose whether to start the UEFI or BIOS image
-    let uefi = true;
+    // choose whether to start the UEFI or BIOS image; pass `--bios` to use BIOS
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let uefi = !args.iter().any(|arg| arg == "--bios");
 
     let mut cmd = std::process::Command::new("qemu-system-x86_64");
     if uefi {
@@ -21,11 +22,11 @@ fn main() {
     cmd.arg("-serial").arg("stdio");
     
     // Process command line args
-    std::env::args().skip(1).for_each(|arg| {
+    args.iter().for_each(|arg| {
         if arg == "--debug" {
             cmd.arg("-S"); // Wait for debugger
-        } else {
-            cmd.arg(&arg);
+        } else if arg != "--bios" {
+            cmd.arg(arg);
         }
     });
     
