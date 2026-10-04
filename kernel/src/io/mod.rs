@@ -1,10 +1,11 @@
-pub mod video;
-pub mod serial;
-pub mod utils;
+pub mod console;
+pub mod fwcfg;
+pub mod hpet;
 pub mod interrupts;
 pub mod ps2;
-pub mod hpet;
-pub mod console;
+pub mod serial;
+pub mod utils;
+pub mod video;
 
 pub fn init_io() {
     interrupts::init_interrupts();

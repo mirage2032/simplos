@@ -19,9 +19,9 @@ fn main() {
 
     let dimension = |name: &str, default: u64| -> u64 {
         match env::var(name) {
-            Ok(value) => value
-                .parse()
-                .unwrap_or_else(|_| panic!("{name} must be a number, got {value:?}")),
+            Ok(value) => {
+                value.parse().unwrap_or_else(|_| panic!("{name} must be a number, got {value:?}"))
+            }
             Err(_) => default,
         }
     };
