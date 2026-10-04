@@ -1,15 +1,17 @@
+use bootloader_api::info::{MemoryRegionKind, MemoryRegions};
 use x86_64::{
     PhysAddr, VirtAddr,
     structures::paging::{FrameAllocator, OffsetPageTable, PageTable, PhysFrame, Size4KiB},
 };
-use bootloader_api::info::{MemoryRegionKind,MemoryRegions};
 
 /// Initialize a new OffsetPageTable.
 ///
-/// This function is unsafe because the caller must guarantee that the
-/// complete physical memory is mapped to virtual memory at the passed
-/// `physical_memory_offset`. Also, this function must be only called once
-/// to avoid aliasing `&mut` references (which is undefined behavior).
+/// # Safety
+///
+/// The caller must guarantee that the complete physical memory is mapped to
+/// virtual memory at the passed `physical_memory_offset`. Also, this function
+/// must be only called once to avoid aliasing `&mut` references (which is
+/// undefined behavior).
 pub unsafe fn init(physical_memory_offset: VirtAddr) -> OffsetPageTable<'static> {
     unsafe {
         let level_4_table = active_level_4_table(physical_memory_offset);
@@ -53,14 +55,13 @@ pub struct BootInfoFrameAllocator {
 impl BootInfoFrameAllocator {
     /// Create a FrameAllocator from the passed memory map.
     ///
-    /// This function is unsafe because the caller must guarantee that the passed
-    /// memory map is valid. The main requirement is that all frames that are marked
-    /// as `USABLE` in it are really unused.
+    /// # Safety
+    ///
+    /// The caller must guarantee that the passed memory map is valid. The main
+    /// requirement is that all frames that are marked as `USABLE` in it are
+    /// really unused.
     pub unsafe fn init(memory_map: &'static MemoryRegions) -> Self {
-        BootInfoFrameAllocator {
-            memory_map,
-            next: 0,
-        }
+        BootInfoFrameAllocator { memory_map, next: 0 }
     }
 
     /// Returns an iterator over the usable frames specified in the memory map.

@@ -31,18 +31,18 @@ pub struct FixedSizeBlockAllocator {
 impl FixedSizeBlockAllocator {
     /// Creates an empty FixedSizeBlockAllocator.
     pub const fn new() -> Self {
-        const EMPTY: Option<&'static mut ListNode> = None;
         FixedSizeBlockAllocator {
-            list_heads: [EMPTY; BLOCK_SIZES.len()],
+            list_heads: [const { None }; BLOCK_SIZES.len()],
             fallback_allocator: linked_list_allocator::Heap::empty(),
         }
     }
 
     /// Initialize the allocator with the given heap bounds.
     ///
-    /// This function is unsafe because the caller must guarantee that the given
-    /// heap bounds are valid and that the heap is unused. This method must be
-    /// called only once.
+    /// # Safety
+    ///
+    /// The caller must guarantee that the given heap bounds are valid and that
+    /// the heap is unused. This method must be called only once.
     pub unsafe fn init(&mut self, heap_start: usize, heap_size: usize) {
         unsafe {
             //convert heap_start to *mut u8
@@ -88,9 +88,7 @@ unsafe impl GlobalAlloc for Locked<FixedSizeBlockAllocator> {
         let mut allocator = self.lock();
         match list_index(&layout) {
             Some(index) => {
-                let new_node = ListNode {
-                    next: allocator.list_heads[index].take(),
-                };
+                let new_node = ListNode { next: allocator.list_heads[index].take() };
                 // verify that block has size and alignment required for storing node
                 assert!(mem::size_of::<ListNode>() <= BLOCK_SIZES[index]);
                 assert!(mem::align_of::<ListNode>() <= BLOCK_SIZES[index]);
@@ -107,5 +105,11 @@ unsafe impl GlobalAlloc for Locked<FixedSizeBlockAllocator> {
                 }
             }
         }
+    }
+}
+
+impl Default for FixedSizeBlockAllocator {
+    fn default() -> Self {
+        Self::new()
     }
 }

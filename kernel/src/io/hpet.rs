@@ -7,18 +7,18 @@ use spin::{Lazy, Mutex};
 use x86_64::VirtAddr;
 
 // HPET register offsets
-const HPET_CAP_ID: usize = 0x00;       // Capabilities and ID
-const HPET_CONFIG: usize = 0x10;       // Configuration
-const HPET_COUNTER: usize = 0xF0;      // Main counter value (64-bit)
+const HPET_CAP_ID: usize = 0x00; // Capabilities and ID
+const HPET_CONFIG: usize = 0x10; // Configuration
+const HPET_COUNTER: usize = 0xF0; // Main counter value (64-bit)
 
 // Configuration register bits
-const HPET_CFG_ENABLE: u64 = 1 << 0;   // Enable main counter
+const HPET_CFG_ENABLE: u64 = 1 << 0; // Enable main counter
 
 /// HPET driver instance
 pub struct Hpet {
     base: VirtAddr,
-    period_fs: u64,     // Period in femtoseconds (10^-15 seconds)
-    start_count: u64,   // Counter value at initialization
+    period_fs: u64,   // Period in femtoseconds (10^-15 seconds)
+    start_count: u64, // Counter value at initialization
 }
 
 impl Hpet {
@@ -30,22 +30,23 @@ impl Hpet {
     pub unsafe fn new(hpet_phys_addr: u64, phys_mem_offset: VirtAddr) -> Self {
         let base = phys_mem_offset + hpet_phys_addr;
 
-        // Read capabilities register to get the period
-        let cap = read_volatile((base + HPET_CAP_ID as u64).as_ptr::<u64>());
-        let period_fs = cap >> 32; // Upper 32 bits = period in femtoseconds
+        // Safety: these are the HPET's own memory-mapped registers, which the
+        // caller has promised `base` points at. Each access is volatile because
+        // the device, not this code, decides what they read back as.
+        unsafe {
+            // Read capabilities register to get the period
+            let cap = read_volatile((base + HPET_CAP_ID as u64).as_ptr::<u64>());
+            let period_fs = cap >> 32; // Upper 32 bits = period in femtoseconds
 
-        // Enable the main counter
-        let mut config = read_volatile((base + HPET_CONFIG as u64).as_ptr::<u64>());
-        config |= HPET_CFG_ENABLE;
-        write_volatile((base + HPET_CONFIG as u64).as_mut_ptr::<u64>(), config);
+            // Enable the main counter
+            let mut config = read_volatile((base + HPET_CONFIG as u64).as_ptr::<u64>());
+            config |= HPET_CFG_ENABLE;
+            write_volatile((base + HPET_CONFIG as u64).as_mut_ptr::<u64>(), config);
 
-        // Read initial counter value
-        let start_count = read_volatile((base + HPET_COUNTER as u64).as_ptr::<u64>());
+            // Read initial counter value
+            let start_count = read_volatile((base + HPET_COUNTER as u64).as_ptr::<u64>());
 
-        Hpet {
-            base,
-            period_fs,
-            start_count,
+            Hpet { base, period_fs, start_count }
         }
     }
 
@@ -99,7 +100,7 @@ pub static HPET: Lazy<Mutex<Option<Hpet>>> = Lazy::new(|| Mutex::new(None));
 /// * `rsdp_addr` - Physical address of RSDP (from bootloader)
 /// * `phys_mem_offset` - Virtual address offset for physical memory mapping
 pub fn init_hpet(rsdp_addr: u64, phys_mem_offset: VirtAddr) -> Result<(), &'static str> {
-    use acpi::{AcpiHandler, AcpiTables, PhysicalMapping, HpetInfo};
+    use acpi::{AcpiHandler, AcpiTables, HpetInfo, PhysicalMapping};
     use core::ptr::NonNull;
 
     /// Handler for the acpi crate to map physical memory
@@ -115,13 +116,19 @@ pub fn init_hpet(rsdp_addr: u64, phys_mem_offset: VirtAddr) -> Result<(), &'stat
             size: usize,
         ) -> PhysicalMapping<Self, T> {
             let virtual_address = physical_address + self.phys_offset as usize;
-            PhysicalMapping::new(
-                physical_address,
-                NonNull::new(virtual_address as *mut T).unwrap(),
-                size,
-                size,
-                self.clone(),
-            )
+            // Safety: all of physical memory is already mapped at
+            // `phys_offset`, so the region is live for as long as this mapping
+            // is, and the caller's `physical_address` and `size` describe a
+            // real ACPI table.
+            unsafe {
+                PhysicalMapping::new(
+                    physical_address,
+                    NonNull::new(virtual_address as *mut T).unwrap(),
+                    size,
+                    size,
+                    self.clone(),
+                )
+            }
         }
 
         fn unmap_physical_region<T>(_region: &PhysicalMapping<Self, T>) {
@@ -129,9 +136,7 @@ pub fn init_hpet(rsdp_addr: u64, phys_mem_offset: VirtAddr) -> Result<(), &'stat
         }
     }
 
-    let handler = IdentityMappedHandler {
-        phys_offset: phys_mem_offset.as_u64(),
-    };
+    let handler = IdentityMappedHandler { phys_offset: phys_mem_offset.as_u64() };
 
     // Parse ACPI tables
     let tables = unsafe {
@@ -140,8 +145,7 @@ pub fn init_hpet(rsdp_addr: u64, phys_mem_offset: VirtAddr) -> Result<(), &'stat
     };
 
     // Get HPET info from platform info
-    let hpet_info = HpetInfo::new(&tables)
-        .map_err(|_| "HPET not found in ACPI tables")?;
+    let hpet_info = HpetInfo::new(&tables).map_err(|_| "HPET not found in ACPI tables")?;
 
     let hpet_base = hpet_info.base_address as u64;
 
@@ -162,4 +166,3 @@ pub fn elapsed_millis() -> Option<u64> {
 pub fn elapsed_micros() -> Option<u64> {
     HPET.lock().as_ref().map(|h| h.elapsed_micros())
 }
-

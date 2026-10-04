@@ -6,7 +6,6 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
-use spin::Mutex;
 
 /// Maximum number of messages in the buffer
 const BUFFER_SIZE: usize = 64;
@@ -22,10 +21,7 @@ struct MessageSlot {
 
 impl MessageSlot {
     const fn new() -> Self {
-        Self {
-            data: [0; MAX_MSG_LEN],
-            len: AtomicUsize::new(0),
-        }
+        Self { data: [0; MAX_MSG_LEN], len: AtomicUsize::new(0) }
     }
 }
 
@@ -38,10 +34,13 @@ pub struct ConsoleBuffer {
 
 impl ConsoleBuffer {
     pub const fn new() -> Self {
-        // Can't use array init with const fn easily, so we do it manually
-        const EMPTY_SLOT: MessageSlot = MessageSlot::new();
+        // `[MessageSlot::new(); N]` needs the element to be `Copy`, which an
+        // `AtomicUsize` is not. `from_fn` in a const context isn't available
+        // either, so the array is built by repeating a const — written inline
+        // rather than as a named `const`, which would read as a shared value
+        // when each slot is in fact its own.
         Self {
-            slots: [EMPTY_SLOT; BUFFER_SIZE],
+            slots: [const { MessageSlot::new() }; BUFFER_SIZE],
             write_pos: AtomicUsize::new(0),
             read_pos: AtomicUsize::new(0),
         }
@@ -52,7 +51,7 @@ impl ConsoleBuffer {
     pub fn push(&self, msg: &str) -> bool {
         let write = self.write_pos.load(Ordering::Acquire);
         let read = self.read_pos.load(Ordering::Acquire);
-        
+
         // Check if buffer is full
         let next_write = (write + 1) % BUFFER_SIZE;
         if next_write == read {
@@ -62,7 +61,7 @@ impl ConsoleBuffer {
         let slot = &self.slots[write];
         let bytes = msg.as_bytes();
         let len = bytes.len().min(MAX_MSG_LEN);
-        
+
         // Copy message to slot
         // Safety: We're the only writer to this slot at this position
         unsafe {
@@ -70,7 +69,7 @@ impl ConsoleBuffer {
             core::ptr::copy_nonoverlapping(bytes.as_ptr(), data_ptr, len);
         }
         slot.len.store(len, Ordering::Release);
-        
+
         // Advance write position
         self.write_pos.store(next_write, Ordering::Release);
         true
@@ -80,14 +79,14 @@ impl ConsoleBuffer {
     pub fn pop(&self) -> Option<String> {
         let read = self.read_pos.load(Ordering::Acquire);
         let write = self.write_pos.load(Ordering::Acquire);
-        
+
         if read == write {
             return None; // Buffer empty
         }
 
         let slot = &self.slots[read];
         let len = slot.len.load(Ordering::Acquire);
-        
+
         if len == 0 {
             return None;
         }
@@ -97,11 +96,11 @@ impl ConsoleBuffer {
             let slice = core::slice::from_raw_parts(slot.data.as_ptr(), len);
             String::from_utf8_lossy(slice).into_owned()
         };
-        
+
         // Clear slot and advance read position
         slot.len.store(0, Ordering::Release);
         self.read_pos.store((read + 1) % BUFFER_SIZE, Ordering::Release);
-        
+
         Some(msg)
     }
 
@@ -143,3 +142,8 @@ macro_rules! interrupt_log {
     };
 }
 
+impl Default for ConsoleBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
