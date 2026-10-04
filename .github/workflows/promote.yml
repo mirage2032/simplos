@@ -1,0 +1,172 @@
+name: Promote to master
+
+# Promotes what's merged into develop to master: checks it, gives it a new
+# version, moves both branches to that one commit, and publishes a GitHub
+# Release with the two bootable disk images attached. You're asked which part of
+# the version to bump (patch: fixes · minor: new features · major: big changes).
+#
+# master is therefore always a released, checked commit, and the images on its
+# latest release are what the website and anyone else should be running — no
+# building a bare-metal Rust kernel to get a bootable image.
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Which part of the version to bump"
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+        default: patch
+
+permissions:
+  contents: read
+
+# One promotion at a time; a second waits instead of racing the first.
+concurrency:
+  group: promote
+  cancel-in-progress: false
+
+jobs:
+  # Pins the develop commit being released, so the checks and the release are
+  # about the same code even if develop moves in the meantime.
+  target:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.develop.outputs.sha }}
+    steps:
+      - id: develop
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/develop" --jq .sha)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Releasing develop at $sha" >> "$GITHUB_STEP_SUMMARY"
+
+  # The pull request checks passed for each change on its own; this checks them
+  # together, at the exact commit being released.
+  check:
+    needs: target
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.target.outputs.sha }}
+
+  release:
+    needs: [target, check]
+    if: ${{ !failure() && !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions:
+      # To push master, develop and the tag, and to create the Release.
+      # Unlike the website's, this promotion never changes a workflow file and
+      # triggers nothing downstream, so the built-in token is enough and no
+      # GitHub App is needed.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.target.outputs.sha }}
+          fetch-depth: 0 # every branch and tag: to compare with master and past releases
+
+      - name: Install QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y qemu-system-x86
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache-workspaces: |
+            kernel -> target
+            fullkernel -> target
+            tools/boot-test -> target
+            vendor/bootloader -> target
+
+      - name: Check there's something to promote
+        env:
+          SHA: ${{ needs.target.outputs.sha }}
+        run: |
+          if [[ $(git rev-parse origin/develop) != "$SHA" ]]; then
+            echo "::error::develop moved while the checks ran. Run it again."; exit 1
+          fi
+          if ! git merge-base --is-ancestor origin/master HEAD; then
+            echo "::error::master has commits that develop doesn't (a direct push or hotfix?). Merge master into develop first."; exit 1
+          fi
+          if [[ $(git rev-parse origin/master) == "$SHA" ]]; then
+            echo "::error::Nothing to promote: master already has everything on develop."; exit 1
+          fi
+
+      - name: Work out the version
+        id: version
+        run: |
+          next=$(.github/scripts/next-version.sh "${{ inputs.bump }}")
+          previous=$(git tag --list 'v*' --sort=-v:refname | head -1)
+          echo "next=$next" >> "$GITHUB_OUTPUT"
+          echo "previous=$previous" >> "$GITHUB_OUTPUT"
+          echo "v$next (since ${previous:-the start})"
+
+      # Both crates carry the release version, and their locks follow because
+      # fullkernel depends on the kernel by path. Nothing else may change.
+      - name: Bump the version
+        env:
+          NEXT: ${{ steps.version.outputs.next }}
+        run: |
+          for crate in kernel fullkernel; do
+            sed -i -E "0,/^version = \"[^\"]*\"$/s//version = \"$NEXT\"/" "$crate/Cargo.toml"
+            # Both from inside the crate: fullkernel's manifest uses an artifact
+            # dependency, which cargo refuses to even parse without the `bindeps`
+            # setting in that crate's own .cargo/config.toml.
+            (
+              cd "$crate"
+              cargo update --workspace
+              pkgid=$(cargo pkgid)
+              if [[ ${pkgid##*[#@]} != "$NEXT" ]]; then
+                echo "::error::$crate/Cargo.toml still reads ${pkgid##*[#@]} after the bump."; exit 1
+              fi
+            )
+          done
+          expected="fullkernel/Cargo.lock fullkernel/Cargo.toml kernel/Cargo.lock kernel/Cargo.toml"
+          if [[ $(git diff --name-only | sort | xargs) != "$expected" ]]; then
+            echo "::error::The bump changed more than the versions:"; git diff --stat; exit 1
+          fi
+
+      # Built from the release commit, so the images attached below are exactly
+      # what this tag describes. The smoke test runs once more here because
+      # these specific files are the artefacts people will download.
+      - name: Build the images
+        run: scripts/build-images.sh
+
+      - name: Boot the images
+        run: scripts/smoke-test.sh
+
+      - name: Commit, tag and push
+        env:
+          NEXT: ${{ steps.version.outputs.next }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "Release v$NEXT"
+          git tag -a "v$NEXT" -m "v$NEXT"
+          # Fast-forwards only (no --force), all or nothing: master, develop and
+          # the tag end up on the same release commit, or nothing changes.
+          git push --atomic origin HEAD:refs/heads/master HEAD:refs/heads/develop "refs/tags/v$NEXT"
+
+      - name: Publish the GitHub Release
+        env:
+          NEXT: ${{ steps.version.outputs.next }}
+          PREVIOUS: ${{ steps.version.outputs.previous }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v$NEXT" --verify-tag --title "v$NEXT" --generate-notes \
+            ${PREVIOUS:+--notes-start-tag "$PREVIOUS"} \
+            "dist/bios.img#Bootable BIOS disk image" \
+            "dist/uefi.img#Bootable UEFI disk image"
+          {
+            echo "### Released v$NEXT"
+            echo "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/v$NEXT"
+            echo
+            echo "master and develop now point at this commit. Both images boot at"
+            echo "1920x1080; pass \`-fw_cfg name=opt/simplos/fb,string=WIDTHxHEIGHT\`"
+            echo "to ask the kernel for something smaller."
+          } >> "$GITHUB_STEP_SUMMARY"
