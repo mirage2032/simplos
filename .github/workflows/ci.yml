@@ -7,13 +7,14 @@ name: CI
 # which builds four real-mode BIOS stages and a UEFI loader through five nested
 # `cargo install` runs with their own `build-std`. Splitting format, lint, test
 # and build across jobs would pay that cost once per job.
+#
+# Deliberately without a `paths` filter, even though a README-only change pays
+# for a full build. Once this is a required check on develop, a pull request
+# whose files are all excluded would never run it, and a required check that
+# never runs stays pending forever — the pull request can't merge and there is
+# nothing to re-run. Minutes are cheaper than that.
 on:
   pull_request:
-    paths:
-      - '**'
-      - '!**/*.md'
-      - '!.github/**'
-      - '.github/workflows/ci.yml'
   workflow_call:
     inputs:
       ref:
