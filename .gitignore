@@ -1,2 +1,11 @@
 /target
 vendor/bootloader/target
+
+# Written by fullkernel/build.rs on every build, pointing at the kernel ELF
+# inside an OUT_DIR whose cargo hash is not stable. Machine-specific by
+# construction, so they can never be right for two checkouts at once.
+/.gdbinit
+/.lldbinit
+
+# Release images, produced by scripts/build-images.sh.
+/dist
