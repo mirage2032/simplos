@@ -40,28 +40,58 @@ trap 'rm -rf "$logs"' EXIT
 firmware=$(find ~/.cargo/registry/src -name 'OVMF-pure-efi.fd' 2>/dev/null | head -1 || true)
 
 status=0
+
+# How long to give a boot before calling it hung. A 1080p framebuffer under an
+# interpreted CPU is not fast, but it is nowhere near this slow.
+readonly DEADLINE=120
+
 boot() {
-    local mode=$1 image=$2 log="$logs/$1.log"
+    local mode=$1 image=$2
     shift 2
-    echo "--- $mode ---"
+    # Separate statement: a single `local` expands every right-hand side before
+    # it assigns any of them, so `$mode` would still be unset here.
+    local log="$logs/$mode-$expect.log"
+    echo "--- $mode, expecting $expect ---"
+    : >"$log"
+
+    # Started in the background and killed as soon as it has said what we need
+    # to know. The kernel has no shutdown: it reports its mode and then runs its
+    # render loop forever, so waiting for QEMU to exit means waiting out the
+    # whole deadline on every boot — three of those is six minutes of nothing.
+    #
     # `-display none` because there is nobody to look at it, and TCG because CI
-    # has no KVM. A kernel that has reported its mode has nothing left to prove,
-    # but it never exits on its own, so the timeout is the normal way out.
-    timeout 120 qemu-system-x86_64 \
+    # has no KVM.
+    qemu-system-x86_64 \
         -drive "format=raw,file=$image" \
         -accel tcg -cpu qemu64 -m 256M -display none -no-reboot \
         -chardev "file,id=serial0,path=$log" -serial chardev:serial0 \
-        "$@" >/dev/null 2>&1 || true
+        "$@" >/dev/null 2>&1 &
+    local qemu=$!
 
-    local banner
+    local banner="" waited=0
+    while ((waited < DEADLINE)); do
+        banner=$(grep -a -m1 "^simplos: boot=" "$log" 2>/dev/null || true)
+        [[ -n $banner ]] && break
+        # A guest that died on its own (a triple fault, a QEMU error) will never
+        # print anything, so stop waiting for it.
+        kill -0 "$qemu" 2>/dev/null || break
+        sleep 1
+        waited=$((waited + 1))
+    done
+    # Give the kernel a moment past the banner, so a fault immediately after it
+    # still lands in the log before we pull the plug.
+    [[ -n $banner ]] && sleep 2
+    kill "$qemu" 2>/dev/null || true
+    wait "$qemu" 2>/dev/null || true
+
     banner=$(grep -a -m1 "^simplos: boot=" "$log" 2>/dev/null || true)
     if [[ -z $banner ]]; then
-        echo "::error::$mode: the kernel never reported a boot banner."
-        sed 's/^/    /' "$log" 2>/dev/null | tail -20
+        echo "::error::$mode: the kernel never reported a boot banner (waited ${waited}s)."
+        tail -20 "$log" 2>/dev/null | sed 's/^/    /'
         status=1
         return
     fi
-    echo "    $banner"
+    echo "    $banner  (after ${waited}s)"
 
     if [[ $banner != *"boot=${mode}"* ]]; then
         echo "::error::$mode: the kernel reports a different firmware: $banner"
@@ -71,7 +101,7 @@ boot() {
         echo "::error::$mode: expected fb=$expect, got: $banner"
         status=1
     fi
-    # A panic still prints a banner first, so the banner alone isn't enough.
+    # A panic prints a banner first, so the banner alone isn't enough.
     if grep -qa "KERNEL PANIC\|EXCEPTION: DOUBLE FAULT\|EXCEPTION: PAGE FAULT" "$log"; then
         echo "::error::$mode: the kernel faulted after booting."
         grep -a -A6 "KERNEL PANIC\|EXCEPTION:" "$log" | sed 's/^/    /'
