@@ -1,0 +1,4 @@
+[unstable]
+# The vendored bootloader's own dev-dependencies use artifact dependencies, so
+# even reading its manifest needs this.
+bindeps = true

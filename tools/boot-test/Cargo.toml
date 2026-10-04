@@ -1,0 +1,12 @@
+[package]
+name = "boot-test"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+# The same vendored bootloader the real images use, so a test boots the way the
+# kernel does. Taken by path rather than through a `[patch]` of the git
+# dependency, which is why this manifest needs none of the patch stanzas that
+# kernel/Cargo.toml and fullkernel/Cargo.toml carry.
+bootloader = { path = "../../vendor/bootloader" }
