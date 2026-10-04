@@ -1,6 +1,6 @@
-use ps2::error::{ControllerError, KeyboardError, MouseError};
+use ps2::Controller;
+use ps2::error::ControllerError;
 use ps2::flags::ControllerConfigFlags;
-use ps2::{Controller, Mouse, MouseType};
 use spin::{Lazy, Mutex};
 // use crate::{println, serial_println};
 
@@ -79,57 +79,6 @@ impl Ps2Controller {
         controller.write_config(config)?;
 
         Ok(Ps2Controller { controller })
-    }
-
-    fn initialize_keyboard(
-        controller: &mut Controller,
-        config: &mut ControllerConfigFlags,
-    ) -> Result<(), KeyboardError> {
-        controller.enable_keyboard()?;
-        config.set(ControllerConfigFlags::DISABLE_KEYBOARD, false);
-        config.set(ControllerConfigFlags::ENABLE_KEYBOARD_INTERRUPT, true);
-        controller.keyboard().reset_and_self_test()?;
-        controller.keyboard().set_scancode_set(1)?;
-        Ok(())
-    }
-
-    fn initialize_mouse(
-        controller: &mut Controller,
-        config: &mut ControllerConfigFlags,
-    ) -> Result<(), MouseError> {
-        controller.enable_mouse()?;
-        config.set(ControllerConfigFlags::DISABLE_MOUSE, false);
-        config.set(ControllerConfigFlags::ENABLE_MOUSE_INTERRUPT, true);
-        controller.mouse().reset_and_self_test()?;
-        Self::configure_mouse(controller)?;
-        controller.mouse().enable_data_reporting()?;
-        Ok(())
-    }
-
-    fn configure_mouse(controller: &mut Controller) -> Result<(), ControllerError> {
-        let sample_rates = [200, 100, 80, 200, 200, 80];
-        for &rate in &sample_rates {
-            controller.write_mouse(0xf3)?; // Set sample rate command
-            if controller.read_data()? != 0xFA {
-                panic!("Failed to set mouse sample rate");
-            }
-            controller.write_mouse(rate)?;
-            if controller.read_data()? != 0xFA {
-                panic!("Failed to set mouse sample rate");
-            }
-        }
-
-        // Set resolution to max
-        controller.write_mouse(0xe8)?; // Set resolution command
-        if controller.read_data()? != 0xFA {
-            panic!("Failed to set mouse resolution");
-        }
-        controller.write_mouse(3)?; // Max resolution
-        if controller.read_data()? != 0xFA {
-            panic!("Failed to set mouse resolution");
-        }
-
-        Ok(())
     }
 
     pub fn controller(&self) -> &Controller {

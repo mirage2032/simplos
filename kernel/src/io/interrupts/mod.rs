@@ -1,8 +1,6 @@
-use x86_64::instructions::port::Port;
-
 pub mod gdt;
-pub mod pic;
 pub mod idt;
+pub mod pic;
 pub fn init_interrupts() {
     gdt::init_gdt();
     idt::init_idt();
