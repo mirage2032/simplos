@@ -150,7 +150,18 @@ jobs:
           git tag -a "v$NEXT" -m "v$NEXT"
           # Fast-forwards only (no --force), all or nothing: master, develop and
           # the tag end up on the same release commit, or nothing changes.
-          git push --atomic origin HEAD:refs/heads/master HEAD:refs/heads/develop "refs/tags/v$NEXT"
+          if ! git push --atomic origin \
+            HEAD:refs/heads/master HEAD:refs/heads/develop "refs/tags/v$NEXT"; then
+            echo "::error::Couldn't push the release. If git rejected it for a branch rule:"
+            echo "::error::the release commit is pushed straight to develop, so a rule on"
+            echo "::error::develop that requires a pull request or a passing check will"
+            echo "::error::refuse it — the built-in GITHUB_TOKEN can't bypass a ruleset on a"
+            echo "::error::user-owned repository (only an org can grant an app a bypass)."
+            echo "::error::Either relax develop's ruleset to deletion + force-push only, or"
+            echo "::error::give this job a token that bypasses it (a PAT or deploy key added"
+            echo "::error::as a bypass actor). Nothing was pushed: the push is --atomic."
+            exit 1
+          fi
 
       - name: Publish the GitHub Release
         env:
