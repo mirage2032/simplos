@@ -66,7 +66,6 @@ checksum = "1b8e56985ec62d17e9c1001dc89c88ecd7dc08e47eba5ec7c29c7b5eeecde967"
 [[package]]
 name = "bootloader_api"
 version = "0.11.17"
-source = "git+https://github.com/rust-osdev/bootloader.git#3d7f72e36d4101ecf78b70cef2475d700bb01721"
 
 [[package]]
 name = "byteorder"

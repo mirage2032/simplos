@@ -40,3 +40,7 @@ harness = false
 # current nightly (unstable `Step` trait gained new required methods).
 # Local copy only bumps that dependency to 0.15.
 ps2 = { path = "../vendor/ps2" }
+
+# Vendored bootloader, patched for a 1920x1080 framebuffer on both firmware paths.
+[patch."https://github.com/rust-osdev/bootloader.git"]
+bootloader_api = { path = "../vendor/bootloader/api" }

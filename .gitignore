@@ -1,1 +1,3 @@
 /target
+vendor/bootloader/target
+spike/i686/target
