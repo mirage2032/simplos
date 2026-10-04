@@ -17,8 +17,8 @@ fn main() {
         set architecture i386:x86-64\n\
         add-symbol-file {} -o 0x8000000000\n\
         ",
-         kernel.to_string_lossy(),
-         kernel.to_string_lossy()
+        kernel.to_string_lossy(),
+        kernel.to_string_lossy()
     );
     println!("cargo:rerun-if-changed={}", gdbinit_path.display());
     std::fs::write(&gdbinit_path, gdbinit_content).unwrap();

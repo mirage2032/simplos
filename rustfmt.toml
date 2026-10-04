@@ -1,0 +1,5 @@
+# Same as the website's, so the two repositories read alike. "Max" lets short
+# constructs stay on one line instead of being split at 60% of the width, which
+# is how this kernel was already written: long `cmd.arg(..).arg(..)` chains and
+# small matches read better unbroken.
+use_small_heuristics = "Max"

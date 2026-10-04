@@ -1,0 +1,15 @@
+# The kernel needs nightly: `build-std`, artifact dependencies (`bindeps`),
+# `abi_x86_interrupt`, `custom_test_frameworks` and `panic-abort-tests` are all
+# unstable. Nightly is also a moving target, and this repo has been broken twice
+# by a nightly that changed under it, so the exact one is pinned here. Bumping it
+# is a deliberate commit that CI checks, not a surprise on someone's machine.
+#
+# `llvm-tools` is not optional: the vendored bootloader finds `llvm-objcopy`
+# through it to flatten the BIOS stages into flat binaries.
+#
+# Note the off-by-one: nightly channels are named for their *publish* date, so
+# `nightly-2026-09-26` is the toolchain that reports `(5ceaf6608 2026-09-25)`.
+[toolchain]
+channel = "nightly-2026-09-26"
+components = ["rust-src", "llvm-tools", "clippy", "rustfmt"]
+targets = ["x86_64-unknown-none"]
