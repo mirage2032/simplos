@@ -93,7 +93,6 @@ dependencies = [
 [[package]]
 name = "bootloader"
 version = "0.11.17"
-source = "git+https://github.com/rust-osdev/bootloader.git#3d7f72e36d4101ecf78b70cef2475d700bb01721"
 dependencies = [
  "anyhow",
  "bootloader-boot-config",
@@ -108,7 +107,6 @@ dependencies = [
 [[package]]
 name = "bootloader-boot-config"
 version = "0.11.17"
-source = "git+https://github.com/rust-osdev/bootloader.git#3d7f72e36d4101ecf78b70cef2475d700bb01721"
 dependencies = [
  "serde",
 ]
@@ -116,7 +114,6 @@ dependencies = [
 [[package]]
 name = "bootloader_api"
 version = "0.11.17"
-source = "git+https://github.com/rust-osdev/bootloader.git#3d7f72e36d4101ecf78b70cef2475d700bb01721"
 
 [[package]]
 name = "byteorder"

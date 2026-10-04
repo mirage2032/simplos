@@ -19,3 +19,8 @@ opt-level = 0
 debug = 2
 [patch.crates-io]
 ps2 = { path = "../vendor/ps2" }
+
+# Vendored bootloader, patched for a 1920x1080 framebuffer on both firmware paths.
+[patch."https://github.com/rust-osdev/bootloader.git"]
+bootloader = { path = "../vendor/bootloader" }
+bootloader_api = { path = "../vendor/bootloader/api" }
