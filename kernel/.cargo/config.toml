@@ -1,11 +1,19 @@
 [build]
-#target = "x86_64-simplos.json"
-#rustflags=["-g"]
-#rustflags = ["-C", "debuginfo=2"]
+# This crate only ever builds for the bare-metal target, so `cargo build`,
+# `cargo clippy` and `cargo test` all default to it instead of needing
+# `--target x86_64-unknown-none` spelled out every time.
+target = "x86_64-unknown-none"
+
 [unstable]
-#bindeps=true
 build-std-features = ["compiler-builtins-mem"]
 build-std = ["core", "compiler_builtins", "alloc"]
+# Each integration test is its own binary that aborts on panic, so the panic
+# tests don't need (and can't have) unwinding.
 panic-abort-tests = true
-#[target.'cfg(target_os = "none")']
-#runner = "bootimage runner"
+
+[target.x86_64-unknown-none]
+# The tests are kernels: they have to be wrapped in a bootable image and run
+# under QEMU. `tools/boot-test` does that and turns how the guest exited back
+# into a pass or a fail. Relative to this crate's directory, which is where
+# cargo invokes the runner from.
+runner = "../scripts/boot-test.sh"
