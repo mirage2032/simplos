@@ -15,6 +15,19 @@ pub fn _print(args: ::core::fmt::Arguments) {
     });
 }
 
+/// Write straight to the UART, bypassing [`SERIAL1`].
+///
+/// A panic can land while `_print` holds that lock — or in an interrupt that
+/// interrupted it — and taking it again would spin forever, turning the one
+/// message that explains the failure into yet another silent hang. The 16550
+/// has no state worth preserving, so re-initialising it here is safe.
+pub fn panic_print(args: ::core::fmt::Arguments) {
+    use core::fmt::Write;
+    let mut port = unsafe { SerialPort::new(0x3F8) };
+    port.init();
+    let _ = port.write_fmt(args);
+}
+
 #[macro_export]
 macro_rules! serial_print {
     ($($arg:tt)*) => {
