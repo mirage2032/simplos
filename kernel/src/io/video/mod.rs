@@ -1,13 +1,17 @@
 // pub mod vga_buffer;
 
+pub mod vbe;
+
+use crate::io::fwcfg;
+use crate::serial_println;
 use alloc::vec;
 use alloc::vec::Vec;
-use bootloader_api::info::{FrameBuffer, PixelFormat};
+use bootloader_api::info::{FrameBuffer, FrameBufferInfo, PixelFormat};
+use embedded_graphics::Pixel;
 use embedded_graphics::draw_target::DrawTarget;
 use embedded_graphics::geometry::{Dimensions, Point, Size};
 use embedded_graphics::pixelcolor::{Rgb888, RgbColor};
 use embedded_graphics::primitives::Rectangle;
-use embedded_graphics::Pixel;
 use spin::{Lazy, Mutex};
 
 /// Unified display driver that owns the hardware framebuffer and a back buffer
@@ -43,15 +47,18 @@ impl Display {
         }
     }
 
-    /// Initialize the display with a framebuffer from the bootloader
-    pub fn init(&mut self, framebuffer: FrameBuffer) {
-        let info = framebuffer.info();
+    /// Initialize the display with a framebuffer from the bootloader.
+    ///
+    /// `info` is passed separately rather than read from `framebuffer`, because
+    /// after [`resolve_mode`] has changed the hardware mode the framebuffer's
+    /// own copy describes the mode we are no longer in.
+    pub fn init(&mut self, framebuffer: FrameBuffer, info: FrameBufferInfo) {
         self.width = info.width as u32;
         self.height = info.height as u32;
         self.stride = info.stride as u32;
         self.bytes_per_pixel = info.bytes_per_pixel as u32;
         self.pixel_format = info.pixel_format;
-        
+
         let bufsize = (self.width * self.height * self.bytes_per_pixel) as usize;
         self.back_buffer = vec![0; bufsize];
         self.framebuffer = Some(framebuffer);
@@ -180,12 +187,13 @@ impl DrawTarget for Display {
         I: IntoIterator<Item = Pixel<Self::Color>>,
     {
         let max_index = (self.width * self.height * self.bytes_per_pixel) as usize;
-        
+
         for Pixel(coord, color) in pixels {
             if coord.x < 0 || coord.y < 0 || coord.x as u32 >= self.width {
                 continue;
             }
-            let index = ((coord.y as u32 * self.width + coord.x as u32) * self.bytes_per_pixel) as usize;
+            let index =
+                ((coord.y as u32 * self.width + coord.x as u32) * self.bytes_per_pixel) as usize;
             if index < max_index {
                 self.set_pixel(index, &color);
                 let row = coord.y as u32;
@@ -204,7 +212,102 @@ impl DrawTarget for Display {
 /// Global display instance
 pub static DISPLAY: Lazy<Mutex<Display>> = Lazy::new(|| Mutex::new(Display::new()));
 
-/// Initialize the display with a framebuffer from the bootloader
-pub fn init_display(framebuffer: FrameBuffer) {
-    DISPLAY.lock().init(framebuffer);
+/// Initialize the display with a framebuffer from the bootloader.
+pub fn init_display(framebuffer: FrameBuffer, info: FrameBufferInfo) {
+    DISPLAY.lock().init(framebuffer, info);
+}
+
+/// The fw_cfg file naming the mode to use, e.g. `1024x768`.
+const MODE_FILE: &str = "opt/simplos/fb";
+
+/// The display mode to actually use, which may not be the one we booted in.
+///
+/// The firmware chooses the mode before the kernel runs, so the build-time
+/// 1920x1080 is what both boot paths hand over. A host that wants something
+/// else — the browser build, where every emulated pixel is paid for twice —
+/// says so with `-fw_cfg name=opt/simplos/fb,string=1024x768`, and this is
+/// where that request is honoured.
+///
+/// **It can only make the framebuffer smaller.** The bootloader mapped exactly
+/// `original.byte_len` bytes of video memory and nothing will map more, so a
+/// larger mode would leave us writing past the end of the mapping. A request
+/// that doesn't fit is refused and the firmware's mode kept, which is also what
+/// happens on real hardware, where these registers don't exist at all.
+pub fn resolve_mode(original: FrameBufferInfo) -> FrameBufferInfo {
+    let Some((width, height)) = requested_mode() else {
+        return original;
+    };
+    if width == 0 || height == 0 {
+        serial_println!("simplos: fb request {}x{} is empty, keeping the boot mode", width, height);
+        return original;
+    }
+
+    let needed = width as usize * height as usize * original.bytes_per_pixel;
+    if needed > original.byte_len {
+        serial_println!(
+            "simplos: fb request {}x{} needs {} bytes but only {} are mapped, keeping the boot mode",
+            width,
+            height,
+            needed,
+            original.byte_len
+        );
+        return original;
+    }
+
+    let Some(mode) = vbe::set_mode(width, height, original.bytes_per_pixel as u32) else {
+        serial_println!("simplos: no VBE extensions, keeping the boot mode");
+        return original;
+    };
+
+    // What the device reports, not what was asked for — and checked again,
+    // because a device is free to answer with a mode of its own choosing.
+    let got = mode.stride as usize * mode.height as usize * mode.bytes_per_pixel as usize;
+    if got > original.byte_len {
+        serial_println!(
+            "simplos: VBE answered {}x{} stride={}, which overruns the mapping; reverting",
+            mode.width,
+            mode.height,
+            mode.stride
+        );
+        vbe::set_mode(
+            original.width as u32,
+            original.height as u32,
+            original.bytes_per_pixel as u32,
+        );
+        return original;
+    }
+
+    FrameBufferInfo {
+        width: mode.width as usize,
+        height: mode.height as usize,
+        stride: mode.stride as usize,
+        bytes_per_pixel: mode.bytes_per_pixel as usize,
+        // Still the size of the mapping, which is what `buffer_mut()` hands
+        // out; the visible mode is now a subset of it.
+        byte_len: original.byte_len,
+        pixel_format: original.pixel_format,
+    }
+}
+
+/// `WIDTHxHEIGHT` from fw_cfg, if the host asked for one.
+fn requested_mode() -> Option<(u32, u32)> {
+    // Long enough for any mode these registers can express ("65535x65535").
+    let mut buf = [0u8; 16];
+    let len = fwcfg::read_file(MODE_FILE, &mut buf)?;
+    // QEMU's `string=` values are NUL-terminated; a file written another way
+    // may have trailing whitespace.
+    let text = core::str::from_utf8(&buf[..len]).ok()?.trim_end_matches('\0').trim();
+
+    let parsed = text.split_once(['x', 'X']).and_then(|(width, height)| {
+        match (width.trim().parse(), height.trim().parse()) {
+            (Ok(width), Ok(height)) => Some((width, height)),
+            _ => None,
+        }
+    });
+    if parsed.is_none() {
+        // Worth saying out loud: a typo here would otherwise look exactly like
+        // not having asked for anything.
+        serial_println!("simplos: {} is {:?}, not WIDTHxHEIGHT", MODE_FILE, text);
+    }
+    parsed
 }

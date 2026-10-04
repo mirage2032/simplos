@@ -3,6 +3,16 @@ use std::process::Command;
 const BOOTLOADER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() {
+    // LOCAL PATCH: the BIOS stage-2's VESA cap is generated from these two
+    // variables (see bios/stage-2/build.rs). Cargo only knows about the
+    // *nested* build scripts' dependencies once it has run this one, so
+    // without declaring them here a change to either is invisible: this
+    // script doesn't rerun, the nested `cargo install` is never invoked, and
+    // the previously built stage-2 is reused with the old cap baked in. That
+    // silently shipped 1024x768 images labelled 1920x1080.
+    println!("cargo::rerun-if-env-changed=SIMPLOS_FB_WIDTH");
+    println!("cargo::rerun-if-env-changed=SIMPLOS_FB_HEIGHT");
+
     #[cfg(not(feature = "uefi"))]
     fn uefi_main() {}
     #[cfg(not(feature = "bios"))]

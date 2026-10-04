@@ -6,29 +6,27 @@
 extern crate alloc;
 use alloc::format;
 use alloc::string::ToString;
+use bootloader_api::{BootInfo, entry_point};
 use core::ops::DerefMut;
 use core::panic::PanicInfo;
 use core::sync::atomic::Ordering;
-use bootloader_api::{entry_point, BootInfo};
 use embedded_graphics::mono_font::ascii::FONT_7X13;
 // use embedded_graphics::mono_font::ascii::FONT_7X13;
 // use haxorfont::FONT_HAX_ITALICRMEDIUM11;
+use alloc::string::String;
 use embedded_graphics::mono_font::MonoTextStyle;
-use embedded_graphics::pixelcolor::{Rgb888};
+use embedded_graphics::pixelcolor::Rgb888;
 use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::Rectangle;
 use embedded_graphics::text::{Alignment, Text};
-use alloc::string::String;
-use simplos::boot_mode;
 use simplos::BOOTLOADER_CONFIG;
-use simplos::DISPLAY;
 use simplos::CONSOLE;
-use simplos::io::interrupts::idt::TIMER_COUNTER;
+use simplos::DISPLAY;
+use simplos::boot_mode;
 use simplos::io::hpet;
+use simplos::io::interrupts::idt::TIMER_COUNTER;
 use simplos::pre_init;
 use x86_rtc::Rtc;
-use x86;
-use simplos::badoo;
 
 entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 #[allow(unreachable_code)]
@@ -97,7 +95,8 @@ fn start() -> ! {
         let hpet_ms = hpet::elapsed_millis().unwrap_or(0);
         let hpet_secs = hpet_ms / 1000;
         let hpet_frac = hpet_ms % 1000;
-        let status = format!("\
+        let status = format!(
+            "\
             Update: {val}\n\
             Boot: {firmware}\n\
             Timer: {tick}\n\
@@ -107,7 +106,8 @@ fn start() -> ! {
             Vendor: {cpu_vendor}\n\
             \n\
             Keyboard: {keyboard_input}\n\
-            ");
+            "
+        );
 
         {
             let mut display = DISPLAY.lock();
@@ -125,15 +125,13 @@ fn start() -> ! {
     }
 }
 
+// Under `cargo test` the failure has to reach the host, which is what
+// `test_panic_handler` does: report over serial, then tell QEMU to exit with a
+// failing status.
 #[cfg(test)]
 #[panic_handler]
-#[allow(unreachable_code)]
 fn panic(info: &PanicInfo) -> ! {
-    use simplos::io::utils::qemu::{exit_qemu, QemuExitCode};
-    // serial_println!("[failed]\n");
-    // serial_println!("Error: {}\n", info);
-    exit_qemu(QemuExitCode::Failed);
-    loop {}
+    simplos::test_panic_handler(info)
 }
 #[cfg(not(test))]
 #[panic_handler]
@@ -147,7 +145,6 @@ fn panic(info: &PanicInfo) -> ! {
     simplos::hlt_loop();
 }
 
-#[test_case]
-fn trivial_assertion() {
-    assert_eq!(1, 1);
-}
+// No `#[test_case]`s here on purpose. What this binary does — the render loop —
+// needs a screen to be worth asserting about; that it boots at all is covered by
+// tests/basic_boot.rs.
