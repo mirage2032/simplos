@@ -153,13 +153,13 @@ jobs:
           if ! git push --atomic origin \
             HEAD:refs/heads/master HEAD:refs/heads/develop "refs/tags/v$NEXT"; then
             echo "::error::Couldn't push the release. If git rejected it for a branch rule:"
-            echo "::error::the release commit is pushed straight to develop, so a rule on"
-            echo "::error::develop that requires a pull request or a passing check will"
-            echo "::error::refuse it — the built-in GITHUB_TOKEN can't bypass a ruleset on a"
-            echo "::error::user-owned repository (only an org can grant an app a bypass)."
-            echo "::error::Either relax develop's ruleset to deletion + force-push only, or"
-            echo "::error::give this job a token that bypasses it (a PAT or deploy key added"
-            echo "::error::as a bypass actor). Nothing was pushed: the push is --atomic."
+            echo "::error::this commit goes straight to master and develop, and a rule that"
+            echo "::error::requires a pull request or a passing check refuses a direct push"
+            echo "::error::even when it is a clean fast-forward. The built-in GITHUB_TOKEN"
+            echo "::error::cannot be given a ruleset bypass on a user-owned repository, so"
+            echo "::error::either keep both branches to deletion + force-push rules, or give"
+            echo "::error::this job a PAT or deploy key added as a bypass actor. Nothing was"
+            echo "::error::pushed either way: the push is --atomic."
             exit 1
           fi
 
