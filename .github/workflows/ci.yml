@@ -1,0 +1,106 @@
+name: CI
+
+# Every pull request into develop, and every promotion to master (promote.yml
+# calls this workflow for the commit it is about to release).
+#
+# One job, not several: the expensive part by far is the vendored bootloader,
+# which builds four real-mode BIOS stages and a UEFI loader through five nested
+# `cargo install` runs with their own `build-std`. Splitting format, lint, test
+# and build across jobs would pay that cost once per job.
+on:
+  pull_request:
+    paths:
+      - '**'
+      - '!**/*.md'
+      - '!.github/**'
+      - '.github/workflows/ci.yml'
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit to check (defaults to the calling run's commit)
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+# One run per PR: a new push cancels the previous run. When called there is no
+# PR, so the group falls back to the caller's run id.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      # The tests and the smoke test are real boots, so the runner needs an
+      # emulator. It has no /dev/kvm, so everything runs under TCG.
+      - name: Install QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y qemu-system-x86
+
+      # Honours rust-toolchain.toml, including its components and the
+      # x86_64-unknown-none target. Pull requests only read the cache; a
+      # promotion's run saves it.
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          # There is no workspace: three separate crates with three target
+          # directories, plus the vendored bootloader's own, which the nested
+          # `cargo install` runs fill with a rebuilt `core` for two custom
+          # 16-bit and 32-bit targets. Leaving that one out doubles the run.
+          cache-workspaces: |
+            kernel -> target
+            fullkernel -> target
+            tools/boot-test -> target
+            vendor/bootloader -> target
+          cache-save-if: ${{ github.event_name != 'pull_request' }}
+
+      # vendor/ is upstream code with its own style; only what we write.
+      - name: Format
+        run: |
+          for crate in kernel fullkernel tools/boot-test; do
+            echo "::group::$crate"
+            (cd "$crate" && cargo fmt --check)
+            echo "::endgroup::"
+          done
+
+      # `-D warnings` reaches only the crate being linted, so the vendored
+      # bootloader and ps2 are checked but not gated — which is what we want,
+      # and worth knowing before someone goes looking for why.
+      - name: Lint
+        run: |
+          for crate in kernel fullkernel tools/boot-test; do
+            echo "::group::$crate"
+            (cd "$crate" && cargo clippy --all-targets -- -D warnings)
+            echo "::endgroup::"
+          done
+
+      # Each of these is a kernel: built for x86_64-unknown-none, wrapped in a
+      # bootable image by tools/boot-test and run under QEMU, which reports the
+      # result by the status it exits with.
+      - name: Test
+        working-directory: kernel
+        run: cargo test
+
+      - name: Build the images
+        run: scripts/build-images.sh
+
+      # Boots both images for real and checks the kernel's own boot banner —
+      # the firmware it came up under and the framebuffer mode it settled on.
+      - name: Boot
+        run: scripts/smoke-test.sh
+
+      # Handy on a pull request that changes the kernel: download and boot it
+      # without building the whole thing locally.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: disk-images
+          path: dist/*.img
+          if-no-files-found: error
+          retention-days: 7
