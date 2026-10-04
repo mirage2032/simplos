@@ -26,7 +26,6 @@ use simplos::CONSOLE;
 use simplos::io::interrupts::idt::TIMER_COUNTER;
 use simplos::io::hpet;
 use simplos::pre_init;
-use simplos::serial_println;
 use x86_rtc::Rtc;
 use x86;
 use simplos::badoo;
@@ -71,7 +70,6 @@ fn start() -> ! {
     let mut val: u64 = 0;
     let mut previous = Rectangle::new(Point::zero(), Size::zero());
     let mut last_tick = usize::MAX;
-    let mut last_serial = u64::MAX;
 
     loop {
         // Drain console messages from interrupts (keyboard input)
@@ -121,14 +119,6 @@ fn start() -> ! {
             previous = text.bounding_box();
             text.draw(display.deref_mut()).expect("Failed to draw text");
             display.present();
-        }
-
-        // Mirror the same block to the serial port once a second. This is the
-        // entire UI when the framebuffer can't be shown, and the only trace of
-        // what happened when a boot goes wrong.
-        if time != last_serial {
-            last_serial = time;
-            serial_println!("{}", status.replace('\n', " | "));
         }
 
         val += 1;

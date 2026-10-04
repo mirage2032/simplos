@@ -17,6 +17,14 @@ debug = 2
 [profile.dev.build-override]
 opt-level = 0
 debug = 2
+
+# The kernel is an *artifact build-dependency*, so cargo builds it under
+# `build-override`, not under `[profile.release]`. Without this a release build
+# still ships an unoptimised kernel — which matters most when the guest CPU is
+# an interpreter (TCG, or QEMU compiled to WebAssembly).
+[profile.release.build-override]
+opt-level = 3
+debug = false
 [patch.crates-io]
 ps2 = { path = "../vendor/ps2" }
 
