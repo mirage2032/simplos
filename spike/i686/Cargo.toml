@@ -1,0 +1,20 @@
+[package]
+name = "simplos-i686-spike"
+version = "0.1.0"
+edition = "2024"
+
+# Spike: can a 32-bit simplos boot in v86 via multiboot, set a Bochs VBE mode
+# itself, and render the status screen with the same embedded-graphics code the
+# 64-bit kernel uses? Those are the three unknowns; everything else in the port
+# is mechanical.
+
+[dependencies]
+embedded-graphics = "0.8.1"
+linked_list_allocator = "0.10.5"
+
+[profile.dev]
+panic = "abort"
+opt-level = 1
+
+[profile.release]
+panic = "abort"

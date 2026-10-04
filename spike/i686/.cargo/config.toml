@@ -1,0 +1,11 @@
+[build]
+target = "i686-simplos.json"
+
+[target.i686-simplos]
+rustflags = ["-C", "link-arg=-Tlink.ld", "-C", "link-arg=--build-id=none"]
+
+[unstable]
+# Current nightly requires this opt-in before it will read a .json target spec.
+json-target-spec = true
+build-std = ["core", "compiler_builtins", "alloc"]
+build-std-features = ["compiler-builtins-mem"]
