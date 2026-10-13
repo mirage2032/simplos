@@ -19,8 +19,6 @@ pub static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     idt[InterruptIndex::Ps2Mouse.as_u8()].set_handler_fn(mouse_interrupt_handler);
     idt
 });
-// const EXCEPTION_COLOR: Lazy<ColorCode> =
-//     Lazy::new(|| ColorCode::new(Color::LightRed, Color::Black));
 /// A breakpoint is a trap, not a fault: `int3` is how a debugger (or a test)
 /// asks to be noticed, and execution continues at the instruction after it.
 /// Reporting it used to go to a VGA text console that no longer exists, and in
@@ -60,31 +58,26 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
 }
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
     use crate::io::console::CONSOLE;
-    use alloc::format;
     use pc_keyboard::{DecodedKey, HandleControl, Keyboard, ScancodeSet1, layouts};
 
     static KEYBOARD: Lazy<Mutex<Keyboard<layouts::Us104Key, ScancodeSet1>>> = Lazy::new(|| {
         Mutex::new(Keyboard::new(ScancodeSet1::new(), layouts::Us104Key, HandleControl::Ignore))
     });
 
-    let mut controller = PS2_CONTROLLER.lock();
-    let data_available = controller.output_has_data();
-    let from_keyboard = controller.interrupt_cause() == Ps2InterruptCause::Keyboard;
-    if data_available && from_keyboard {
+    if let Some(controller) = PS2_CONTROLLER.lock().as_mut()
+        && controller.output_has_data()
+        && controller.interrupt_cause() == Ps2InterruptCause::Keyboard
+    {
         let mut keyboard = KEYBOARD.lock();
         if let Ok(scancode) = controller.controller_mut().read_data()
             && let Ok(Some(key_event)) = keyboard.add_byte(scancode)
             && let Some(key) = keyboard.process_keyevent(key_event)
         {
-            // Log key to console buffer (interrupt-safe!)
+            // No heap in here: see `ConsoleBuffer::push`.
             match key {
-                DecodedKey::Unicode(c) => {
-                    CONSOLE.push(&format!("{}", c));
-                }
-                DecodedKey::RawKey(k) => {
-                    CONSOLE.push(&format!("{:?}", k));
-                }
-            }
+                DecodedKey::Unicode(c) => CONSOLE.push(format_args!("{c}")),
+                DecodedKey::RawKey(k) => CONSOLE.push(format_args!("{k:?}")),
+            };
         }
     }
     pic::notify_end_of_interrupt(&InterruptIndex::Keyboard);
@@ -105,15 +98,14 @@ extern "x86-interrupt" fn page_fault_handler(
     crate::hlt_loop();
 }
 extern "x86-interrupt" fn mouse_interrupt_handler(_stack_frame: InterruptStackFrame) {
-    let mut controller = PS2_CONTROLLER.lock();
-    let data_available = controller.output_has_data();
-    let from_mouse = controller.interrupt_cause() == Ps2InterruptCause::Mouse;
-    if data_available && from_mouse {
+    if let Some(controller) = PS2_CONTROLLER.lock().as_mut()
+        && controller.output_has_data()
+        && controller.interrupt_cause() == Ps2InterruptCause::Mouse
+    {
         // The packet has to be read whether or not anything wants it: leaving a
         // byte in the output buffer stops the controller raising further
         // interrupts. Nothing moves a cursor yet, so it is read and dropped.
         let _ = controller.controller_mut().mouse().read_data_packet();
     }
     pic::notify_end_of_interrupt(&InterruptIndex::Ps2Mouse);
-    // });
 }

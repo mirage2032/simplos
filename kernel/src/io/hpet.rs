@@ -65,29 +65,14 @@ impl Hpet {
     /// Get elapsed time in nanoseconds since initialization
     pub fn elapsed_nanos(&self) -> u64 {
         let ticks = self.elapsed_ticks();
-        // period_fs is in femtoseconds, divide by 1_000_000 to get nanoseconds
-        ticks * self.period_fs / 1_000_000
-    }
-
-    /// Get elapsed time in microseconds since initialization
-    pub fn elapsed_micros(&self) -> u64 {
-        self.elapsed_nanos() / 1_000
+        // period_fs is in femtoseconds, divide by 1_000_000 to get nanoseconds.
+        // In 128 bits: the product passes u64::MAX after about 5 hours of uptime.
+        (u128::from(ticks) * u128::from(self.period_fs) / 1_000_000) as u64
     }
 
     /// Get elapsed time in milliseconds since initialization
     pub fn elapsed_millis(&self) -> u64 {
         self.elapsed_nanos() / 1_000_000
-    }
-
-    /// Get the HPET frequency in Hz
-    pub fn frequency(&self) -> u64 {
-        // frequency = 10^15 / period_fs
-        1_000_000_000_000_000 / self.period_fs
-    }
-
-    /// Get the period in femtoseconds
-    pub fn period_femtoseconds(&self) -> u64 {
-        self.period_fs
     }
 }
 
@@ -160,9 +145,4 @@ pub fn init_hpet(rsdp_addr: u64, phys_mem_offset: VirtAddr) -> Result<(), &'stat
 /// Get elapsed milliseconds since HPET initialization
 pub fn elapsed_millis() -> Option<u64> {
     HPET.lock().as_ref().map(|h| h.elapsed_millis())
-}
-
-/// Get elapsed microseconds since HPET initialization  
-pub fn elapsed_micros() -> Option<u64> {
-    HPET.lock().as_ref().map(|h| h.elapsed_micros())
 }

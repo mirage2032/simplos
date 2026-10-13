@@ -5,16 +5,14 @@
 #![reexport_test_harness_main = "test_main"]
 extern crate alloc;
 use alloc::format;
+use alloc::string::String;
 use alloc::string::ToString;
 use bootloader_api::{BootInfo, entry_point};
 use core::ops::DerefMut;
 use core::panic::PanicInfo;
 use core::sync::atomic::Ordering;
-use embedded_graphics::mono_font::ascii::FONT_7X13;
-// use embedded_graphics::mono_font::ascii::FONT_7X13;
-// use haxorfont::FONT_HAX_ITALICRMEDIUM11;
-use alloc::string::String;
 use embedded_graphics::mono_font::MonoTextStyle;
+use embedded_graphics::mono_font::ascii::FONT_7X13;
 use embedded_graphics::pixelcolor::Rgb888;
 use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::Rectangle;

@@ -1,8 +1,8 @@
+use crate::serial_println;
 use ps2::Controller;
 use ps2::error::ControllerError;
 use ps2::flags::ControllerConfigFlags;
 use spin::{Lazy, Mutex};
-// use crate::{println, serial_println};
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub enum Ps2InterruptCause {
@@ -64,15 +64,22 @@ impl Ps2Controller {
             controller.enable_keyboard()?;
             config.set(ControllerConfigFlags::DISABLE_KEYBOARD, false);
             config.set(ControllerConfigFlags::ENABLE_KEYBOARD_INTERRUPT, true);
-            controller.keyboard().reset_and_self_test().unwrap();
+            // A real keyboard can take longer to self-test than the driver waits.
+            // It usually still works afterwards, so say so and carry on.
+            if let Err(e) = controller.keyboard().reset_and_self_test() {
+                serial_println!("PS/2 keyboard reset failed: {:?}", e);
+            }
         }
         if mouse_works {
             controller.enable_mouse()?;
             config.set(ControllerConfigFlags::DISABLE_MOUSE, false);
             config.set(ControllerConfigFlags::ENABLE_MOUSE_INTERRUPT, true);
-            controller.mouse().reset_and_self_test().unwrap();
-            // This will start streaming events from the mouse
-            controller.mouse().enable_data_reporting().unwrap();
+            let mut mouse = controller.mouse();
+            // Enabling data reporting starts streaming events from the mouse
+            if let Err(e) = mouse.reset_and_self_test().and_then(|()| mouse.enable_data_reporting())
+            {
+                serial_println!("PS/2 mouse setup failed: {:?}", e);
+            }
         }
 
         // Write last configuration to enable devices and interrupts
@@ -81,24 +88,8 @@ impl Ps2Controller {
         Ok(Ps2Controller { controller })
     }
 
-    pub fn controller(&self) -> &Controller {
-        &self.controller
-    }
-
     pub fn controller_mut(&mut self) -> &mut Controller {
         &mut self.controller
-    }
-
-    pub fn disable_keyboard_mouse(&mut self) -> Result<(), ControllerError> {
-        self.controller.disable_keyboard()?;
-        self.controller.disable_mouse()?;
-        Ok(())
-    }
-
-    pub fn enable_keyboard_mouse(&mut self) -> Result<(), ControllerError> {
-        self.controller.enable_keyboard()?;
-        self.controller.enable_mouse()?;
-        Ok(())
     }
 
     pub fn interrupt_cause(&mut self) -> Ps2InterruptCause {
@@ -116,8 +107,18 @@ impl Ps2Controller {
     }
 }
 
-pub static PS2_CONTROLLER: Lazy<Mutex<Ps2Controller>> =
-    Lazy::new(|| Mutex::new(Ps2Controller::new().expect("Error while Ps2Controller init")));
+/// `None` when there is no working controller — common on modern PCs without
+/// legacy USB emulation, whose ports just read back `0xFF`. No keyboard then,
+/// but no reason not to boot either.
+pub static PS2_CONTROLLER: Lazy<Mutex<Option<Ps2Controller>>> = Lazy::new(|| {
+    Mutex::new(
+        Ps2Controller::new()
+            .inspect_err(|e| {
+                serial_println!("PS/2 controller unavailable: {:?}", e);
+            })
+            .ok(),
+    )
+});
 
 pub fn ps2_controller_init() {
     PS2_CONTROLLER.lock();
