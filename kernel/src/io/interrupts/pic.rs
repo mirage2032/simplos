@@ -1,6 +1,5 @@
 use pic8259::ChainedPics;
 use spin::{Lazy, Mutex};
-// use crate::println;
 
 pub const PIC_1_OFFSET: u8 = 32;
 pub const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
@@ -29,9 +28,6 @@ pub enum InterruptIndex {
 impl InterruptIndex {
     pub fn as_u8(self) -> u8 {
         self as u8
-    }
-    pub fn as_usize(self) -> usize {
-        self as usize
     }
 }
 
@@ -62,10 +58,6 @@ pub fn config_pics() {
 
     // Write the updated masks back to the PICs
     unsafe { PICS.lock().write_masks(masks[0], masks[1]) };
-}
-
-pub fn disable_interrupts() {
-    x86_64::instructions::interrupts::disable();
 }
 
 pub fn notify_end_of_interrupt(interrupt_index: &InterruptIndex) {

@@ -4,7 +4,8 @@
 //! The main loop can drain and display these messages.
 
 use alloc::string::String;
-use alloc::vec::Vec;
+use core::cell::UnsafeCell;
+use core::fmt;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// Maximum number of messages in the buffer
@@ -15,13 +16,28 @@ const MAX_MSG_LEN: usize = 128;
 
 /// A single message slot
 struct MessageSlot {
-    data: [u8; MAX_MSG_LEN],
+    data: UnsafeCell<[u8; MAX_MSG_LEN]>,
     len: AtomicUsize,
 }
 
 impl MessageSlot {
     const fn new() -> Self {
-        Self { data: [0; MAX_MSG_LEN], len: AtomicUsize::new(0) }
+        Self { data: UnsafeCell::new([0; MAX_MSG_LEN]), len: AtomicUsize::new(0) }
+    }
+}
+
+/// Formats straight into a slot, cutting off whatever doesn't fit.
+struct SlotWriter<'a> {
+    buf: &'a mut [u8; MAX_MSG_LEN],
+    len: usize,
+}
+
+impl fmt::Write for SlotWriter<'_> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let n = s.len().min(MAX_MSG_LEN - self.len);
+        self.buf[self.len..self.len + n].copy_from_slice(&s.as_bytes()[..n]);
+        self.len += n;
+        Ok(())
     }
 }
 
@@ -31,6 +47,11 @@ pub struct ConsoleBuffer {
     write_pos: AtomicUsize,
     read_pos: AtomicUsize,
 }
+
+// Safety: one producer (interrupt handlers, which don't nest) and one consumer
+// (the main loop). A slot's bytes are only touched by the side that owns it,
+// and ownership is handed over through the Release/Acquire positions.
+unsafe impl Sync for ConsoleBuffer {}
 
 impl ConsoleBuffer {
     pub const fn new() -> Self {
@@ -48,7 +69,11 @@ impl ConsoleBuffer {
 
     /// Push a message to the buffer (safe to call from interrupts)
     /// Returns false if buffer is full
-    pub fn push(&self, msg: &str) -> bool {
+    ///
+    /// Takes `format_args!` rather than a string so that callers never touch
+    /// the heap: an interrupt that lands while the main loop holds the
+    /// allocator's spin lock would wait for it forever.
+    pub fn push(&self, args: fmt::Arguments) -> bool {
         let write = self.write_pos.load(Ordering::Acquire);
         let read = self.read_pos.load(Ordering::Acquire);
 
@@ -59,16 +84,10 @@ impl ConsoleBuffer {
         }
 
         let slot = &self.slots[write];
-        let bytes = msg.as_bytes();
-        let len = bytes.len().min(MAX_MSG_LEN);
-
-        // Copy message to slot
-        // Safety: We're the only writer to this slot at this position
-        unsafe {
-            let data_ptr = slot.data.as_ptr() as *mut u8;
-            core::ptr::copy_nonoverlapping(bytes.as_ptr(), data_ptr, len);
-        }
-        slot.len.store(len, Ordering::Release);
+        // Safety: the reader won't look at this slot until `write_pos` moves past it.
+        let mut writer = SlotWriter { buf: unsafe { &mut *slot.data.get() }, len: 0 };
+        let _ = fmt::Write::write_fmt(&mut writer, args);
+        slot.len.store(writer.len, Ordering::Release);
 
         // Advance write position
         self.write_pos.store(next_write, Ordering::Release);
@@ -91,11 +110,9 @@ impl ConsoleBuffer {
             return None;
         }
 
-        // Copy message out
-        let msg = unsafe {
-            let slice = core::slice::from_raw_parts(slot.data.as_ptr(), len);
-            String::from_utf8_lossy(slice).into_owned()
-        };
+        // Safety: the writer won't touch this slot again until `read_pos` moves past it.
+        let data = unsafe { &*slot.data.get() };
+        let msg = String::from_utf8_lossy(&data[..len]).into_owned();
 
         // Clear slot and advance read position
         slot.len.store(0, Ordering::Release);
@@ -103,44 +120,10 @@ impl ConsoleBuffer {
 
         Some(msg)
     }
-
-    /// Check if there are messages to read
-    pub fn has_messages(&self) -> bool {
-        self.read_pos.load(Ordering::Acquire) != self.write_pos.load(Ordering::Acquire)
-    }
-
-    /// Drain all messages into a vector (call from main loop)
-    pub fn drain(&self) -> Vec<String> {
-        let mut messages = Vec::new();
-        while let Some(msg) = self.pop() {
-            messages.push(msg);
-        }
-        messages
-    }
 }
 
 /// Global console buffer - safe to use from interrupts
 pub static CONSOLE: ConsoleBuffer = ConsoleBuffer::new();
-
-/// Log a message from anywhere (interrupt-safe)
-#[macro_export]
-macro_rules! console_log {
-    ($($arg:tt)*) => {
-        {
-            use alloc::format;
-            let msg = format!($($arg)*);
-            $crate::io::console::CONSOLE.push(&msg);
-        }
-    };
-}
-
-/// Log from interrupt handler (same as console_log but more explicit name)
-#[macro_export]
-macro_rules! interrupt_log {
-    ($($arg:tt)*) => {
-        $crate::console_log!($($arg)*)
-    };
-}
 
 impl Default for ConsoleBuffer {
     fn default() -> Self {

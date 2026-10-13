@@ -9,9 +9,7 @@ extern crate alloc;
 pub mod allocator;
 pub mod io;
 pub mod memory;
-pub mod utils;
 
-// pub use io::video::vga_buffer;
 pub use io::console::CONSOLE;
 pub use io::serial;
 pub use io::video::DISPLAY;

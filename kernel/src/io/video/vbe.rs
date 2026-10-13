@@ -85,13 +85,19 @@ pub fn set_mode(width: u32, height: u32, bytes_per_pixel: u32) -> Option<Mode> {
         return None;
     }
 
+    // Checked before anything is written: bailing out after `DISABLED` would
+    // leave the screen switched off.
+    let xres = u16::try_from(width).ok()?;
+    let yres = u16::try_from(height).ok()?;
+    let bpp = u16::try_from(bytes_per_pixel * 8).ok()?;
+
     // Mode registers are only safe to change while the extension is off, and
     // `ENABLE` is what commits them.
     write(INDEX_ENABLE, DISABLED);
-    write(INDEX_XRES, u16::try_from(width).ok()?);
-    write(INDEX_YRES, u16::try_from(height).ok()?);
-    write(INDEX_BPP, u16::try_from(bytes_per_pixel * 8).ok()?);
-    write(INDEX_VIRT_WIDTH, u16::try_from(width).ok()?);
+    write(INDEX_XRES, xres);
+    write(INDEX_YRES, yres);
+    write(INDEX_BPP, bpp);
+    write(INDEX_VIRT_WIDTH, xres);
     write(INDEX_X_OFFSET, 0);
     write(INDEX_Y_OFFSET, 0);
     write(INDEX_ENABLE, ENABLED | LFB_ENABLED);

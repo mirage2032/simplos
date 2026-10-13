@@ -1,5 +1,3 @@
-use alloc::alloc::{GlobalAlloc, Layout};
-use core::ptr::null_mut;
 use fixed_size_block::FixedSizeBlockAllocator;
 use x86_64::{
     VirtAddr,
@@ -39,18 +37,6 @@ pub fn init_heap(
     }
 
     Ok(())
-}
-
-pub struct Dummy;
-
-unsafe impl GlobalAlloc for Dummy {
-    unsafe fn alloc(&self, _layout: Layout) -> *mut u8 {
-        null_mut()
-    }
-
-    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
-        panic!("dealloc should be never called")
-    }
 }
 
 /// A wrapper around spin::Mutex to permit trait implementations.

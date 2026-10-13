@@ -44,6 +44,9 @@ status=0
 # How long to give a boot before calling it hung. A 1080p framebuffer under an
 # interpreted CPU is not fast, but it is nowhere near this slow.
 readonly DEADLINE=120
+# What the kernel's panic and fault handlers print. They halt rather than exit,
+# so without looking for these a crash would wait out the whole deadline.
+readonly FAULTS="KERNEL PANIC\|EXCEPTION: DOUBLE FAULT\|EXCEPTION: PAGE FAULT"
 
 boot() {
     local mode=$1 image=$2
@@ -72,6 +75,7 @@ boot() {
     while ((waited < DEADLINE)); do
         banner=$(grep -a -m1 "^simplos: boot=" "$log" 2>/dev/null || true)
         [[ -n $banner ]] && break
+        grep -qa "$FAULTS" "$log" 2>/dev/null && break
         # A guest that died on its own (a triple fault, a QEMU error) will never
         # print anything, so stop waiting for it.
         kill -0 "$qemu" 2>/dev/null || break
@@ -102,7 +106,7 @@ boot() {
         status=1
     fi
     # A panic prints a banner first, so the banner alone isn't enough.
-    if grep -qa "KERNEL PANIC\|EXCEPTION: DOUBLE FAULT\|EXCEPTION: PAGE FAULT" "$log"; then
+    if grep -qa "$FAULTS" "$log"; then
         echo "::error::$mode: the kernel faulted after booting."
         grep -a -A6 "KERNEL PANIC\|EXCEPTION:" "$log" | sed 's/^/    /'
         status=1
@@ -116,6 +120,9 @@ else
     echo "::error::UEFI: no OVMF firmware found; build fullkernel once so ovmf-prebuilt is unpacked."
     status=1
 fi
+
+# No PS/2 controller, as on many modern PCs: no keyboard, but it must still boot.
+boot BIOS "$images/bios.img" -machine pc,i8042=off
 
 # The point of the fw_cfg channel: the host asks for a smaller mode and gets it.
 expect=1024x768

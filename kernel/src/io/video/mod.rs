@@ -1,5 +1,3 @@
-// pub mod vga_buffer;
-
 pub mod vbe;
 
 use crate::io::fwcfg;
@@ -159,6 +157,14 @@ impl Display {
                 let b = color.b() >> 6;
                 self.back_buffer[index] = (r << 5) | (g << 2) | b;
             }
+            // BIOS VESA modes that aren't plain RGB/BGR (UEFI bitmask modes never
+            // get here: the bootloader refuses them). shortcut: assumes 8-bit
+            // channels, so 15/16-bit modes draw wrong colours; pack the bits if one shows up.
+            PixelFormat::Unknown { red_position, green_position, blue_position } => {
+                self.back_buffer[index + red_position as usize / 8] = color.r();
+                self.back_buffer[index + green_position as usize / 8] = color.g();
+                self.back_buffer[index + blue_position as usize / 8] = color.b();
+            }
             _ => {
                 panic!("Unsupported pixel format");
             }
@@ -255,7 +261,7 @@ pub fn resolve_mode(original: FrameBufferInfo) -> FrameBufferInfo {
     }
 
     let Some(mode) = vbe::set_mode(width, height, original.bytes_per_pixel as u32) else {
-        serial_println!("simplos: no VBE extensions, keeping the boot mode");
+        serial_println!("simplos: VBE can't set {}x{}, keeping the boot mode", width, height);
         return original;
     };
 

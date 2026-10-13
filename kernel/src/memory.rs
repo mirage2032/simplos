@@ -37,19 +37,13 @@ unsafe fn active_level_4_table(physical_memory_offset: VirtAddr) -> &'static mut
     unsafe { &mut *page_table_ptr }
 }
 
-/// A FrameAllocator that always returns `None`.
-pub struct EmptyFrameAllocator;
-
-unsafe impl FrameAllocator<Size4KiB> for EmptyFrameAllocator {
-    fn allocate_frame(&mut self) -> Option<PhysFrame> {
-        None
-    }
-}
-
 /// A FrameAllocator that returns usable frames from the bootloader's memory map.
 pub struct BootInfoFrameAllocator {
     memory_map: &'static MemoryRegions,
-    next: usize,
+    /// Index of the region frames are currently taken from.
+    region: usize,
+    /// Next address to hand out in that region; 0 means its start.
+    next: u64,
 }
 
 impl BootInfoFrameAllocator {
@@ -61,27 +55,23 @@ impl BootInfoFrameAllocator {
     /// requirement is that all frames that are marked as `USABLE` in it are
     /// really unused.
     pub unsafe fn init(memory_map: &'static MemoryRegions) -> Self {
-        BootInfoFrameAllocator { memory_map, next: 0 }
-    }
-
-    /// Returns an iterator over the usable frames specified in the memory map.
-    fn usable_frames(&self) -> impl Iterator<Item = PhysFrame> {
-        // get usable regions from memory map
-        let regions = self.memory_map.iter();
-        let usable_regions = regions.filter(|r| r.kind == MemoryRegionKind::Usable);
-        // map each region to its address range
-        let addr_ranges = usable_regions.map(|r| r.start..r.end);
-        // transform to an iterator of frame start addresses
-        let frame_addresses = addr_ranges.flat_map(|r| r.step_by(4096));
-        // create `PhysFrame` types from the start addresses
-        frame_addresses.map(|addr| PhysFrame::containing_address(PhysAddr::new(addr)))
+        BootInfoFrameAllocator { memory_map, region: 0, next: 0 }
     }
 }
 
 unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
+    /// Picks up where the last call stopped, so handing out n frames costs
+    /// O(n) rather than walking the whole map from the start every time.
     fn allocate_frame(&mut self) -> Option<PhysFrame> {
-        let frame = self.usable_frames().nth(self.next);
-        self.next += 1;
-        frame
+        while let Some(region) = self.memory_map.get(self.region) {
+            let start = self.next.max(region.start.next_multiple_of(4096));
+            if region.kind == MemoryRegionKind::Usable && start + 4096 <= region.end {
+                self.next = start + 4096;
+                return Some(PhysFrame::containing_address(PhysAddr::new(start)));
+            }
+            self.region += 1;
+            self.next = 0;
+        }
+        None
     }
 }
