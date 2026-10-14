@@ -2,8 +2,8 @@
 
 A small x86_64 operating system written in Rust, from the boot sector up. It
 brings up long mode, a GDT and IDT, paging and a heap, a PS/2 keyboard, the
-HPET, and draws a status screen into a linear framebuffer. It boots under both
-BIOS and UEFI firmware, on real hardware or an emulator — including
+HPET, and drops into a small command line (type `help`) drawn into a linear
+framebuffer. It boots under both BIOS and UEFI firmware, on real hardware or an emulator — including
 [in a browser tab](https://lazyscript.com/projects/simplos), where QEMU itself
 is compiled to WebAssembly.
 
