@@ -105,13 +105,15 @@ the right firmware and the right framebuffer mode.
 | `kernel/` | the OS. A `no_std` library plus the binary that draws the screen. |
 | `fullkernel/` | host-side: builds the disk images, runs QEMU. |
 | `tools/boot-test/` | cargo's test runner for the kernel's bare-metal tests. |
+| `user/probe/` | a user program: ordinary Rust with `std`, built for Linux (static musl). Both images and every test boot carry it as the bootloader's ramdisk. |
 | `vendor/bootloader/` | [rust-osdev/bootloader](https://github.com/rust-osdev/bootloader) 0.11.17, vendored and patched. |
 | `vendor/ps2/` | the `ps2` crate, with its `x86_64` dependency bumped. |
 | `scripts/` | `build-images.sh`, `smoke-test.sh`, `boot-test.sh`. |
 
 There is no cargo workspace: `kernel` builds for `x86_64-unknown-none` with
-`build-std`, the other two build for the host, and the settings for those are
-mutually exclusive. Each crate has its own `Cargo.toml`, `Cargo.lock`,
+`build-std`, the host tools build for the host, `user/probe` builds for
+`x86_64-unknown-linux-musl` (linked by the host's `cc`), and the settings for
+those are mutually exclusive. Each crate has its own `Cargo.toml`, `Cargo.lock`,
 `.cargo/config.toml` and target directory — so a `[patch]` added to one has to
 be added to the others that need it.
 

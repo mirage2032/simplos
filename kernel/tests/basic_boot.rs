@@ -112,3 +112,16 @@ fn timer_ticks_at_timer_hz() {
         "{ticks} ticks in 500 ms of HPET time, expected about {expected}"
     );
 }
+
+#[test_case]
+fn ramdisk_holds_an_x86_64_executable() {
+    // tools/boot-test attaches user/probe to every test boot, as fullkernel
+    // does to the real images. Checked by hand here; the loader will parse it.
+    let elf = simplos::ramdisk().expect("the image has a ramdisk");
+    assert!(elf.len() > 64, "a {}-byte ramdisk", elf.len());
+    assert_eq!(elf[..4], *b"\x7fELF", "not an ELF file");
+    assert_eq!((elf[4], elf[5]), (2, 1), "not 64-bit little-endian");
+    let kind = u16::from_le_bytes([elf[16], elf[17]]);
+    assert!(kind == 2 || kind == 3, "ELF type {kind}, not an executable");
+    assert_eq!(u16::from_le_bytes([elf[18], elf[19]]), 62, "not x86-64");
+}

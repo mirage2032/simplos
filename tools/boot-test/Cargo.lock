@@ -47,6 +47,7 @@ version = "0.1.0"
 dependencies = [
  "bootloader",
  "ovmf-prebuilt",
+ "probe",
 ]
 
 [[package]]
@@ -260,6 +261,10 @@ name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
+
+[[package]]
+name = "probe"
+version = "0.1.0"
 
 [[package]]
 name = "proc-macro2"

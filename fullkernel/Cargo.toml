@@ -7,6 +7,9 @@ license = "GPL-2.0-only"
 [build-dependencies]
 bootloader = {git = "https://github.com/rust-osdev/bootloader.git"}
 simplos = {path= "../kernel",artifact = "bin", target = "x86_64-unknown-none" }
+# The user program the kernel runs from the ramdisk: ordinary Rust with std,
+# built for Linux, whose system calls simplos implements.
+probe = { path = "../user/probe", artifact = "bin", target = "x86_64-unknown-linux-musl" }
 [dependencies]
 # used for UEFI booting in QEMU
 ovmf-prebuilt = "0.1.0-alpha.1"

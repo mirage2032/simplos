@@ -7,9 +7,12 @@
 # `llvm-tools` is not optional: the vendored bootloader finds `llvm-objcopy`
 # through it to flatten the BIOS stages into flat binaries.
 #
+# `x86_64-unknown-linux-musl` builds `user/probe`, the user program the kernel
+# runs: a static Linux binary, linked by the host's `cc`.
+#
 # Note the off-by-one: nightly channels are named for their *publish* date, so
 # `nightly-2026-09-26` is the toolchain that reports `(5ceaf6608 2026-09-25)`.
 [toolchain]
 channel = "nightly-2026-09-26"
 components = ["rust-src", "llvm-tools", "clippy", "rustfmt"]
-targets = ["x86_64-unknown-none"]
+targets = ["x86_64-unknown-none", "x86_64-unknown-linux-musl"]

@@ -96,6 +96,14 @@ pub fn boot_mode() -> BootMode {
     }
 }
 
+static RAMDISK: spin::Once<&'static [u8]> = spin::Once::new();
+
+/// The ramdisk the bootloader loaded beside the kernel, which for now is the
+/// user program `user/probe`. `None` if the image was built without one.
+pub fn ramdisk() -> Option<&'static [u8]> {
+    RAMDISK.get().copied()
+}
+
 /// The boot info carries no firmware field, but the memory map does: regions the
 /// bootloader could not classify keep their origin tag, which only one of the two
 /// firmware paths ever produces.
@@ -146,6 +154,14 @@ pub fn pre_init(boot_info: &'static mut BootInfo) {
             info.bytes_per_pixel,
             info.pixel_format
         );
+
+        if let Some(addr) = boot_info.ramdisk_addr.into_option() {
+            let len = boot_info.ramdisk_len as usize;
+            // Safety: the bootloader mapped `len` bytes there, for the kernel
+            // alone, and nothing unmaps them.
+            RAMDISK.call_once(|| unsafe { core::slice::from_raw_parts(addr as *const u8, len) });
+            serial_println!("simplos: ramdisk {} bytes", len);
+        }
 
         // Initialize HPET for high-precision timing
         if let Some(rsdp_addr) = boot_info.rsdp_addr.take()
