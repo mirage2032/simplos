@@ -282,6 +282,8 @@ static int ext4_link(struct ext4_mountpoint *mp, struct ext4_inode_ref *parent,
 				return EIO;
 
 			ext4_dir_en_set_inode(res.dentry, parent->index);
+			/* LOCAL PATCH: the block changed, so its checksum. */
+			ext4_dir_set_csum(ch, (void *)res.block.data);
 			ext4_trans_set_block_dirty(res.block.buf);
 			r = ext4_dir_destroy_result(ch, &res);
 			if (r != EOK)
@@ -830,7 +832,12 @@ static int ext4_trunc_inode(struct ext4_mountpoint *mp,
 
 	inode_size = ext4_inode_get_size(&fs->sb, inode_ref.inode);
 	ext4_fs_put_inode_ref(&inode_ref);
-	if (has_trans)
+	/* LOCAL PATCH: a truncation that fits in one step stays in the caller's
+	 * transaction, so that removing a file is all or nothing; ending it
+	 * first, a crash could leave the file there, emptied. */
+	bool own_trans = !has_trans ||
+			 inode_size > new_size + CONFIG_MAX_TRUNCATE_SIZE;
+	if (has_trans && own_trans)
 		ext4_trans_stop(mp);
 
 	while (inode_size > new_size + CONFIG_MAX_TRUNCATE_SIZE) {
@@ -860,10 +867,12 @@ static int ext4_trunc_inode(struct ext4_mountpoint *mp,
 
 		inode_size = new_size;
 
-		ext4_trans_start(mp);
+		if (own_trans)
+			ext4_trans_start(mp);
 		r = ext4_fs_get_inode_ref(fs, index, &inode_ref);
 		if (r != EOK) {
-			ext4_trans_abort(mp);
+			if (own_trans)
+				ext4_trans_abort(mp);
 			goto Finish;
 		}
 		r = ext4_fs_truncate_inode(&inode_ref, inode_size);
@@ -872,16 +881,18 @@ static int ext4_trunc_inode(struct ext4_mountpoint *mp,
 		else
 			r = ext4_fs_put_inode_ref(&inode_ref);
 
-		if (r != EOK)
-			ext4_trans_abort(mp);
-		else
-			ext4_trans_stop(mp);
+		if (own_trans) {
+			if (r != EOK)
+				ext4_trans_abort(mp);
+			else
+				ext4_trans_stop(mp);
+		}
 
 	}
 
 Finish:
 
-	if (has_trans)
+	if (has_trans && own_trans)
 		ext4_trans_start(mp);
 
 	return r;
