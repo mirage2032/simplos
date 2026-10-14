@@ -102,15 +102,37 @@ fn main() {
             println!("{} {copied}", arg(3));
         }
         // dup of a descriptor that isn't open, dup2 to one past the most
-        // there can be, pipe2 into the kernel's half, and pipe2 asked not
-        // to wait, which isn't there yet.
+        // there can be, pipe2 into the kernel's half, and pipe2 with a flag
+        // it doesn't take.
         Some("bad-pipes") => {
             let closed = syscall(32, 1000, 0, 0);
             let far = syscall(33, 1, 5000, 0);
             let kernel = syscall(293, 0xFFFF_8000_0000_0000, 0, 0);
             let mut fds = [0i32; 2];
-            let nonblocking = syscall(293, fds.as_mut_ptr() as usize, 0o4000, 0);
-            println!("{closed} {far} {kernel} {nonblocking}");
+            let unknown = syscall(293, fds.as_mut_ptr() as usize, 0o1, 0);
+            println!("{closed} {far} {kernel} {unknown}");
+        }
+        // O_NONBLOCK: an empty pipe read, a pipe written until it's full,
+        // F_GETFL of its writing end; then standard input made not to wait,
+        // with FIONBIO, and read.
+        Some("nonblocking") => {
+            let mut fds = [0i32; 2];
+            syscall(293, fds.as_mut_ptr() as usize, 0o4000, 0);
+            let (read, write) = (fds[0] as usize, fds[1] as usize);
+            let mut buf = [0u8; 4096];
+            let empty = syscall(0, read, buf.as_mut_ptr() as usize, buf.len());
+            let mut filled = 0;
+            let full = loop {
+                match syscall(1, write, buf.as_ptr() as usize, buf.len()) {
+                    written if written > 0 => filled += written,
+                    error => break error,
+                }
+            };
+            let flags = syscall(72, write, 3, 0);
+            let on = 1i32;
+            syscall(16, 0, 0x5421, &raw const on as usize);
+            let typed = syscall(0, 0, buf.as_mut_ptr() as usize, buf.len());
+            println!("{empty} {filled} {full} {flags} {typed}");
         }
         // A copy of the program, with fork, which changes its memory and
         // ends; then the original's memory, as it was, and how the copy
@@ -272,6 +294,81 @@ fn main() {
             let output = or_fail("stdout", io::read_to_string(child.stdout.take().unwrap()));
             print!("{output}");
             println!("{}", or_fail(&arg(3), child.wait()));
+        }
+        // Whether standard input and output are terminals, and a pipe; and
+        // the terminal's size, as TIOCGWINSZ says.
+        Some("tty") => {
+            use std::io::IsTerminal;
+            let mut size = [0u16; 4];
+            let got = syscall(16, 1, 0x5413, size.as_mut_ptr() as usize);
+            let pipe = std::os::fd::OwnedFd::from(or_fail("pipe", io::pipe()).0);
+            let (stdin, stdout) = (io::stdin().is_terminal(), io::stdout().is_terminal());
+            println!("{stdin} {stdout} {} {}x{} {got}", pipe.is_terminal(), size[0], size[1]);
+        }
+        // Standard input in raw mode, as cfmakeraw makes it: COUNT bytes
+        // read as they come, each read's shown; then as it was.
+        Some("raw") => {
+            const TCGETS: usize = 0x5401;
+            const TCSETS: usize = 0x5402;
+            let mut termios = [0u8; 60];
+            syscall(16, 0, TCGETS, termios.as_mut_ptr() as usize);
+            let saved = termios;
+            let mut clear = |at: usize, bits: u32| {
+                let flags = u32::from_le_bytes(termios[at..at + 4].try_into().unwrap()) & !bits;
+                termios[at..at + 4].copy_from_slice(&flags.to_le_bytes());
+            };
+            // ICRNL and IXON; OPOST; ICANON, ECHO, ISIG and IEXTEN.
+            clear(0, 0o400 | 0o2000);
+            clear(4, 0o1);
+            clear(12, 0o2 | 0o10 | 0o1 | 0o100000);
+            // VMIN and VTIME: a byte at least, waiting as long as it takes.
+            (termios[17 + 6], termios[17 + 5]) = (1, 0);
+            syscall(16, 0, TCSETS, termios.as_ptr() as usize);
+            println!("raw");
+            let count: usize = arg(2).parse().unwrap_or(1);
+            let mut got = 0;
+            while got < count {
+                let mut buf = [0u8; 16];
+                let read = syscall(0, 0, buf.as_mut_ptr() as usize, buf.len()).max(0) as usize;
+                println!("{:?}", &buf[..read]);
+                got += read.max(1);
+            }
+            syscall(16, 0, TCSETS, saved.as_ptr() as usize);
+            println!("cooked");
+        }
+        // poll on a pipe: with nothing in it, at once and then for 50 ms;
+        // then until a copy writes; then once it's gone and that's read. What
+        // each returned, and the last two's revents.
+        Some("poll") => {
+            let (reader, writer) = or_fail("pipe", io::pipe());
+            let fd = reader.as_raw_fd();
+            let poll = |timeout: i32| {
+                // `struct pollfd`: the fd, then POLLIN asked for, then revents.
+                let mut entry = [fd, 1];
+                let ready = syscall(7, entry.as_mut_ptr() as usize, 1, timeout as usize);
+                (ready, entry[1] >> 16)
+            };
+            let (now, later) = (poll(0).0, poll(50).0);
+            let child = syscall(57, 0, 0, 0);
+            if child == 0 {
+                std::thread::sleep(Duration::from_millis(50));
+                or_fail("pipe", (&writer).write_all(b"x"));
+                std::process::exit(0);
+            }
+            let written = poll(-1);
+            wait(child);
+            drop(writer);
+            or_fail("pipe", (&reader).read_exact(&mut [0]));
+            let closed = poll(-1);
+            println!("{now} {later} {written:?} {closed:?}");
+        }
+        // Run PROGRAM with ARGS, collecting its output: then what it wrote to
+        // each, and how it ended.
+        Some("output") => {
+            let output = Command::new(arg(2)).args(std::env::args().skip(3)).output();
+            let output = or_fail(&arg(2), output);
+            print!("{}", String::from_utf8_lossy(&output.stdout));
+            println!("{:?} {}", String::from_utf8_lossy(&output.stderr), output.status);
         }
         // End with PATH open, for the kernel to close.
         Some("hold") => std::mem::forget(or_fail(&arg(2), fs::File::open(arg(2)))),

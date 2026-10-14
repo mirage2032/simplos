@@ -117,6 +117,23 @@ impl Display {
         self.mark_dirty(top, bottom);
     }
 
+    /// Move the rows `top..top + height` up by `by`, as text scrolls, and fill
+    /// the rows that opens at the bottom with `color`: cheaper than drawing
+    /// them all again.
+    pub fn scroll_up(&mut self, top: u32, height: u32, by: u32, color: Rgb888) {
+        let bottom = top.saturating_add(height).min(self.height);
+        if top >= bottom {
+            return;
+        }
+        let by = by.min(bottom - top);
+        let pitch = (self.width * self.bytes_per_pixel) as usize;
+        let (start, end) = (top as usize * pitch, bottom as usize * pitch);
+        self.back_buffer.copy_within(start + by as usize * pitch..end, start);
+        let opened = Rectangle::new(Point::new(0, (bottom - by) as i32), Size::new(self.width, by));
+        self.fill_rect(&opened, color);
+        self.mark_dirty(top, bottom - 1);
+    }
+
     /// `area` intersected with the screen, as inclusive `(left, top, right, bottom)`.
     fn clip(&self, area: &Rectangle) -> Option<(u32, u32, u32, u32)> {
         if self.width == 0 || self.height == 0 || area.size.width == 0 || area.size.height == 0 {

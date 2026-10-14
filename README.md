@@ -2,9 +2,9 @@
 
 A small x86_64 operating system written in Rust, from the boot sector up. It
 brings up long mode, a GDT and IDT, paging and a heap, a PS/2 keyboard, the
-HPET, and drops into a small command line (type `help`) drawn into a linear
-framebuffer, from which `run` starts an unmodified Linux x86-64 program in user
-mode. It boots under both BIOS and UEFI firmware, on real hardware or an
+HPET, and drops into a small command line (type `help`) on a terminal drawn
+into a linear framebuffer, from which `run` starts an unmodified Linux x86-64
+program in user mode. It boots under both BIOS and UEFI firmware, on real hardware or an
 emulator — including [in a browser tab](https://lazyscript.com/projects/simplos), where QEMU itself
 is compiled to WebAssembly.
 
@@ -113,10 +113,9 @@ has the user program read it, and `run` lists its other modes. For now:
 
 - no symbolic link is followed, so `stat` and `lstat` are the same;
 - a file that's open can't be removed or renamed over (`EBUSY`);
-- pipes always wait (no `O_NONBLOCK`), and writing to one nobody reads is
-  `EPIPE` without `SIGPIPE`, as there are no signals yet;
-- `/dev` holds just those three, and can't be written;
-- standard input is always at its end.
+- writing to a pipe nobody reads is `EPIPE` without `SIGPIPE`, as there are
+  no signals yet;
+- `/dev` holds just those three, and can't be written.
 
 ## Processes
 
@@ -124,8 +123,8 @@ A program can start others as on Linux: `fork`, `vfork` and `clone` (as C
 libraries use it for them) copy it, `execve` replaces it with an ELF program
 from the disk, closing the descriptors marked close-on-exec, and `wait4`
 waits for its copies and tells how each ended; `getpid` and `getppid` say
-who's who. So Rust's `std::process::Command` works: its `spawn`, `status`
-and `exec`, but not yet `output`, which needs `poll` to wait. `cargo run`'s
+who's who. So Rust's `std::process::Command` works: its `spawn`, `status`,
+`output` and `exec`. `cargo run`'s
 disk has the user program as `/bin/probe` (a `disk.img` made before this
 doesn't: delete it), so in the shell, `run spawn /bin/probe hello` has it
 run itself again. For now:
@@ -141,6 +140,33 @@ run itself again. For now:
   and no signals, so nothing is ever stopped;
 - `execve` takes ELF programs of up to 4 MiB, which it reads whole, and not
   scripts: shells run those themselves when told `ENOEXEC`.
+
+## Terminal
+
+The screen is a terminal, and the keyboard types into it, as on Linux's
+console: a program's standard input, output and error are the terminal,
+`/dev/tty` too, and what it reads is what's typed. Between them is Linux's
+line discipline (`tty.rs`): in canonical mode, the default, a line is typed
+and edited first, with Backspace, ^U, ^W, and ^D for the end of file, and
+handed over on Enter; in raw mode each key is ready as it's pressed. A
+program reads and changes the settings, laid out as Linux's `termios`, with
+`ioctl` (`TCGETS`, `TCSETS` and the rest), and asks the size with
+`TIOCGWINSZ`. The screen (`terminal.rs`) keeps a grid of characters and a
+cursor, scrolls, and draws only the rows that changed.
+
+`poll` and `ppoll` wait for pipes and terminals, as long as they're asked
+to, and `O_NONBLOCK` (from `open`, `pipe2`, `fcntl` or `FIONBIO`) makes what
+would wait fail with `EAGAIN` instead. In the shell, `run cat` copies what's
+typed until ^D. For now:
+
+- of the escape sequences, only moving the cursor and erasing the screen and
+  lines; the rest of a VT100's are read and ignored;
+- no signals, so ^C, ^\ and ^Z throw away the line typed so far and send
+  nothing, and no process groups: a program asking which is in the
+  foreground is told it's itself;
+- in raw mode, `VTIME` is ignored: a read waits for `VMIN` bytes however
+  long they take;
+- the font is ASCII: anything else shows as `?`.
 
 ## Tests
 
@@ -159,7 +185,8 @@ derived from the value written. Every test also gets two blank scratch disks,
 ext4 disk made by e2fsprogs' `mke2fs`, which `tests/ext4.rs` writes to, and
 `tests/files.rs` has the user program read and write through system calls. It holds
 the user program as `/bin/probe`, which `tests/processes.rs` has it start
-copies of and run again. After a run that passes, e2fsck must find nothing wrong with it, and it must have been
+copies of and run again; `tests/tty.rs` types into a terminal for it to read.
+After a run that passes, e2fsck must find nothing wrong with it, and it must have been
 unmounted, so the tests need e2fsprogs installed.
 
 Each test boots twice, under BIOS and then under UEFI, and passes only if it

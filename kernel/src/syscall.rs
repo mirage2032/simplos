@@ -11,11 +11,13 @@
 mod files;
 mod processes;
 
+use crate::fs::Handle;
 use crate::io::interrupts::gdt;
 use crate::memory::USER_END;
 use crate::process::{self, LOWEST, MMAP_END, MMAP_START, Process, Registers, pages};
 use crate::{serial_println, thread};
 use alloc::vec;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use x86_64::VirtAddr;
 use x86_64::instructions::interrupts;
@@ -185,7 +187,7 @@ fn call(frame: &Frame) -> i64 {
         // stat and lstat: the same, as no symbolic link is followed yet.
         4 | 6 => files::newfstatat(&process, files::AT_FDCWD, a0, a1, 0),
         5 => files::fstat(&process, a0, a1),
-        7 => poll(&process, a0, a1),
+        7 => poll(&process, a0, a1, (a2 as i32 >= 0).then_some(a2 as i32 as u64)),
         8 => files::lseek(&process, a0, a1, a2),
         9 => mmap(&process, a0, a1, a2, a3),
         10 => mprotect(&process, a0, a1, a2),
@@ -193,7 +195,7 @@ fn call(frame: &Frame) -> i64 {
         12 => brk(&process, a0),
         13 => rt_sigaction(&process, a0, a2, a3),
         14 => rt_sigprocmask(&process, a2, a3),
-        16 => -ENOTTY,
+        16 => files::ioctl(&process, a0, a1, a2),
         17 => files::pread(&process, a0, a1, a2, a3),
         18 => files::pwrite(&process, a0, a1, a2, a3),
         22 => files::pipe2(&process, a0, 0),
@@ -243,6 +245,7 @@ fn call(frame: &Frame) -> i64 {
         262 => files::newfstatat(&process, a0, a1, a2, a3),
         263 => files::unlinkat(&process, a0, a1, a2),
         264 => files::renameat2(&process, a0, a1, a2, a3, 0),
+        271 => ppoll(&process, a0, a1, a2),
         292 => files::dup3(&process, a0, a1, a2, false),
         293 => files::pipe2(&process, a0, a1),
         316 => files::renameat2(&process, a0, a1, a2, a3, a4),
@@ -253,33 +256,90 @@ fn call(frame: &Frame) -> i64 {
     }
 }
 
-/// Which descriptors are open, which is what Rust's start-up asks of 0-2.
-///
-/// shortcut: never waits, and never reports anything readable or writable;
-/// nothing a program has open can make it wait yet.
-fn poll(process: &Process, fds: u64, count: u64) -> i64 {
+/// Wait until one of the descriptors in the `struct pollfd`s at `fds` is
+/// ready as asked, or for `timeout` milliseconds if it isn't `None`: how
+/// many are, each told how in its `revents`.
+fn poll(process: &Process, fds: u64, count: u64, timeout: Option<u64>) -> i64 {
+    const POLLIN: i16 = 0x1;
+    const POLLOUT: i16 = 0x4;
+    const POLLERR: i16 = 0x8;
+    const POLLHUP: i16 = 0x10;
     const POLLNVAL: i16 = 0x20;
     if count > 1024 {
         return -EINVAL;
     }
     // `struct pollfd`: an int fd, then two shorts, events and revents.
     let mut table = vec![0u8; count as usize * 8];
-    let mut memory = process.memory.lock();
-    if memory.space.read(fds, &mut table).is_none() {
+    if process.memory.lock().space.read(fds, &mut table).is_none() {
         return -EFAULT;
     }
-    let mut ready = 0;
-    for entry in table.as_chunks_mut::<8>().0 {
+    let entry = |entry: &[u8; 8]| {
         let fd = i32::from_le_bytes(entry[..4].try_into().unwrap());
+        let events = i16::from_le_bytes([entry[4], entry[5]]);
         // A negative fd is skipped, as poll's caller intends.
-        let revents = if fd < 0 || files::is_open(process, fd) { 0 } else { POLLNVAL };
+        (events, (fd >= 0).then(|| files::open_handle(process, fd)))
+    };
+    let entries: Vec<_> = table.as_chunks::<8>().0.iter().map(entry).collect();
+    let mut revents = vec![0i16; entries.len()];
+    // What each is ready for, of what was asked; errors and hang-ups are
+    // told whether asked or not.
+    let check = |revents: &mut [i16]| {
+        for ((events, handle), revents) in entries.iter().zip(revents.iter_mut()) {
+            let ready = match handle {
+                None => 0,
+                Some(None) => POLLNVAL,
+                Some(Some(handle)) => match &**handle {
+                    Handle::Tty { tty, .. } => POLLOUT | if tty.readable() { POLLIN } else { 0 },
+                    Handle::Pipe { end, .. } => {
+                        let pipe = end.poll();
+                        match (end.write, pipe.closed) {
+                            (false, closed) => {
+                                (if pipe.now { POLLIN } else { 0 })
+                                    | if closed { POLLHUP } else { 0 }
+                            }
+                            (true, true) => POLLERR,
+                            (true, false) => {
+                                if pipe.now {
+                                    POLLOUT
+                                } else {
+                                    0
+                                }
+                            }
+                        }
+                    }
+                    // Files never make a program wait.
+                    _ => POLLIN | POLLOUT,
+                },
+            };
+            *revents = ready & (events | POLLERR | POLLHUP | POLLNVAL);
+        }
+        revents.iter().any(|&revents| revents != 0)
+    };
+    // A timeout of 0 only looks.
+    let deadline = timeout.map(|ms| if ms == 0 { 0 } else { thread::ticks_after(ms) });
+    thread::poll_until(deadline, || check(&mut revents));
+    let mut ready = 0;
+    for (entry, revents) in table.as_chunks_mut::<8>().0.iter_mut().zip(&revents) {
         entry[6..].copy_from_slice(&revents.to_le_bytes());
-        ready += i64::from(revents != 0);
+        ready += i64::from(*revents != 0);
     }
-    if memory.space.write(fds, &table).is_none() {
+    if process.memory.lock().space.write(fds, &table).is_none() {
         return -EFAULT;
     }
     ready
+}
+
+/// `poll`, with its timeout a `struct timespec` at `timeout`, or none.
+///
+/// shortcut: the signal mask is taken and ignored, as there are no signals.
+fn ppoll(process: &Process, fds: u64, count: u64, timeout: u64) -> i64 {
+    if timeout == 0 {
+        return poll(process, fds, count, None);
+    }
+    match timespec_ms(process, timeout) {
+        Ok(ms) => poll(process, fds, count, Some(ms)),
+        Err(errno) => -errno,
+    }
 }
 
 const PROT_WRITE: u64 = 2;
@@ -424,19 +484,25 @@ fn clock_nanosleep(process: &Process, clock: u64, flags: u64, request: u64) -> i
     if flags != 0 || (clock != CLOCK_REALTIME && clock != CLOCK_MONOTONIC) {
         return -EINVAL;
     }
-    let mut timespec = [0u8; 16];
-    if process.memory.lock().space.read(request, &mut timespec).is_none() {
-        return -EFAULT;
+    match timespec_ms(process, request) {
+        Ok(ms) => {
+            thread::sleep(ms);
+            0
+        }
+        Err(errno) => -errno,
     }
+}
+
+/// The `struct timespec` at `addr`, in milliseconds, rounded up.
+fn timespec_ms(process: &Process, addr: u64) -> Result<u64, i64> {
+    let mut timespec = [0u8; 16];
+    process.memory.lock().space.read(addr, &mut timespec).ok_or(EFAULT)?;
     let seconds = i64::from_le_bytes(timespec[..8].try_into().unwrap());
     let nanos = i64::from_le_bytes(timespec[8..].try_into().unwrap());
     if seconds < 0 || !(0..1_000_000_000).contains(&nanos) {
-        return -EINVAL;
+        return Err(EINVAL);
     }
-    let ms =
-        (seconds as u64).saturating_mul(1000).saturating_add((nanos as u64).div_ceil(1_000_000));
-    thread::sleep(ms);
-    0
+    Ok((seconds as u64).saturating_mul(1000).saturating_add((nanos as u64).div_ceil(1_000_000)))
 }
 
 /// `fs`, where musl keeps its thread-local storage.
