@@ -16,10 +16,11 @@ use crate::io::interrupts::gdt;
 use crate::memory::AddressSpace;
 use crate::thread::{self, WaitQueue};
 use alloc::boxed::Box;
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 use spin::Mutex;
 use x86_64::VirtAddr;
 use x86_64::registers::control::{Cr0, Cr0Flags, Cr3, Cr3Flags, Cr4, Cr4Flags};
@@ -63,6 +64,11 @@ pub struct Process {
     /// Its file descriptors, by number; `None` for one that's closed. Taken
     /// only with interrupts on, by the program's own system calls.
     pub files: Mutex<Vec<Option<Arc<fs::Handle>>>>,
+    /// Where its relative paths start: a path from the root, without the
+    /// leading slash, as `fs::resolve` makes them.
+    pub cwd: Mutex<String>,
+    /// The permission bits taken off what it creates.
+    pub umask: AtomicU32,
 }
 
 /// What a program's standard output and error are written to.
@@ -113,6 +119,8 @@ pub fn spawn(
         exited: WaitQueue::new(),
         output: Mutex::new(Box::new(output)),
         files: Mutex::new(vec![Some(Arc::new(fs::Handle::Console)); 3]),
+        cwd: Mutex::new(String::new()),
+        umask: AtomicU32::new(0o022),
     });
     let user = UserState {
         process: process.clone(),

@@ -54,6 +54,30 @@ fn main() {
             println!("{bad_path} {bad_buf} {small} {read_dir} {closed}");
         }
         Some("exit") => {}
+        Some("mkdir") => or_fail(&arg(2), fs::create_dir(arg(2))),
+        Some("mkdir-p") => or_fail(&arg(2), fs::create_dir_all(arg(2))),
+        Some("rm") => or_fail(&arg(2), fs::remove_file(arg(2))),
+        Some("rmdir") => or_fail(&arg(2), fs::remove_dir(arg(2))),
+        Some("rm-r") => or_fail(&arg(2), fs::remove_dir_all(arg(2))),
+        Some("mv") => or_fail(&arg(2), fs::rename(arg(2), arg(3))),
+        // mv, but never over what's there: renameat2's RENAME_NOREPLACE.
+        Some("mv-n") => {
+            let (from, to) =
+                (std::ffi::CString::new(arg(2)).unwrap(), std::ffi::CString::new(arg(3)).unwrap());
+            let at_fdcwd = -100isize as usize;
+            let result = syscall5(
+                316,
+                [at_fdcwd, from.as_ptr() as usize, at_fdcwd, to.as_ptr() as usize, 1],
+            );
+            println!("{result}");
+        }
+        // Go to DIR, say where that is, then print PATH from there.
+        Some("cd") => {
+            or_fail(&arg(2), std::env::set_current_dir(arg(2)));
+            println!("{}", or_fail(&arg(2), std::env::current_dir()).display());
+            let contents = or_fail(&arg(3), fs::read(arg(3)));
+            or_fail(&arg(3), io::stdout().write_all(&contents));
+        }
         // End with PATH open, for the kernel to close.
         Some("hold") => std::mem::forget(or_fail(&arg(2), fs::File::open(arg(2)))),
         // Files, through std::fs, as any program would use them.
@@ -127,8 +151,14 @@ fn or_fail<T>(path: &str, result: io::Result<T>) -> T {
 
 /// A system call made directly, bypassing libc's checks.
 fn syscall(nr: isize, a0: usize, a1: usize, a2: usize) -> isize {
+    syscall5(nr, [a0, a1, a2, 0, 0])
+}
+
+/// The same, with up to five arguments.
+fn syscall5(nr: isize, [a0, a1, a2, a3, a4]: [usize; 5]) -> isize {
     let result;
-    // Safety: the calls made here touch no memory of the program's.
+    // Safety: whatever a call is pointed at outlives it, and the compiler
+    // takes the asm to read and write memory, as without `nomem` it does.
     unsafe {
         std::arch::asm!(
             "syscall",
@@ -136,6 +166,8 @@ fn syscall(nr: isize, a0: usize, a1: usize, a2: usize) -> isize {
             in("rdi") a0,
             in("rsi") a1,
             in("rdx") a2,
+            in("r10") a3,
+            in("r8") a4,
             out("rcx") _,
             out("r11") _,
             options(nostack),

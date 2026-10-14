@@ -31,7 +31,14 @@ fn writes_the_tree(test: &str, options: &[&str]) {
     fs.rename("dir/nested/deep.txt", "new/deep.txt").unwrap();
     // A directory: its `..` must follow it.
     fs.rename("dir", "new/dir").unwrap();
-    fs.remove_file("empty").unwrap();
+    // Over a file that's there, which goes.
+    write_all(&fs.create("new/replacement").unwrap(), 0, b"replaced\n");
+    fs.rename("new/replacement", "empty").unwrap();
+    // Over an empty directory, which goes too.
+    fs.create_dir("new/gone").unwrap();
+    fs.create_dir("new/going").unwrap();
+    fs.rename("new/going", "new/gone").unwrap();
+    fs.remove_dir("new/gone").unwrap();
     fs.remove_file("link").unwrap();
     drop(fs);
 
@@ -44,7 +51,8 @@ fn writes_the_tree(test: &str, options: &[&str]) {
     assert!(debugfs(&saved, "cat new/deeper/bigger.bin") == bigger(), "bigger.bin too");
     assert_eq!(debugfs(&saved, "cat hello.txt"), b"rewritten\n");
     assert_eq!(debugfs(&saved, "cat new/deep.txt"), b"deep\n");
-    assert_eq!(debugfs_ls(&saved, "/"), ["big.bin", "hello.txt", "lost+found", "new"]);
+    assert_eq!(debugfs(&saved, "cat empty"), b"replaced\n");
+    assert_eq!(debugfs_ls(&saved, "/"), ["big.bin", "empty", "hello.txt", "lost+found", "new"]);
     assert_eq!(debugfs_ls(&saved, "new"), ["deep.txt", "deeper", "dir"]);
     assert_eq!(debugfs_ls(&saved, "new/dir"), ["nested"]);
     assert!(debugfs_ls(&saved, "new/dir/nested").is_empty());
@@ -163,7 +171,12 @@ fn refuses_what_linux_refuses() {
     assert_eq!(fs.create_dir("hello.txt").err(), Some(Error::AlreadyExists));
     assert_eq!(fs.remove_file("missing").err(), Some(Error::NotFound));
     assert_eq!(fs.rename("missing", "elsewhere").err(), Some(Error::NotFound));
-    assert_eq!(fs.rename("hello.txt", "empty").err(), Some(Error::AlreadyExists));
+    assert_eq!(fs.rename("hello.txt", "dir").err(), Some(Error::IsADirectory));
+    assert_eq!(fs.rename("dir", "empty").err(), Some(Error::NotADirectory));
+    assert_eq!(fs.remove_dir("dir").err(), Some(Error::NotEmpty));
+    assert_eq!(fs.remove_dir("hello.txt").err(), Some(Error::NotADirectory));
+    assert_eq!(fs.remove_dir("missing").err(), Some(Error::NotFound));
+    assert_eq!(fs.remove_dir("/").err(), Some(Error::Busy));
     // lwext4 alone would cut `dir` off, in a loop of its own.
     assert_eq!(fs.rename("dir", "dir/nested/dir").err(), Some(Error::InvalidArgument));
     // lwext4 alone would write to a file opened for reading.
@@ -318,4 +331,45 @@ fn says_what_stat_says() {
     for entry in fs.read_dir("/").unwrap() {
         assert_eq!(entry.inode, fs.metadata(&entry.name).unwrap().inode, "{}", entry.name);
     }
+}
+
+#[test]
+fn replaces_and_removes_only_what_it_may() {
+    let _serial = serial();
+    let dir = workspace("replaces");
+    let root = dir.join("tree");
+    make_tree(&root);
+    let image = image(&dir, &root, &["-t", "ext4"], "64M");
+    let fs = Ext4::mount_writable(Box::new(image.clone())).unwrap();
+    // Not while it's open: lwext4 would free it under whoever has it.
+    let open = fs.open("hello.txt").unwrap();
+    write_all(&fs.create("new").unwrap(), 0, b"new\n");
+    assert_eq!(fs.rename("new", "hello.txt").err(), Some(Error::Busy));
+    drop(open);
+    fs.rename("new", "hello.txt").unwrap();
+    // Onto itself: nothing happens.
+    fs.rename("hello.txt", "hello.txt").unwrap();
+    // A directory that's open can't go either.
+    fs.create_dir("empty-dir").unwrap();
+    let listing = fs.open_dir("empty-dir").unwrap();
+    assert_eq!(fs.remove_dir("empty-dir").err(), Some(Error::Busy));
+    drop(listing);
+    fs.remove_dir("empty-dir").unwrap();
+    // A directory onto one that isn't empty.
+    fs.create_dir("other").unwrap();
+    assert_eq!(fs.rename("other", "dir").err(), Some(Error::NotEmpty));
+    fs.set_permissions("hello.txt", 0o600).unwrap();
+    assert_eq!(fs.metadata("hello.txt").unwrap().permissions, 0o600);
+    drop(fs);
+
+    let saved = dir.join("written.img");
+    image.save(&saved);
+    fsck(&saved).unwrap();
+    assert_eq!(debugfs(&saved, "cat hello.txt"), b"new\n");
+    assert_eq!(
+        debugfs_ls(&saved, "/"),
+        ["big.bin", "dir", "empty", "hello.txt", "link", "lost+found", "other"]
+    );
+    let stat = String::from_utf8(debugfs(&saved, "stat hello.txt")).unwrap();
+    assert!(stat.contains("Mode:  0600"), "{stat}");
 }

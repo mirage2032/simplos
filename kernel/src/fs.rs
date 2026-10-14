@@ -115,6 +115,7 @@ pub fn errno(error: ext4::Error) -> i64 {
         InvalidArgument => 22,
         NoSpace => 28,
         ReadOnly => 30,
+        NotEmpty => 39,
         Unsupported => 95,
         Other(errno) => errno.into(),
     }

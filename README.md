@@ -98,12 +98,13 @@ The disk is trusted: lwext4 is C, parsing it in ring 0, and isn't fuzzed yet.
 Programs use it through Linux's system calls, so Rust's `std::fs` (or C's
 stdio) works as it does on Linux: `open`, `openat`, `close`, `read`, `write`,
 `pread64`, `pwrite64`, `lseek`, `stat`, `lstat`, `fstat`, `newfstatat`,
-`getdents64`, `fcntl` and `fsync`. In the shell, `run cat /hello.txt` has the
-user program read it, and `run` lists its other modes. For now:
+`getdents64`, `fcntl`, `fsync`, `mkdir`, `mkdirat`, `rmdir`, `unlink`,
+`unlinkat`, `rename`, `renameat`, `renameat2`, `chdir`, `getcwd` and `umask`.
+In the shell, `run cat /hello.txt` has the user program read it, and `run`
+lists its other modes. For now:
 
-- every path starts at the root: there's no `chdir` yet, and no `mkdir`,
-  `unlink` or `rename` for programs either;
 - no symbolic link is followed, so `stat` and `lstat` are the same;
+- a file that's open can't be removed or renamed over (`EBUSY`);
 - standard input is always at its end, and close-on-exec means nothing until
   there's an `execve`.
 
@@ -183,6 +184,11 @@ MBR code, which nothing uses. It is GPL-2.0 (its extents and xattr code are
   having errors, where Linux clears its "clean" flag: after a crash, Linux
   would warn of errors that weren't there.
 
+And one addition, also marked: **`src/ext4.c`, renaming onto a file that's
+there** replaces it in the rename's own transaction, as `rename(2)` promises,
+so a crash leaves the old file or the new one there, never neither. Upstream
+refuses (`EEXIST`).
+
 `fs/ext4` compiles it with the host's C compiler, the same way for the
 kernel as for its tests on the host: freestanding, with no C library but the
 few headers in `fs/ext4/src/include` and the few functions in
@@ -201,11 +207,12 @@ there or unlinking a directory, move a directory into itself, write to a file
 opened for reading, quietly mount read-only what it can't write, and crash
 unmounting after a failed mount.
 
-What it still can't do: rename onto a name that's there (refused, where Linux
-replaces it), remove a file over 16 MiB in one transaction, remove a file
-that's open (refused, where Linux removes the name and keeps the file until
-it's closed), set timestamps, or leave a hole in a file (writing past the end
-fills the gap with zeros). Every change is on the device before the call
+What it still can't do: rename a directory onto an empty one in one
+transaction (it's two), remove a file over 16 MiB in one transaction, remove
+or replace a file that's open (refused, where Linux removes the name and
+keeps the file until it's closed), set timestamps, or leave a hole in a file
+(writing past the end fills the gap with zeros). A new file's permissions are
+set just after it's made, in a transaction of their own. Every change is on the device before the call
 returns, in the journal if there is one, which is simple and slow.
 
 Building and running `fs/ext4`'s tests needs e2fsprogs (`mke2fs`, `e2fsck`,

@@ -132,12 +132,12 @@ extern "sysv64" fn dispatch(frame: &Frame) -> i64 {
     result
 }
 
-fn call(nr: u64, [a0, a1, a2, a3, _a4, _a5]: [u64; 6]) -> i64 {
+fn call(nr: u64, [a0, a1, a2, a3, a4, _a5]: [u64; 6]) -> i64 {
     let process = thread::current_process().expect("system calls come from programs");
     match nr {
         0 => files::read(&process, a0, a1, a2),
         1 => files::write(&process, a0, a1, a2),
-        2 => files::open(&process, files::AT_FDCWD, a0, a1),
+        2 => files::open(&process, files::AT_FDCWD, a0, a1, a2),
         3 => files::close(&process, a0),
         // stat and lstat: the same, as no symbolic link is followed yet.
         4 | 6 => files::newfstatat(&process, files::AT_FDCWD, a0, a1, 0),
@@ -161,6 +161,13 @@ fn call(nr: u64, [a0, a1, a2, a3, _a4, _a5]: [u64; 6]) -> i64 {
             process::exit_current((a0 & 0xFF) as i32)
         }
         72 => files::fcntl(&process, a0, a1, a2),
+        79 => files::getcwd(&process, a0, a1),
+        80 => files::chdir(&process, a0),
+        82 => files::renameat2(&process, files::AT_FDCWD, a0, files::AT_FDCWD, a1, 0),
+        83 => files::mkdirat(&process, files::AT_FDCWD, a0, a1),
+        84 => files::unlinkat(&process, files::AT_FDCWD, a0, files::AT_REMOVEDIR),
+        87 => files::unlinkat(&process, files::AT_FDCWD, a0, 0),
+        95 => files::umask(&process, a0),
         // fsync, fdatasync.
         74 | 75 => files::fsync(&process, a0),
         131 => sigaltstack(&process, a1),
@@ -171,8 +178,12 @@ fn call(nr: u64, [a0, a1, a2, a3, _a4, _a5]: [u64; 6]) -> i64 {
         217 => files::getdents64(&process, a0, a1, a2),
         218 => process.id as i64,
         230 => clock_nanosleep(&process, a0, a1, a2),
-        257 => files::open(&process, a0, a1, a2),
+        257 => files::open(&process, a0, a1, a2, a3),
+        258 => files::mkdirat(&process, a0, a1, a2),
         262 => files::newfstatat(&process, a0, a1, a2, a3),
+        263 => files::unlinkat(&process, a0, a1, a2),
+        264 => files::renameat2(&process, a0, a1, a2, a3, 0),
+        316 => files::renameat2(&process, a0, a1, a2, a3, a4),
         _ => {
             serial_println!("simplos: process {}: no system call {}", process.id, nr);
             -ENOSYS

@@ -57,6 +57,11 @@ fn ok(text: &str) -> (i32, String) {
     (0, String::from(text))
 }
 
+/// How probe says what went wrong with `path`.
+fn failed(path: &str, error: &str) -> (i32, String) {
+    (1, alloc::format!("probe: {path}: {error}\n"))
+}
+
 #[test_case]
 fn a_program_reads_files_and_lists_directories() {
     assert_eq!(run(&["cat", "/hello.txt", "/dir/nested/deep.txt"]), ok("hello from ext4\ndeep\n"));
@@ -81,7 +86,6 @@ fn a_program_sees_what_stat_says() {
 
 #[test_case]
 fn a_program_is_told_what_linux_would_tell_it() {
-    let failed = |path: &str, error: &str| (1, alloc::format!("probe: {path}: {error}\n"));
     assert_eq!(
         run(&["cat", "/missing"]),
         failed("/missing", "No such file or directory (os error 2)")
@@ -170,4 +174,78 @@ fn a_program_s_files_close_as_it_ends() {
     // Busy if the program's file were still open.
     ROOT.lock().as_ref().unwrap().remove_file("held.txt").unwrap();
     drop(process);
+}
+
+#[test_case]
+fn a_program_makes_and_removes_directories() {
+    assert_eq!(run(&["mkdir", "/made"]), ok(""));
+    // As on Linux: what a program asks for, less the umask's 022. Two
+    // blocks, not one: lwext4 makes every directory indexed from the start.
+    assert_eq!(run(&["stat", "/made"]), ok("8192 dir 755\n8192 dir 755\n"));
+    assert_eq!(run(&["mkdir", "/made"]), failed("/made", "File exists (os error 17)"));
+    assert_eq!(run(&["mkdir-p", "/made/a/b/c"]), ok(""));
+    assert_eq!(run(&["write", "/made/a/b/c/file.txt", "deep\n"]), ok(""));
+    assert_eq!(run(&["stat", "/made/a/b/c/file.txt"]), ok("5 file 644\n5 file 644\n"));
+    assert_eq!(run(&["rmdir", "/made/a"]), failed("/made/a", "Directory not empty (os error 39)"));
+    assert_eq!(run(&["rm", "/made/a"]), failed("/made/a", "Is a directory (os error 21)"));
+    assert_eq!(
+        run(&["rmdir", "/made/a/b/c/file.txt"]),
+        failed("/made/a/b/c/file.txt", "Not a directory (os error 20)")
+    );
+    assert_eq!(
+        run(&["rmdir", "/made/a/b/c/."]),
+        failed("/made/a/b/c/.", "Invalid argument (os error 22)")
+    );
+    assert_eq!(run(&["rm", "/made/a/b/c/file.txt"]), ok(""));
+    assert_eq!(run(&["rmdir", "/made/a/b/c"]), ok(""));
+    // The rest, as std::fs::remove_dir_all does it: openat, getdents64 and
+    // unlinkat, each relative to the directory above.
+    assert_eq!(run(&["write", "/made/a/b/again.txt", "x"]), ok(""));
+    assert_eq!(run(&["rm-r", "/made"]), ok(""));
+    assert_eq!(run(&["ls", "/"]), ok("dir/\nhello.txt\nlost+found/\n"));
+}
+
+#[test_case]
+fn a_program_moves_files_and_replaces_them() {
+    assert_eq!(run(&["mkdir", "/moves"]), ok(""));
+    assert_eq!(run(&["write", "/moves/first.txt", "first\n"]), ok(""));
+    assert_eq!(run(&["write", "/moves/second.txt", "second\n"]), ok(""));
+    assert_eq!(run(&["mv", "/moves/first.txt", "/moves/moved.txt"]), ok(""));
+    assert_eq!(run(&["cat", "/moves/moved.txt"]), ok("first\n"));
+    assert_eq!(
+        run(&["cat", "/moves/first.txt"]),
+        failed("/moves/first.txt", "No such file or directory (os error 2)")
+    );
+    // Not over what's there, when asked not to.
+    assert_eq!(run(&["mv-n", "/moves/second.txt", "/moves/moved.txt"]), ok("-17\n"));
+    // Over it, which goes, as a program saving a file whole expects.
+    assert_eq!(run(&["mv", "/moves/second.txt", "/moves/moved.txt"]), ok(""));
+    assert_eq!(run(&["cat", "/moves/moved.txt"]), ok("second\n"));
+    assert_eq!(run(&["ls", "/moves"]), ok("moved.txt\n"));
+    // A directory, with what's in it.
+    assert_eq!(run(&["mv", "/moves", "/dir/moved"]), ok(""));
+    assert_eq!(run(&["cat", "/dir/moved/moved.txt"]), ok("second\n"));
+    assert_eq!(
+        run(&["mv", "/dir", "/dir/moved/dir"]),
+        failed("/dir", "Invalid argument (os error 22)")
+    );
+    assert_eq!(run(&["rm-r", "/dir/moved"]), ok(""));
+}
+
+#[test_case]
+fn a_program_has_a_working_directory() {
+    // Says where it went, then reads a path from there.
+    assert_eq!(run(&["cd", "/dir", "nested/deep.txt"]), ok("/dir\ndeep\n"));
+    assert_eq!(
+        run(&["cd", "/dir/nested/", "../../hello.txt"]),
+        ok("/dir/nested\nhello from ext4\n")
+    );
+    assert_eq!(
+        run(&["cd", "/hello.txt", "x"]),
+        failed("/hello.txt", "Not a directory (os error 20)")
+    );
+    assert_eq!(
+        run(&["cd", "/missing", "x"]),
+        failed("/missing", "No such file or directory (os error 2)")
+    );
 }
