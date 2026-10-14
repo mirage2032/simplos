@@ -3,6 +3,7 @@
 
 use super::{EBADF, EFAULT, EINVAL};
 use crate::fs::{self, Handle, ROOT};
+use crate::pipe;
 use crate::process::Process;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -20,6 +21,7 @@ const ESPIPE: i64 = 29;
 const ERANGE: i64 = 34;
 const ENAMETOOLONG: i64 = 36;
 const ENOTEMPTY: i64 = 39;
+const EPIPE: i64 = 32;
 
 const O_ACCMODE: u64 = 3;
 const O_RDONLY: u64 = 0;
@@ -29,6 +31,7 @@ const O_EXCL: u64 = 0o200;
 const O_TRUNC: u64 = 0o1000;
 const O_APPEND: u64 = 0o2000;
 const O_DIRECTORY: u64 = 0o200000;
+const O_CLOEXEC: u64 = 0o2000000;
 
 /// A `dirfd` that means the working directory.
 pub const AT_FDCWD: u64 = -100i64 as u64;
@@ -122,6 +125,9 @@ pub fn open(process: &Process, dirfd: u64, path: u64, flags: u64, mode: u64) -> 
             return Err(EINVAL);
         }
         let path = lookup(process, dirfd, &path_at(process, path)?)?;
+        if let Some(device) = fs::device(&path) {
+            return install(process, device);
+        }
         let root = ROOT.lock();
         let fs = root.as_ref().ok_or(ENOENT)?;
         let found = fs.metadata(&path);
@@ -215,17 +221,31 @@ fn at(offset: u64) -> Result<u64> {
 
 /// Read from `at`, or else from the descriptor's place, and move it on.
 fn read_at(process: &Process, fd: u64, buf: u64, count: u64, at: Option<u64>) -> Result<i64> {
+    let count = (count as usize).min(MOST);
     match &*handle(process, fd)? {
+        Handle::Console | Handle::Pipe(_) if at.is_some() => Err(ESPIPE),
         // shortcut: programs get no input yet: their standard input is at
         // its end.
-        Handle::Console if at.is_none() => Ok(0),
-        Handle::Console => Err(ESPIPE),
+        Handle::Console => Ok(0),
+        Handle::Null => Ok(0),
+        Handle::Zero => {
+            process.memory.lock().space.write(buf, &vec![0; count]).ok_or(EFAULT)?;
+            Ok(count as i64)
+        }
+        Handle::Pipe(end) if end.write => Err(EBADF),
+        // Not even for nothing: with no data, it would wait.
+        Handle::Pipe(_) if count == 0 => Ok(0),
+        Handle::Pipe(end) => {
+            let data = end.read(count);
+            process.memory.lock().space.write(buf, &data).ok_or(EFAULT)?;
+            Ok(data.len() as i64)
+        }
         Handle::Dir { .. } => Err(EISDIR),
         Handle::File { read: false, .. } => Err(EBADF),
         Handle::File { file, offset, .. } => {
             let _root = ROOT.lock();
             let from = at.unwrap_or_else(|| offset.load(Relaxed));
-            let mut data = vec![0; (count as usize).min(MOST)];
+            let mut data = vec![0; count];
             let read = file.read_at(from, &mut data).map_err(fs::errno)?;
             process.memory.lock().space.write(buf, &data[..read]).ok_or(EFAULT)?;
             if at.is_none() {
@@ -242,11 +262,16 @@ fn write_at(process: &Process, fd: u64, buf: u64, count: u64, at: Option<u64>) -
     let mut data = vec![0; (count as usize).min(MOST)];
     process.memory.lock().space.read(buf, &mut data).ok_or(EFAULT)?;
     match &*handle {
-        Handle::Console if at.is_none() => {
+        Handle::Console | Handle::Pipe(_) if at.is_some() => Err(ESPIPE),
+        Handle::Console => {
             (process.output.lock())(&data);
             Ok(data.len() as i64)
         }
-        Handle::Console => Err(ESPIPE),
+        Handle::Null | Handle::Zero => Ok(data.len() as i64),
+        Handle::Pipe(end) if !end.write => Err(EBADF),
+        // shortcut: no SIGPIPE, as there are no signals: just the error,
+        // which is what a Rust program, ignoring SIGPIPE, gets anyway.
+        Handle::Pipe(end) => end.write(&data).map(|written| written as i64).ok_or(EPIPE),
         Handle::Dir { .. } | Handle::File { write: false, .. } => Err(EBADF),
         Handle::File { file, append, offset, .. } => {
             let _root = ROOT.lock();
@@ -273,7 +298,8 @@ pub fn lseek(process: &Process, fd: u64, offset: u64, whence: u64) -> i64 {
     ret((|| {
         let offset = offset as i64;
         match &*handle(process, fd)? {
-            Handle::Console => Err(ESPIPE),
+            Handle::Console | Handle::Pipe(_) => Err(ESPIPE),
+            Handle::Null | Handle::Zero => Ok(0),
             Handle::File { file, offset: place, .. } => {
                 let _root = ROOT.lock();
                 let from = match whence {
@@ -302,22 +328,27 @@ pub fn lseek(process: &Process, fd: u64, offset: u64, whence: u64) -> i64 {
 
 /// The descriptor's file's metadata.
 fn metadata(handle: &Handle) -> Result<Metadata> {
+    // What isn't on the disk has its type in `permissions`.
+    let special = |mode| Metadata {
+        inode: 0,
+        kind: Kind::Other,
+        permissions: mode,
+        links: 1,
+        uid: 0,
+        gid: 0,
+        size: 0,
+        blocks: 0,
+        accessed: 0,
+        modified: 0,
+        changed: 0,
+    };
     let _root = ROOT.lock();
     match handle {
-        // A character device, as a terminal is.
-        Handle::Console => Ok(Metadata {
-            inode: 0,
-            kind: Kind::Other,
-            permissions: 0o620,
-            links: 1,
-            uid: 0,
-            gid: 0,
-            size: 0,
-            blocks: 0,
-            accessed: 0,
-            modified: 0,
-            changed: 0,
-        }),
+        // Character devices, as a terminal is.
+        Handle::Console => Ok(special(0o020620)),
+        Handle::Null | Handle::Zero => Ok(special(0o020666)),
+        // A FIFO.
+        Handle::Pipe(_) => Ok(special(0o010600)),
         Handle::File { file, .. } => file.metadata().map_err(fs::errno),
         Handle::Dir { dir, .. } => dir.metadata().map_err(fs::errno),
     }
@@ -329,8 +360,8 @@ fn stat_bytes(metadata: &Metadata) -> [u8; 144] {
         Kind::File => 0o100000,
         Kind::Directory => 0o040000,
         Kind::Symlink => 0o120000,
-        // Only the console, for now: a character device.
-        Kind::Other => 0o020000,
+        // Devices and pipes, whose `permissions` carry their type.
+        Kind::Other => 0,
     };
     let mut stat = [0; 144];
     let wide = [
@@ -374,6 +405,9 @@ pub fn newfstatat(process: &Process, dirfd: u64, path: u64, buf: u64, flags: u64
             true => String::new(),
             false => lookup(process, dirfd, &path)?,
         };
+        if let Some(device) = fs::device(&path) {
+            return put_stat(process, &metadata(&device)?, buf);
+        }
         let metadata = {
             let root = ROOT.lock();
             let fs = root.as_ref().ok_or(ENOENT)?;
@@ -440,7 +474,8 @@ pub fn fcntl(process: &Process, fd: u64, command: u64, arg: u64) -> i64 {
             F_DUPFD | F_DUPFD_CLOEXEC => install_from(process, handle, arg as usize),
             F_GETFD | F_SETFD | F_SETFL => Ok(0),
             F_GETFL => Ok(match &*handle {
-                Handle::Console => 2,
+                Handle::Console | Handle::Null | Handle::Zero => 2,
+                Handle::Pipe(end) => end.write as i64,
                 Handle::Dir { .. } => (O_RDONLY | O_DIRECTORY) as i64,
                 Handle::File { read, write, append, .. } => {
                     let access = match (read, write) {
@@ -545,6 +580,70 @@ pub fn getcwd(process: &Process, buf: u64, size: u64) -> i64 {
 /// Set the umask, and say what it was.
 pub fn umask(process: &Process, mask: u64) -> i64 {
     process.umask.swap(mask as u32 & 0o777, Relaxed).into()
+}
+
+/// `pipe` and `pipe2`: a new pipe, whose reading and writing descriptors go
+/// to `fds` as two ints.
+///
+/// shortcut: no O_NONBLOCK, which nothing has needed yet; close-on-exec is
+/// taken and forgotten, as with `fcntl`.
+pub fn pipe2(process: &Process, fds: u64, flags: u64) -> i64 {
+    ret((|| {
+        if flags & !O_CLOEXEC != 0 {
+            return Err(EINVAL);
+        }
+        let (read, write) = pipe::new();
+        let read = install(process, Handle::Pipe(read))?;
+        let installed = install(process, Handle::Pipe(write)).and_then(|write| {
+            let mut ends = [0u8; 8];
+            ends[..4].copy_from_slice(&(read as i32).to_le_bytes());
+            ends[4..].copy_from_slice(&(write as i32).to_le_bytes());
+            if process.memory.lock().space.write(fds, &ends).is_none() {
+                let gone = process.files.lock()[write as usize].take();
+                drop(gone);
+                return Err(EFAULT);
+            }
+            Ok(0)
+        });
+        if installed.is_err() {
+            let gone = process.files.lock()[read as usize].take();
+            drop(gone);
+        }
+        installed
+    })())
+}
+
+pub fn dup(process: &Process, fd: u64) -> i64 {
+    ret(handle(process, fd).and_then(|handle| install_from(process, handle, 0)))
+}
+
+/// `dup2` and `dup3`: `fd` copied to `to`, closing what was there first.
+/// `dup2` takes copying a descriptor to itself; `dup3` doesn't.
+pub fn dup3(process: &Process, fd: u64, to: u64, flags: u64, dup2: bool) -> i64 {
+    ret((|| {
+        let handle = handle(process, fd)?;
+        if fd == to {
+            return if dup2 { Ok(to as i64) } else { Err(EINVAL) };
+        }
+        if flags & !O_CLOEXEC != 0 {
+            return Err(EINVAL);
+        }
+        let to = to as usize;
+        if to >= MOST_FILES {
+            return Err(EBADF);
+        }
+        // Closing what was there is a call into the file system.
+        let _root = ROOT.lock();
+        let replaced = {
+            let mut files = process.files.lock();
+            if to >= files.len() {
+                files.resize(to + 1, None);
+            }
+            files[to].replace(handle)
+        };
+        drop(replaced);
+        Ok(to as i64)
+    })())
 }
 
 /// Every change is on the disk by the time the call that made it returns.

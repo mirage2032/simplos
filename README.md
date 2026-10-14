@@ -99,12 +99,16 @@ Programs use it through Linux's system calls, so Rust's `std::fs` (or C's
 stdio) works as it does on Linux: `open`, `openat`, `close`, `read`, `write`,
 `pread64`, `pwrite64`, `lseek`, `stat`, `lstat`, `fstat`, `newfstatat`,
 `getdents64`, `fcntl`, `fsync`, `mkdir`, `mkdirat`, `rmdir`, `unlink`,
-`unlinkat`, `rename`, `renameat`, `renameat2`, `chdir`, `getcwd` and `umask`.
-In the shell, `run cat /hello.txt` has the user program read it, and `run`
-lists its other modes. For now:
+`unlinkat`, `rename`, `renameat`, `renameat2`, `chdir`, `getcwd` and `umask`;
+and for what isn't a file, `pipe`, `pipe2`, `dup`, `dup2` and `dup3`, and
+`/dev/null`, `/dev/zero` and `/dev/tty`. In the shell, `run cat /hello.txt`
+has the user program read it, and `run` lists its other modes. For now:
 
 - no symbolic link is followed, so `stat` and `lstat` are the same;
 - a file that's open can't be removed or renamed over (`EBUSY`);
+- pipes always wait (no `O_NONBLOCK`), and writing to one nobody reads is
+  `EPIPE` without `SIGPIPE`, as there are no signals yet;
+- `/dev` holds just those three, and can't be listed;
 - standard input is always at its end, and close-on-exec means nothing until
   there's an `execve`.
 

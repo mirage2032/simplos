@@ -100,6 +100,17 @@ pub fn spawn(
     args: &[&str],
     output: impl FnMut(&[u8]) + Send + 'static,
 ) -> Result<Arc<Process>, &'static str> {
+    spawn_with(elf, args, output, vec![Some(Arc::new(fs::Handle::Console)); 3])
+}
+
+/// `spawn`, with `files` as the program's descriptors to start with, by
+/// number: what its standard input, output and error are, for one.
+pub fn spawn_with(
+    elf: &[u8],
+    args: &[&str],
+    output: impl FnMut(&[u8]) + Send + 'static,
+    files: Vec<Option<Arc<fs::Handle>>>,
+) -> Result<Arc<Process>, &'static str> {
     const NO_MEMORY: &str = "out of memory";
     static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -118,7 +129,7 @@ pub fn spawn(
         status: AtomicI32::new(RUNNING),
         exited: WaitQueue::new(),
         output: Mutex::new(Box::new(output)),
-        files: Mutex::new(vec![Some(Arc::new(fs::Handle::Console)); 3]),
+        files: Mutex::new(files),
         cwd: Mutex::new(String::new()),
         umask: AtomicU32::new(0o022),
     });

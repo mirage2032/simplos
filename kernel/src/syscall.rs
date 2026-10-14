@@ -153,6 +153,9 @@ fn call(nr: u64, [a0, a1, a2, a3, a4, _a5]: [u64; 6]) -> i64 {
         16 => -ENOTTY,
         17 => files::pread(&process, a0, a1, a2, a3),
         18 => files::pwrite(&process, a0, a1, a2, a3),
+        22 => files::pipe2(&process, a0, 0),
+        32 => files::dup(&process, a0),
+        33 => files::dup3(&process, a0, a1, 0, true),
         35 => clock_nanosleep(&process, CLOCK_MONOTONIC, 0, a0),
         // exit, exit_group: one thread per program, so the same.
         60 | 231 => {
@@ -183,6 +186,8 @@ fn call(nr: u64, [a0, a1, a2, a3, a4, _a5]: [u64; 6]) -> i64 {
         262 => files::newfstatat(&process, a0, a1, a2, a3),
         263 => files::unlinkat(&process, a0, a1, a2),
         264 => files::renameat2(&process, a0, a1, a2, a3, 0),
+        292 => files::dup3(&process, a0, a1, a2, false),
+        293 => files::pipe2(&process, a0, a1),
         316 => files::renameat2(&process, a0, a1, a2, a3, a4),
         _ => {
             serial_println!("simplos: process {}: no system call {}", process.id, nr);

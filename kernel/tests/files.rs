@@ -16,7 +16,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use bootloader_api::{BootInfo, entry_point};
 use core::panic::PanicInfo;
-use simplos::fs::{self, ROOT};
+use simplos::fs::{self, Handle, ROOT};
 use simplos::process;
 use spin::Mutex;
 
@@ -36,16 +36,65 @@ fn panic(info: &PanicInfo) -> ! {
 
 /// Run probe with `args`: its exit status, and everything it wrote.
 fn run_bytes(args: &[&str]) -> (i32, Vec<u8>) {
-    let output = Arc::new(Mutex::new(Vec::new()));
-    let sink = output.clone();
+    run_with(args, console())
+}
+
+/// Standard input, output and error on the console.
+fn console() -> Vec<Option<Arc<Handle>>> {
+    vec![Some(Arc::new(Handle::Console)); 3]
+}
+
+/// Start probe with `args` and `files` as its descriptors, and what it
+/// writes to the console goes to `output`.
+fn start(
+    args: &[&str],
+    files: Vec<Option<Arc<Handle>>>,
+    output: Arc<Mutex<Vec<u8>>>,
+) -> Arc<process::Process> {
     let mut argv = vec!["probe"];
     argv.extend(args);
     let elf = simplos::ramdisk().expect("tools/boot-test attaches user/probe");
-    let process = process::spawn(elf, &argv, move |bytes| sink.lock().extend_from_slice(bytes))
-        .expect("probe loads");
-    let status = process.wait();
+    process::spawn_with(elf, &argv, move |bytes| output.lock().extend_from_slice(bytes), files)
+        .expect("probe loads")
+}
+
+/// `run_bytes`, with `files` as its descriptors.
+fn run_with(args: &[&str], files: Vec<Option<Arc<Handle>>>) -> (i32, Vec<u8>) {
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let status = start(args, files, output.clone()).wait();
     let output = output.lock().clone();
     (status, output)
+}
+
+/// A pipe's two ends, ready for a program's descriptors.
+fn pipe() -> (Option<Arc<Handle>>, Option<Arc<Handle>>) {
+    let (read, write) = simplos::pipe::new();
+    (Some(Arc::new(Handle::Pipe(read))), Some(Arc::new(Handle::Pipe(write))))
+}
+
+/// How long /big.bin is: 3 MiB and some.
+const BIG: usize = (3 << 20) + 5;
+
+/// What /big.bin holds: no two neighbouring bytes alike. Made as it's needed
+/// rather than kept, as the kernel's heap is shared with the screen's copy.
+fn big(range: core::ops::Range<usize>) -> Vec<u8> {
+    range.map(|i| (i % 251) as u8).collect()
+}
+
+/// Write /big.bin, from the kernel.
+fn big_file() {
+    let root = ROOT.lock();
+    let fs = root.as_ref().expect("the ext4 disk, mounted");
+    let file = fs.create("big.bin").unwrap();
+    let mut done = 0;
+    while done < BIG {
+        let chunk = big(done..BIG.min(done + (64 << 10)));
+        let mut written = 0;
+        while written < chunk.len() {
+            written += file.write_at((done + written) as u64, &chunk[written..]).unwrap();
+        }
+        done += chunk.len();
+    }
 }
 
 fn run(args: &[&str]) -> (i32, String) {
@@ -124,19 +173,10 @@ fn a_program_writes_files_that_stay_written() {
 #[test_case]
 fn a_program_reads_a_big_file_whole() {
     // More than one read's worth, which the program has to loop over.
-    let pattern: Vec<u8> = (0..(3 << 20) + 5).map(|i: u32| (i % 251) as u8).collect();
-    {
-        let root = ROOT.lock();
-        let fs = root.as_ref().expect("the ext4 disk, mounted");
-        let file = fs.create("big.bin").unwrap();
-        let mut done = 0;
-        while done < pattern.len() {
-            done += file.write_at(done as u64, &pattern[done..]).unwrap();
-        }
-    }
+    big_file();
     let (status, output) = run_bytes(&["cat", "/big.bin"]);
     assert_eq!(status, 0);
-    assert!(output == pattern, "big.bin reads back different: {} bytes", output.len());
+    assert!(output == big(0..BIG), "big.bin reads back different: {} bytes", output.len());
     ROOT.lock().as_ref().unwrap().remove_file("big.bin").unwrap();
 }
 
@@ -248,4 +288,71 @@ fn a_program_has_a_working_directory() {
         run(&["cd", "/missing", "x"]),
         failed("/missing", "No such file or directory (os error 2)")
     );
+}
+
+#[test_case]
+fn a_program_pipes_to_itself() {
+    // Out the other end, then the end once the writer's gone; then nothing
+    // reads, and writing says so.
+    assert_eq!(run(&["pipe"]), ok("through a pipe\nBroken pipe (os error 32)\n"));
+}
+
+#[test_case]
+fn two_programs_talk_through_a_pipe() {
+    // More than a pipe holds, so each waits for the other in turn.
+    big_file();
+    let (read, write) = pipe();
+    let mut reader_files = console();
+    reader_files[0] = read;
+    let mut writer_files = console();
+    writer_files[1] = write;
+    let output = Arc::new(Mutex::new(Vec::with_capacity(BIG)));
+    let reader = start(&["cat"], reader_files, output.clone());
+    let writer = start(&["cat", "/big.bin"], writer_files, Arc::new(Mutex::new(Vec::new())));
+    assert_eq!(writer.wait(), 0);
+    // Which closed the writing end as it ended: the reader sees the end.
+    assert_eq!(reader.wait(), 0);
+    let output = output.lock();
+    assert!(*output == big(0..BIG), "{} bytes came through, not {BIG}", output.len());
+    ROOT.lock().as_ref().unwrap().remove_file("big.bin").unwrap();
+}
+
+#[test_case]
+fn a_program_writing_to_no_one_is_told() {
+    let (read, write) = pipe();
+    let mut reader_files = console();
+    reader_files[0] = read;
+    assert_eq!(run_with(&["exit"], reader_files).0, 0);
+    let mut writer_files = console();
+    writer_files[1] = write;
+    let (status, output) = run_with(&["cat", "/hello.txt"], writer_files);
+    assert_eq!(
+        (status, String::from_utf8(output).unwrap()),
+        failed("/hello.txt", "Broken pipe (os error 32)")
+    );
+}
+
+#[test_case]
+fn a_program_sends_its_output_elsewhere() {
+    // dup2 onto standard output, which then writes into the file.
+    assert_eq!(run(&["dup-out", "/out.txt", "into the file"]), ok(""));
+    assert_eq!(run(&["cat", "/out.txt"]), ok("into the file 1\n"));
+    ROOT.lock().as_ref().unwrap().remove_file("out.txt").unwrap();
+}
+
+#[test_case]
+fn a_program_finds_the_devices_it_expects() {
+    assert_eq!(run(&["cat", "/dev/null"]), ok(""));
+    assert_eq!(run(&["write", "/dev/null", "gone"]), ok(""));
+    assert_eq!(run_bytes(&["read-at", "/dev/zero", "0", "8"]), (0, vec![0; 8]));
+    assert_eq!(run(&["write", "/dev/tty", "on the console\n"]), ok("on the console\n"));
+    // Character devices: not directories, and not much else.
+    assert_eq!(run(&["stat", "/dev/null"]), ok("0 file 666\n0 file 666\n"));
+}
+
+#[test_case]
+fn bad_pipe_calls_are_refused() {
+    // EBADF for a descriptor that isn't open and one past the most there can
+    // be, EFAULT for ends to go in the kernel's half, EINVAL for O_NONBLOCK.
+    assert_eq!(run(&["bad-pipes"]), ok("-9 -9 -14 -22\n"));
 }
