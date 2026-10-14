@@ -55,7 +55,7 @@ fn start(args: &[&str], files: Vec<Option<Arc<Handle>>>) -> Arc<process::Process
     let mut argv = vec!["probe"];
     argv.extend(args);
     let elf = simplos::ramdisk().expect("tools/boot-test attaches user/probe");
-    process::spawn_with(elf, &argv, files).expect("probe loads")
+    process::spawn_with(elf, &argv, &[], files).expect("probe loads")
 }
 
 /// Run probe with `args` and `files` as its descriptors: its exit status,

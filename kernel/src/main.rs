@@ -11,7 +11,7 @@ use core::panic::PanicInfo;
 use simplos::BOOTLOADER_CONFIG;
 use simplos::CONSOLE;
 use simplos::DISPLAY;
-use simplos::io::console::CONSOLE_READERS;
+use simplos::io::console::{self, CONSOLE_READERS};
 use simplos::pre_init;
 use simplos::shell::Shell;
 use simplos::terminal::Terminal;
@@ -29,8 +29,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     start();
 }
 
-/// The screen as the console's terminal, what's typed going to it, and the
-/// shell on it.
+/// The screen as the console's terminal, what's typed going to it, the
+/// first program on it, and then the kernel's shell.
 #[unsafe(no_mangle)]
 fn start() -> ! {
     let mut terminal = Terminal::fitting(&DISPLAY.lock());
@@ -38,6 +38,11 @@ fn start() -> ! {
     let screen = move |bytes: &[u8]| {
         terminal.write(bytes);
         terminal.draw(&mut DISPLAY.lock());
+        // Its answers to programs, as if typed.
+        let replies = terminal.take_replies();
+        if !replies.is_empty() {
+            console::answer(&replies);
+        }
     };
     let tty = Arc::new(Tty::new(Box::new(screen), rows as u16, cols as u16));
     // Keys arrive from the keyboard interrupt through `CONSOLE`; the line
@@ -52,6 +57,7 @@ fn start() -> ! {
         }
     })
     .expect("memory for the keyboard's thread");
+    simplos::init::run(&tty);
     Shell::new(tty).run()
 }
 

@@ -290,6 +290,36 @@ pub fn resolve(base: &str, path: &str) -> String {
     parts.join("/")
 }
 
+/// All of the program file at `path`, a path from the root, for `execve` and
+/// the kernel to start: or the errno saying why not.
+pub fn read_program(path: &str) -> Result<Vec<u8>, i64> {
+    const ENOMEM: i64 = 12;
+    const EACCES: i64 = 13;
+    // shortcut: read whole into the kernel's heap, so no bigger than this;
+    // load segments straight from the file when programs get bigger.
+    const MOST: u64 = 4 << 20;
+    let tree = lock();
+    let metadata = tree.metadata(path).map_err(errno)?;
+    // shortcut: anyone's execute bit will do, as there's one user.
+    if metadata.kind != Kind::File || metadata.permissions & 0o111 == 0 {
+        return Err(EACCES);
+    }
+    if metadata.size > MOST {
+        return Err(ENOMEM);
+    }
+    let file = tree.disk(path).map_err(errno)?.open(path).map_err(errno)?;
+    let mut elf = alloc::vec![0; metadata.size as usize];
+    let mut done = 0;
+    while done < elf.len() {
+        match file.read_at(done as u64, &mut elf[done..]).map_err(errno)? {
+            0 => break,
+            read => done += read,
+        }
+    }
+    elf.truncate(done);
+    Ok(elf)
+}
+
 /// Linux's errno for `error`.
 pub fn errno(error: ext4::Error) -> i64 {
     use ext4::Error::*;

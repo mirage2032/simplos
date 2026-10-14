@@ -73,9 +73,9 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
     // while, and the PIC sends no more ticks until the last one is acknowledged.
     crate::thread::timer_tick();
 }
-/// Keys go to `CONSOLE` as what a terminal sends for them: Enter as `\r`,
+/// Keys go to `CONSOLE` as the Linux console sends them: Enter as `\r`,
 /// Backspace as DEL, Ctrl and a letter as its control character, and the
-/// arrows and the like as VT100 escape sequences.
+/// arrows, the keys above them and the function keys as escape sequences.
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
     use crate::io::console::{CONSOLE, CONSOLE_READERS};
     use pc_keyboard::{DecodedKey, HandleControl, KeyCode, Keyboard, ScancodeSet1, layouts};
@@ -105,8 +105,23 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
                 DecodedKey::RawKey(KeyCode::ArrowDown) => "\x1b[B",
                 DecodedKey::RawKey(KeyCode::ArrowRight) => "\x1b[C",
                 DecodedKey::RawKey(KeyCode::ArrowLeft) => "\x1b[D",
-                DecodedKey::RawKey(KeyCode::Home) => "\x1b[H",
-                DecodedKey::RawKey(KeyCode::End) => "\x1b[F",
+                DecodedKey::RawKey(KeyCode::Home) => "\x1b[1~",
+                DecodedKey::RawKey(KeyCode::Insert) => "\x1b[2~",
+                DecodedKey::RawKey(KeyCode::End) => "\x1b[4~",
+                DecodedKey::RawKey(KeyCode::PageUp) => "\x1b[5~",
+                DecodedKey::RawKey(KeyCode::PageDown) => "\x1b[6~",
+                DecodedKey::RawKey(KeyCode::F1) => "\x1b[[A",
+                DecodedKey::RawKey(KeyCode::F2) => "\x1b[[B",
+                DecodedKey::RawKey(KeyCode::F3) => "\x1b[[C",
+                DecodedKey::RawKey(KeyCode::F4) => "\x1b[[D",
+                DecodedKey::RawKey(KeyCode::F5) => "\x1b[[E",
+                DecodedKey::RawKey(KeyCode::F6) => "\x1b[17~",
+                DecodedKey::RawKey(KeyCode::F7) => "\x1b[18~",
+                DecodedKey::RawKey(KeyCode::F8) => "\x1b[19~",
+                DecodedKey::RawKey(KeyCode::F9) => "\x1b[20~",
+                DecodedKey::RawKey(KeyCode::F10) => "\x1b[21~",
+                DecodedKey::RawKey(KeyCode::F11) => "\x1b[23~",
+                DecodedKey::RawKey(KeyCode::F12) => "\x1b[24~",
                 // Shift and the like, which only change other keys.
                 DecodedKey::RawKey(_) => "",
             };

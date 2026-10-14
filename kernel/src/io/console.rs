@@ -8,6 +8,7 @@ use alloc::string::String;
 use core::cell::UnsafeCell;
 use core::fmt;
 use core::sync::atomic::{AtomicUsize, Ordering};
+use x86_64::instructions::interrupts;
 
 /// Maximum number of messages in the buffer
 const BUFFER_SIZE: usize = 64;
@@ -132,6 +133,16 @@ pub static CONSOLE: ConsoleBuffer = ConsoleBuffer::new();
 /// Threads waiting for something to arrive in [`CONSOLE`], woken by the
 /// keyboard interrupt after each push.
 pub static CONSOLE_READERS: WaitQueue = WaitQueue::new();
+
+/// Put `text` in [`CONSOLE`] as if it had been typed: for what the screen
+/// answers programs with, such as where its cursor is. From a thread, with
+/// interrupts off meanwhile, so the keyboard's, the one other writer, can't
+/// come in halfway.
+pub fn answer(text: &[u8]) {
+    let text = String::from_utf8_lossy(text);
+    interrupts::without_interrupts(|| CONSOLE.push(format_args!("{text}")));
+    CONSOLE_READERS.wake_all();
+}
 
 impl Default for ConsoleBuffer {
     fn default() -> Self {

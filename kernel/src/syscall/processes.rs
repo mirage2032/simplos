@@ -6,14 +6,10 @@ use super::{EFAULT, EINVAL, ENOMEM};
 use crate::fs;
 use crate::process::{self, Process, Registers};
 use alloc::sync::Arc;
-use alloc::vec;
 use alloc::vec::Vec;
-use ext4::Kind;
 
 const E2BIG: i64 = 7;
-const ENOEXEC: i64 = 8;
 const ECHILD: i64 = 10;
-const EACCES: i64 = 13;
 
 /// What a parent is sent as its child ends, as `fork` asks.
 pub const SIGCHLD: u64 = 17;
@@ -50,14 +46,10 @@ pub fn execve(process: &Process, path: u64, argv: u64, envp: u64) -> Result<Regi
     let path = lookup(process, AT_FDCWD, &path_at(process, path)?)?;
     let args = strings_at(process, argv, &mut room)?;
     let env = strings_at(process, envp, &mut room)?;
-    let elf = program_file(&path)?;
+    let elf = fs::read_program(&path)?;
     let args: Vec<&[u8]> = args.iter().map(Vec::as_slice).collect();
     let env: Vec<&[u8]> = env.iter().map(Vec::as_slice).collect();
-    let start = process::exec(process, &elf, &args, &env).map_err(|error| match error {
-        process::NO_MEMORY => ENOMEM,
-        process::TOO_LONG => E2BIG,
-        _ => ENOEXEC,
-    })?;
+    let start = process::exec(process, &elf, &args, &env).map_err(process::load_errno)?;
     files::close_on_exec(process);
     Ok(start)
 }
@@ -84,33 +76,6 @@ fn strings_at(process: &Process, addr: u64, room: &mut usize) -> Result<Vec<Vec<
         at += 8;
     }
     Ok(strings)
-}
-
-/// All of the program file at `path`, a path from the root.
-fn program_file(path: &str) -> Result<Vec<u8>> {
-    // shortcut: read whole into the kernel's heap, so no bigger than this;
-    // load segments straight from the file when programs get bigger.
-    const MOST: u64 = 4 << 20;
-    let tree = fs::lock();
-    let metadata = tree.metadata(path).map_err(fs::errno)?;
-    // shortcut: anyone's execute bit will do, as there's one user.
-    if metadata.kind != Kind::File || metadata.permissions & 0o111 == 0 {
-        return Err(EACCES);
-    }
-    if metadata.size > MOST {
-        return Err(ENOMEM);
-    }
-    let file = tree.disk(path).map_err(fs::errno)?.open(path).map_err(fs::errno)?;
-    let mut elf = vec![0; metadata.size as usize];
-    let mut done = 0;
-    while done < elf.len() {
-        match file.read_at(done as u64, &mut elf[done..]).map_err(fs::errno)? {
-            0 => break,
-            read => done += read,
-        }
-    }
-    elf.truncate(done);
-    Ok(elf)
 }
 
 /// Wait for a child to end: the one numbered `pid`, or with any other `pid`

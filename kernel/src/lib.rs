@@ -9,6 +9,7 @@ extern crate alloc;
 pub mod allocator;
 pub mod elf;
 pub mod fs;
+pub mod init;
 pub mod io;
 pub mod memory;
 pub mod pipe;
