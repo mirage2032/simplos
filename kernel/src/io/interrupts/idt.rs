@@ -57,10 +57,10 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
     pic::notify_end_of_interrupt(&InterruptIndex::Timer);
     // After the end-of-interrupt: this thread may not get back here for a
     // while, and the PIC sends no more ticks until the last one is acknowledged.
-    crate::thread::yield_now();
+    crate::thread::timer_tick();
 }
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
-    use crate::io::console::CONSOLE;
+    use crate::io::console::{CONSOLE, CONSOLE_READERS};
     use pc_keyboard::{DecodedKey, HandleControl, Keyboard, ScancodeSet1, layouts};
 
     static KEYBOARD: Lazy<Mutex<Keyboard<layouts::Us104Key, ScancodeSet1>>> = Lazy::new(|| {
@@ -77,8 +77,8 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
             // Raw keys (arrows, shift and friends) are dropped: nothing uses them yet.
             && let Some(DecodedKey::Unicode(c)) = keyboard.process_keyevent(key_event)
         {
-            // No heap in here: see `ConsoleBuffer::push`.
             CONSOLE.push(format_args!("{c}"));
+            CONSOLE_READERS.wake_all();
         }
     }
     pic::notify_end_of_interrupt(&InterruptIndex::Keyboard);

@@ -127,6 +127,9 @@ pub fn pre_init(boot_info: &'static mut BootInfo) {
             .expect("heap initialization failed");
         *memory::FRAMES.lock() = Some(frame_allocator);
         *memory::PAGE_TABLE.lock() = Some(mapper);
+        // Needs the page table for the idle thread's stack, and must be done
+        // before interrupts are on: the first tick may want to switch threads.
+        thread::init();
 
         // Initialize display with framebuffer
         let fb = boot_info.framebuffer.take().expect("No framebuffer found");

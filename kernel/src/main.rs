@@ -16,6 +16,7 @@ use embedded_graphics::text::{Baseline, Text};
 use simplos::BOOTLOADER_CONFIG;
 use simplos::CONSOLE;
 use simplos::DISPLAY;
+use simplos::io::console::CONSOLE_READERS;
 use simplos::io::video::Display;
 use simplos::pre_init;
 use simplos::shell::{PROMPT, Redraw, Shell};
@@ -48,10 +49,10 @@ fn start() -> ! {
             }
         }
 
-        // Nothing changed: sleep until the next interrupt rather than spin,
-        // which is ruinous when the CPU is emulated.
+        // Nothing changed: wait for the next key. Other threads, or the idle
+        // one with the CPU halted, run meanwhile.
         if redraw == Redraw::None {
-            x86_64::instructions::hlt();
+            CONSOLE_READERS.wait_until(|| !CONSOLE.is_empty());
             continue;
         }
 

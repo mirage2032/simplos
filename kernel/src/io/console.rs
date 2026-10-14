@@ -3,6 +3,7 @@
 //! Interrupts can push messages to this buffer without blocking.
 //! The main loop can drain and display these messages.
 
+use crate::thread::WaitQueue;
 use alloc::string::String;
 use core::cell::UnsafeCell;
 use core::fmt;
@@ -70,9 +71,7 @@ impl ConsoleBuffer {
     /// Push a message to the buffer (safe to call from interrupts)
     /// Returns false if buffer is full
     ///
-    /// Takes `format_args!` rather than a string so that callers never touch
-    /// the heap: an interrupt that lands while the main loop holds the
-    /// allocator's spin lock would wait for it forever.
+    /// Takes `format_args!` rather than a string, so it needs no heap.
     pub fn push(&self, args: fmt::Arguments) -> bool {
         let write = self.write_pos.load(Ordering::Acquire);
         let read = self.read_pos.load(Ordering::Acquire);
@@ -92,6 +91,11 @@ impl ConsoleBuffer {
         // Advance write position
         self.write_pos.store(next_write, Ordering::Release);
         true
+    }
+
+    /// Whether there is nothing to pop.
+    pub fn is_empty(&self) -> bool {
+        self.read_pos.load(Ordering::Acquire) == self.write_pos.load(Ordering::Acquire)
     }
 
     /// Pop a message from the buffer (call from main loop only)
@@ -124,6 +128,10 @@ impl ConsoleBuffer {
 
 /// Global console buffer - safe to use from interrupts
 pub static CONSOLE: ConsoleBuffer = ConsoleBuffer::new();
+
+/// Threads waiting for something to arrive in [`CONSOLE`], woken by the
+/// keyboard interrupt after each push.
+pub static CONSOLE_READERS: WaitQueue = WaitQueue::new();
 
 impl Default for ConsoleBuffer {
     fn default() -> Self {
