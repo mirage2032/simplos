@@ -1,5 +1,5 @@
-//! Kernel threads take turns, each on a stack of its own, and give their
-//! stacks back when they finish.
+//! Kernel threads take turns, each on a stack of its own, can't keep the CPU
+//! to themselves, and give their stacks back when they finish.
 
 #![no_std]
 #![no_main]
@@ -9,11 +9,12 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use bootloader_api::{BootInfo, entry_point};
 use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use simplos::memory::STACKS_START;
 use simplos::thread::{spawn, yield_now};
 use spin::Mutex;
@@ -52,7 +53,31 @@ fn threads_take_turns() {
         .expect("memory for a stack");
     }
     wait_for(&log);
-    assert_eq!(*log.lock(), [('a', 0), ('b', 0), ('a', 1), ('b', 1), ('a', 2), ('b', 2)]);
+    // Each thread's turns in order. Not strictly a0 b0 a1 b1: a tick can
+    // preempt a thread between starting and logging, giving the other two
+    // turns in a row.
+    let log = log.lock();
+    for name in ['a', 'b'] {
+        let turns: Vec<_> = log.iter().filter(|(n, _)| *n == name).map(|(_, t)| *t).collect();
+        assert_eq!(turns, [0, 1, 2], "{name}'s turns, in {log:?}");
+    }
+}
+
+#[test_case]
+fn a_thread_that_never_yields_is_preempted() {
+    let stop = Arc::new(AtomicBool::new(false));
+    let spinning = stop.clone();
+    spawn(move || {
+        while !spinning.load(Ordering::Relaxed) {
+            core::hint::spin_loop();
+        }
+    })
+    .expect("memory for a stack");
+    // Hands the CPU to the spinner. Only a timer tick gets it back: without
+    // preemption this never returns, and the test times out.
+    yield_now();
+    stop.store(true, Ordering::Relaxed);
+    wait_for(&stop);
 }
 
 #[test_case]
@@ -80,4 +105,37 @@ fn finished_threads_give_their_stacks_back() {
         spawn(move || drop(held)).expect("memory for a stack, so stacks aren't being freed");
         wait_for(&done);
     }
+}
+
+#[test_case]
+fn threads_switch_while_another_holds_the_heap() {
+    // A thread that never yields and spends its time in the allocator, so a
+    // tick usually preempts it holding the allocator's lock. Each round, the
+    // thread that runs next allocates with interrupts off (`exit`, and the
+    // spawn that follows, both do), and would wait for that lock forever
+    // unless the heap only takes it with interrupts off.
+    static FINISHED: AtomicUsize = AtomicUsize::new(0);
+    let stop = Arc::new(AtomicBool::new(false));
+    let hammering = stop.clone();
+    spawn(move || {
+        while !hammering.load(Ordering::Relaxed) {
+            core::hint::black_box(Box::new([0u8; 64]));
+        }
+    })
+    .expect("memory for a stack");
+    for round in 1..=50 {
+        // Captures nothing, so it neither allocates nor frees: once it is
+        // back from its yield, right after the hammer's preemption, the next
+        // heap access is `exit`'s.
+        spawn(|| {
+            yield_now();
+            FINISHED.fetch_add(1, Ordering::Relaxed);
+        })
+        .expect("memory for a stack");
+        while FINISHED.load(Ordering::Relaxed) < round {
+            yield_now();
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    wait_for(&stop);
 }

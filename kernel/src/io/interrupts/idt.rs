@@ -55,6 +55,9 @@ pub static TIMER_COUNTER: AtomicUsize = AtomicUsize::new(0);
 extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
     TIMER_COUNTER.fetch_add(1, Ordering::Relaxed);
     pic::notify_end_of_interrupt(&InterruptIndex::Timer);
+    // After the end-of-interrupt: this thread may not get back here for a
+    // while, and the PIC sends no more ticks until the last one is acknowledged.
+    crate::thread::yield_now();
 }
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
     use crate::io::console::CONSOLE;

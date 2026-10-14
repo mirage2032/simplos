@@ -1,12 +1,17 @@
 //! Kernel threads: each with a stack of its own, taking turns on the one CPU.
 //!
-//! Cooperative for now. A thread runs until it calls [`yield_now`] or its
-//! entry function returns; the timer doesn't preempt anyone yet.
+//! A thread runs until it calls [`yield_now`], its entry function returns, or
+//! a timer tick preempts it: the timer interrupt calls [`yield_now`] too, so no
+//! thread keeps the CPU for more than a tick (10 ms) while others are ready.
 //!
 //! Every switch happens with interrupts off, inside [`yield_now`] or [`exit`],
 //! and the scheduler's lock is released before it. The thread switched to
 //! resumes inside its own earlier call, and turns interrupts back on as that
 //! call returns, or in [`start`] if it has never run.
+//!
+//! The scheduler's lock is only ever taken with interrupts off, and so must
+//! be every lock taken while holding it (the heap's, for one): a lock a
+//! preempted thread was holding would otherwise never come free.
 
 use crate::memory::KernelStack;
 use alloc::boxed::Box;
@@ -63,7 +68,8 @@ pub fn spawn(entry: impl FnOnce() + Send + 'static) -> Option<()> {
 }
 
 /// Let the next ready thread run. Returns when this thread's turn comes round
-/// again, or at once if no one else is ready.
+/// again, or at once if no one else is ready. Also called by the timer
+/// interrupt, to preempt whichever thread it interrupted.
 pub fn yield_now() {
     interrupts::without_interrupts(|| {
         let mut scheduler = SCHEDULER.lock();
@@ -77,11 +83,16 @@ pub fn yield_now() {
         // Safety: `to` is where `switch` left a ready thread, or a new
         // thread's prepared stack, and `from` outlives the switch.
         unsafe { switch(from, to) };
-        reap();
     });
+    // Not from the timer interrupt: freeing a stack takes the page table's and
+    // the frames' locks, which a preempted thread may be holding.
+    if interrupts::are_enabled() {
+        reap();
+    }
 }
 
-/// End the current thread. Its stack is freed by whichever thread runs next.
+/// End the current thread. Its stack is freed by the next thread to yield or
+/// start.
 ///
 /// # Panics
 ///
@@ -100,18 +111,19 @@ pub fn exit() -> ! {
     unreachable!("an exited thread was switched back to");
 }
 
-/// Free the stacks of threads that have exited. Never called by one of them.
+/// Free the stacks of threads that have exited. Never called by one of them,
+/// and only with interrupts on (see [`yield_now`]).
 fn reap() {
-    let dead = core::mem::take(&mut SCHEDULER.lock().dead);
+    let dead = interrupts::without_interrupts(|| core::mem::take(&mut SCHEDULER.lock().dead));
     drop(dead);
 }
 
 /// Where a new thread begins, returned to by its first [`switch`].
 extern "C" fn start() -> ! {
-    // Whoever switched here may have just exited.
-    reap();
     let entry = SCHEDULER.lock().current.entry.take().expect("a new thread has an entry");
     interrupts::enable();
+    // Whoever switched here may have just exited.
+    reap();
     entry();
     exit()
 }
