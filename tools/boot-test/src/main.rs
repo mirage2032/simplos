@@ -50,10 +50,23 @@ fn run(kernel: &Path) -> Result<ExitCode, Box<dyn Error>> {
     // booted by hand with the exact image that failed.
     let image = kernel.with_extension("img");
     bootloader::BiosBoot::new(kernel).create_disk_image(&image)?;
+    // Blank scratch disks for tests/disk.rs to write to, one per controller
+    // kind, sized differently so the test can tell which is which. Recreated
+    // each run, so nothing a test wrote survives into the next.
+    let ata_scratch = kernel.with_extension("ata.img");
+    let ahci_scratch = kernel.with_extension("ahci.img");
+    for (path, size) in [(&ata_scratch, 1 << 20), (&ahci_scratch, 2 << 20)] {
+        std::fs::File::create(path)?.set_len(size)?;
+    }
 
     let mut qemu = Command::new("qemu-system-x86_64");
     qemu.arg("-drive")
         .arg(format!("format=raw,file={}", image.display()))
+        .arg("-drive")
+        .arg(format!("format=raw,file={},if=ide,index=1", ata_scratch.display()))
+        .args(["-device", "ich9-ahci,id=ahci", "-device", "ide-hd,drive=scratch,bus=ahci.0"])
+        .arg("-drive")
+        .arg(format!("format=raw,file={},if=none,id=scratch", ahci_scratch.display()))
         // How the guest reports its result. Without it a finished test would
         // just sit in `hlt_loop` until the timeout.
         .args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"])

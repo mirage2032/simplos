@@ -1,7 +1,9 @@
 pub mod console;
+pub mod disk;
 pub mod fwcfg;
 pub mod hpet;
 pub mod interrupts;
+pub mod pci;
 pub mod ps2;
 pub mod serial;
 pub mod utils;

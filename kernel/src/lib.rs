@@ -101,6 +101,7 @@ pub fn pre_init(boot_info: &'static mut BootInfo) {
             unsafe { BootInfoFrameAllocator::init(&boot_info.memory_regions) };
         allocator::init_heap(&mut mapper, &mut frame_allocator)
             .expect("heap initialization failed");
+        *memory::FRAMES.lock() = Some(frame_allocator);
 
         // Initialize display with framebuffer
         let fb = boot_info.framebuffer.take().expect("No framebuffer found");
@@ -128,6 +129,8 @@ pub fn pre_init(boot_info: &'static mut BootInfo) {
             // HPET init failed, continue without it
             serial_println!("HPET init failed: {}", e);
         }
+
+        io::disk::init();
 
         x86_64::instructions::interrupts::enable();
     }
