@@ -4,7 +4,7 @@
 use super::{EBADF, EFAULT, EINVAL};
 use crate::fs::{self, Handle};
 use crate::pipe;
-use crate::process::Process;
+use crate::process::{Fd, Process};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -47,25 +47,30 @@ const MOST: usize = 1 << 20;
 const MOST_FILES: usize = 1024;
 
 /// An errno, positive.
-type Result<T> = core::result::Result<T, i64>;
+pub(super) type Result<T> = core::result::Result<T, i64>;
 
 /// What a system call returns: the value, or minus the errno.
-fn ret(result: Result<i64>) -> i64 {
+pub(super) fn ret(result: Result<i64>) -> i64 {
     result.unwrap_or_else(|errno| -errno)
 }
 
 fn handle(process: &Process, fd: u64) -> Result<Arc<Handle>> {
     let files = process.files.lock();
-    files.get(fd as usize).cloned().flatten().ok_or(EBADF)
+    files.get(fd as usize).and_then(Option::as_ref).map(|fd| fd.handle.clone()).ok_or(EBADF)
 }
 
 /// Give `handle` the lowest descriptor that's free.
-fn install(process: &Process, handle: Handle) -> Result<i64> {
-    install_from(process, Arc::new(handle), 0)
+fn install(process: &Process, handle: Handle, cloexec: bool) -> Result<i64> {
+    install_from(process, Arc::new(handle), 0, cloexec)
 }
 
 /// Give `handle` the lowest descriptor from `lowest` on that's free.
-fn install_from(process: &Process, handle: Arc<Handle>, lowest: usize) -> Result<i64> {
+fn install_from(
+    process: &Process,
+    handle: Arc<Handle>,
+    lowest: usize,
+    cloexec: bool,
+) -> Result<i64> {
     let mut files = process.files.lock();
     let free = files.iter().enumerate().skip(lowest).find(|(_, file)| file.is_none());
     let fd = free.map_or(files.len().max(lowest), |(fd, _)| fd);
@@ -75,34 +80,44 @@ fn install_from(process: &Process, handle: Arc<Handle>, lowest: usize) -> Result
     if fd >= files.len() {
         files.resize(fd + 1, None);
     }
-    files[fd] = Some(handle);
+    files[fd] = Some(Fd { handle, cloexec });
     Ok(fd as i64)
 }
 
-/// The NUL-terminated string at `addr` in the program's memory.
-fn path_at(process: &Process, addr: u64) -> Result<String> {
-    const PATH_MAX: usize = 4096;
-    let mut path = Vec::new();
-    let mut memory = process.memory.lock();
+/// The NUL-terminated string at `addr` in the program's memory, without its
+/// NUL: `too_long` if it's `most` bytes or more.
+pub(super) fn string_at(
+    process: &Process,
+    addr: u64,
+    most: usize,
+    too_long: i64,
+) -> Result<Vec<u8>> {
+    let mut string = Vec::new();
     let mut at = addr;
     loop {
         // No further than the end of the page: the next may not be mapped.
         let mut chunk = vec![0; 4096 - (at % 4096) as usize];
-        memory.space.read(at, &mut chunk).ok_or(EFAULT)?;
+        process.memory.lock().space.read(at, &mut chunk).ok_or(EFAULT)?;
         let end = chunk.iter().position(|&byte| byte == 0);
-        path.extend_from_slice(&chunk[..end.unwrap_or(chunk.len())]);
-        if path.len() >= PATH_MAX {
-            return Err(ENAMETOOLONG);
+        string.extend_from_slice(&chunk[..end.unwrap_or(chunk.len())]);
+        if string.len() >= most {
+            return Err(too_long);
         }
         if end.is_some() {
-            return String::from_utf8(path).map_err(|_| EINVAL);
+            return Ok(string);
         }
         at += chunk.len() as u64;
     }
 }
 
+/// The path at `addr` in the program's memory.
+pub(super) fn path_at(process: &Process, addr: u64) -> Result<String> {
+    const PATH_MAX: usize = 4096;
+    String::from_utf8(string_at(process, addr, PATH_MAX, ENAMETOOLONG)?).map_err(|_| EINVAL)
+}
+
 /// `path`, from the root, as `dirfd` says where it starts.
-fn lookup(process: &Process, dirfd: u64, path: &str) -> Result<String> {
+pub(super) fn lookup(process: &Process, dirfd: u64, path: &str) -> Result<String> {
     if path.is_empty() {
         return Err(ENOENT);
     }
@@ -125,8 +140,9 @@ pub fn open(process: &Process, dirfd: u64, path: u64, flags: u64, mode: u64) -> 
             return Err(EINVAL);
         }
         let path = lookup(process, dirfd, &path_at(process, path)?)?;
+        let cloexec = flags & O_CLOEXEC != 0;
         if let Some(device) = fs::device(&path) {
-            return install(process, device);
+            return install(process, device, cloexec);
         }
         let tree = fs::lock();
         let handle = match tree.metadata(&path) {
@@ -156,7 +172,7 @@ pub fn open(process: &Process, dirfd: u64, path: u64, flags: u64, mode: u64) -> 
                 file_handle(file.map_err(fs::errno)?, access, flags)
             }
         };
-        install(process, handle)
+        install(process, handle, cloexec)
     })())
 }
 
@@ -191,11 +207,13 @@ pub fn close(process: &Process, fd: u64) -> i64 {
     }
 }
 
-/// Close every descriptor, as a program ends.
-pub fn close_all(process: &Process) {
+/// Close the descriptors marked close-on-exec, as `execve` succeeds.
+pub fn close_on_exec(process: &Process) {
     let _tree = fs::lock();
-    let files = core::mem::take(&mut *process.files.lock());
+    let mut files = process.files.lock();
+    let closed: Vec<Fd> = files.iter_mut().filter_map(|fd| fd.take_if(|fd| fd.cloexec)).collect();
     drop(files);
+    drop(closed);
 }
 
 pub fn read(process: &Process, fd: u64, buf: u64, count: u64) -> i64 {
@@ -435,8 +453,7 @@ pub fn getdents64(process: &Process, fd: u64, buf: u64, count: u64) -> i64 {
 
 /// Copies of descriptors, and their flags.
 ///
-/// shortcut: close-on-exec is taken and forgotten: until `execve`, it means
-/// nothing. Nor can the flags `open` set be changed.
+/// shortcut: the flags `open` set can't be changed.
 pub fn fcntl(process: &Process, fd: u64, command: u64, arg: u64) -> i64 {
     const F_DUPFD: u64 = 0;
     const F_GETFD: u64 = 1;
@@ -444,11 +461,22 @@ pub fn fcntl(process: &Process, fd: u64, command: u64, arg: u64) -> i64 {
     const F_GETFL: u64 = 3;
     const F_SETFL: u64 = 4;
     const F_DUPFD_CLOEXEC: u64 = 1030;
+    const FD_CLOEXEC: u64 = 1;
     ret((|| {
         let handle = handle(process, fd)?;
         match command {
-            F_DUPFD | F_DUPFD_CLOEXEC => install_from(process, handle, arg as usize),
-            F_GETFD | F_SETFD | F_SETFL => Ok(0),
+            F_DUPFD => install_from(process, handle, arg as usize, false),
+            F_DUPFD_CLOEXEC => install_from(process, handle, arg as usize, true),
+            F_GETFD | F_SETFD => {
+                let mut files = process.files.lock();
+                let fd = files[fd as usize].as_mut().ok_or(EBADF)?;
+                if command == F_SETFD {
+                    fd.cloexec = arg & FD_CLOEXEC != 0;
+                    return Ok(0);
+                }
+                Ok(fd.cloexec as i64)
+            }
+            F_SETFL => Ok(0),
             F_GETFL => Ok(match &*handle {
                 Handle::Console | Handle::Null | Handle::Zero => 2,
                 Handle::Pipe(end) => end.write as i64,
@@ -560,16 +588,16 @@ pub fn umask(process: &Process, mask: u64) -> i64 {
 /// `pipe` and `pipe2`: a new pipe, whose reading and writing descriptors go
 /// to `fds` as two ints.
 ///
-/// shortcut: no O_NONBLOCK, which nothing has needed yet; close-on-exec is
-/// taken and forgotten, as with `fcntl`.
+/// shortcut: no O_NONBLOCK, which nothing has needed yet.
 pub fn pipe2(process: &Process, fds: u64, flags: u64) -> i64 {
     ret((|| {
         if flags & !O_CLOEXEC != 0 {
             return Err(EINVAL);
         }
+        let cloexec = flags & O_CLOEXEC != 0;
         let (read, write) = pipe::new();
-        let read = install(process, Handle::Pipe(read))?;
-        let installed = install(process, Handle::Pipe(write)).and_then(|write| {
+        let read = install(process, Handle::Pipe(read), cloexec)?;
+        let installed = install(process, Handle::Pipe(write), cloexec).and_then(|write| {
             let mut ends = [0u8; 8];
             ends[..4].copy_from_slice(&(read as i32).to_le_bytes());
             ends[4..].copy_from_slice(&(write as i32).to_le_bytes());
@@ -589,7 +617,7 @@ pub fn pipe2(process: &Process, fds: u64, flags: u64) -> i64 {
 }
 
 pub fn dup(process: &Process, fd: u64) -> i64 {
-    ret(handle(process, fd).and_then(|handle| install_from(process, handle, 0)))
+    ret(handle(process, fd).and_then(|handle| install_from(process, handle, 0, false)))
 }
 
 /// `dup2` and `dup3`: `fd` copied to `to`, closing what was there first.
@@ -614,7 +642,7 @@ pub fn dup3(process: &Process, fd: u64, to: u64, flags: u64, dup2: bool) -> i64 
             if to >= files.len() {
                 files.resize(to + 1, None);
             }
-            files[to].replace(handle)
+            files[to].replace(Fd { handle, cloexec: flags & O_CLOEXEC != 0 })
         };
         drop(replaced);
         Ok(to as i64)

@@ -6,6 +6,8 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{FileExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 fn main() {
@@ -53,7 +55,7 @@ fn main() {
             let closed = syscall(3, 1000, 0, 0);
             println!("{bad_path} {bad_buf} {small} {read_dir} {closed}");
         }
-        Some("exit") => {}
+        Some("exit") => std::process::exit(arg(2).parse().unwrap_or(0)),
         Some("mkdir") => or_fail(&arg(2), fs::create_dir(arg(2))),
         Some("mkdir-p") => or_fail(&arg(2), fs::create_dir_all(arg(2))),
         Some("rm") => or_fail(&arg(2), fs::remove_file(arg(2))),
@@ -109,6 +111,109 @@ fn main() {
             let mut fds = [0i32; 2];
             let nonblocking = syscall(293, fds.as_mut_ptr() as usize, 0o4000, 0);
             println!("{closed} {far} {kernel} {nonblocking}");
+        }
+        // A copy of the program, with fork, which changes its memory and
+        // ends; then the original's memory, as it was, and how the copy
+        // ended, as wait4 says.
+        Some("fork") => {
+            let mut on_stack = 1;
+            let mut on_heap = Box::new(1);
+            let parent = syscall(39, 0, 0, 0);
+            let child = syscall(57, 0, 0, 0);
+            if child == 0 {
+                on_stack += 1;
+                *on_heap += 1;
+                let (me, my_parent) = (syscall(39, 0, 0, 0), syscall(110, 0, 0, 0));
+                println!("child: {on_stack} {} {} {}", on_heap, me != parent, my_parent == parent);
+                std::process::exit(7);
+            }
+            let (waited, status) = wait(child);
+            println!("parent: {on_stack} {} {} {status}", on_heap, waited == child);
+        }
+        // A copy that faults, which ends it alone.
+        Some("fork-fault") => {
+            let child = syscall(57, 0, 0, 0);
+            if child == 0 {
+                unsafe { std::ptr::null_mut::<u8>().write_volatile(1) };
+            }
+            println!("{}", wait(child).1);
+        }
+        // COUNT copies one after the other, each waited for: how many were
+        // made. Each copies all of the program's memory, so the kernel had
+        // better free them.
+        Some("forks") => {
+            let count: usize = arg(2).parse().unwrap_or(1);
+            for made in 0..count {
+                let child = syscall(57, 0, 0, 0);
+                if child == 0 {
+                    std::process::exit(0);
+                }
+                if child < 0 || wait(child).0 != child {
+                    println!("{made}: {child}");
+                    std::process::exit(1);
+                }
+            }
+            println!("{count}");
+        }
+        // wait4: for a child still running, with WNOHANG, then without; and
+        // once there are none.
+        Some("waits") => {
+            let child = syscall(57, 0, 0, 0);
+            if child == 0 {
+                std::thread::sleep(Duration::from_millis(100));
+                std::process::exit(3);
+            }
+            let early = syscall(61, child as usize, 0, 1);
+            let (waited, status) = wait(-1);
+            let none = syscall(61, -1isize as usize, 0, 0);
+            println!("{early} {} {status} {none}", waited == child);
+        }
+        // What the kernel must refuse: clone asked for a thread, and execve
+        // of a path, then of arguments, in its half. The program goes on.
+        Some("bad-processes") => {
+            let kernel = 0xFFFF_8000_0000_0000;
+            let thread = syscall(56, 0x10000 | 17, 0, 0);
+            let path = syscall(59, kernel, 0, 0);
+            let probe = c"/bin/probe";
+            let args = syscall(59, probe.as_ptr() as usize, kernel, 0);
+            let pointers = [kernel, 0];
+            let arg = syscall(59, probe.as_ptr() as usize, pointers.as_ptr() as usize, 0);
+            println!("{thread} {path} {args} {arg}");
+        }
+        // Become PROGRAM, with ARGS, and FROM=exec in its environment.
+        Some("exec") => {
+            let error =
+                Command::new(arg(2)).args(std::env::args().skip(3)).env("FROM", "exec").exec();
+            or_fail::<()>(&arg(2), Err(error));
+        }
+        // Its arguments and environment.
+        Some("env") => {
+            println!("{:?}", std::env::args().skip(1).collect::<Vec<_>>());
+            std::env::vars().for_each(|(name, value)| println!("{name}={value}"));
+        }
+        // Run PROGRAM with ARGS, and say how it ended.
+        Some("spawn") => {
+            let status = Command::new(arg(2)).args(std::env::args().skip(3)).status();
+            println!("{}", or_fail(&arg(2), status));
+        }
+        // Run PROGRAM with ARGS, TEXT its standard input and its standard
+        // output read back, both through pipes: then what came back, and
+        // how it ended.
+        Some("feed") => {
+            let mut child = or_fail(
+                &arg(3),
+                Command::new(arg(3))
+                    .args(std::env::args().skip(4))
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .spawn(),
+            );
+            let mut stdin = child.stdin.take().unwrap();
+            or_fail("stdin", stdin.write_all(arg(2).as_bytes()));
+            drop(stdin);
+            let output = or_fail("stdout", io::read_to_string(child.stdout.take().unwrap()));
+            print!("{output}");
+            println!("{}", or_fail(&arg(3), child.wait()));
         }
         // End with PATH open, for the kernel to close.
         Some("hold") => std::mem::forget(or_fail(&arg(2), fs::File::open(arg(2)))),
@@ -195,6 +300,18 @@ fn or_fail<T>(path: &str, result: io::Result<T>) -> T {
         eprintln!("probe: {path}: {error}");
         std::process::exit(1)
     })
+}
+
+/// Wait for child `pid`, or any with -1, with wait4: which ended, and how,
+/// as `ExitStatus` would say it.
+fn wait(pid: isize) -> (isize, String) {
+    let mut status = 0i32;
+    let waited = syscall(61, pid as usize, &raw mut status as usize, 0);
+    let how = match status & 0x7F {
+        0 => format!("exit status: {}", status >> 8 & 0xFF),
+        signal => format!("signal: {signal}"),
+    };
+    (waited, how)
 }
 
 /// A system call made directly, bypassing libc's checks.

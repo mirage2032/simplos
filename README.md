@@ -116,8 +116,31 @@ has the user program read it, and `run` lists its other modes. For now:
 - pipes always wait (no `O_NONBLOCK`), and writing to one nobody reads is
   `EPIPE` without `SIGPIPE`, as there are no signals yet;
 - `/dev` holds just those three, and can't be written;
-- standard input is always at its end, and close-on-exec means nothing until
-  there's an `execve`.
+- standard input is always at its end.
+
+## Processes
+
+A program can start others as on Linux: `fork`, `vfork` and `clone` (as C
+libraries use it for them) copy it, `execve` replaces it with an ELF program
+from the disk, closing the descriptors marked close-on-exec, and `wait4`
+waits for its copies and tells how each ended; `getpid` and `getppid` say
+who's who. So Rust's `std::process::Command` works: its `spawn`, `status`
+and `exec`, but not yet `output`, which needs `poll` to wait. `cargo run`'s
+disk has the user program as `/bin/probe` (a `disk.img` made before this
+doesn't: delete it), so in the shell, `run spawn /bin/probe hello` has it
+run itself again. For now:
+
+- `fork` copies all of a program's memory at once, rather than sharing it
+  until either side writes to it;
+- `clone` makes no threads: asked to share memory (`CLONE_VM`), it copies it
+  too, which is all `posix_spawn` needs, and `CLONE_VFORK` doesn't hold the
+  parent back;
+- a program that ended keeps its memory until it's waited for, and those
+  never waited for go with their parent rather than to an init;
+- there are no process groups, so `wait4` for a group waits for any child,
+  and no signals, so nothing is ever stopped;
+- `execve` takes ELF programs of up to 4 MiB, which it reads whole, and not
+  scripts: shells run those themselves when told `ENOEXEC`.
 
 ## Tests
 
@@ -134,8 +157,9 @@ itself down back into a pass or a fail. The guest's side of that is QEMU's
 derived from the value written. Every test also gets two blank scratch disks,
 1 MiB on IDE and 2 MiB on AHCI, which `tests/disk.rs` writes to, and a 16 MiB
 ext4 disk made by e2fsprogs' `mke2fs`, which `tests/ext4.rs` writes to, and
-`tests/files.rs` has the user program read and write through system calls. After a
-run that passes, e2fsck must find nothing wrong with it, and it must have been
+`tests/files.rs` has the user program read and write through system calls. It holds
+the user program as `/bin/probe`, which `tests/processes.rs` has it start
+copies of and run again. After a run that passes, e2fsck must find nothing wrong with it, and it must have been
 unmounted, so the tests need e2fsprogs installed.
 
 Each test boots twice, under BIOS and then under UEFI, and passes only if it

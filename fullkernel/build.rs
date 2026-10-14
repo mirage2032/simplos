@@ -43,4 +43,6 @@ fn main() {
     // pass the disk image paths as env variables to the `main.rs`
     println!("cargo:rustc-env=UEFI_PATH={}", uefi_path.display());
     println!("cargo:rustc-env=BIOS_PATH={}", bios_path.display());
+    // And the user program's own path, for the ext4 disk `main.rs` makes.
+    println!("cargo:rustc-env=PROBE_PATH={}", probe.display());
 }

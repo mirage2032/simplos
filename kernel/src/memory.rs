@@ -205,6 +205,22 @@ impl AddressSpace {
         Some(space)
     }
 
+    /// A copy, as `fork` makes for the child: the same mappings, each with a
+    /// frame of its own holding what the original's holds. `None` when
+    /// memory runs out.
+    ///
+    /// shortcut: every page is copied at once; share them copy-on-write when
+    /// forking big programs gets slow.
+    pub fn duplicate(&self) -> Option<AddressSpace> {
+        let copy = AddressSpace::new()?;
+        // Declared after `copy`, so released before a failed copy's `drop`
+        // takes it again.
+        let mut frames = FRAMES.lock();
+        copy_tables(self.pml4, copy.pml4, 4, 256, frames.as_mut()?)?;
+        drop(frames);
+        Some(copy)
+    }
+
     /// What CR3 holds while the program runs.
     pub fn pml4(&self) -> PhysFrame {
         self.pml4
@@ -372,6 +388,39 @@ fn free_tables(frame: PhysFrame, level: u8, entries: usize, frames: &mut BootInf
     }
     // Safety: a table only the dropped address space used.
     unsafe { frames.deallocate_frame(frame) };
+}
+
+/// Copy what's mapped below `from`, a page table of `level`, through its
+/// first `entries` entries, into `to`, an empty one of the same level: new
+/// tables, and new frames holding the same bytes. Each new table is linked
+/// into `to` before anything goes into it, so a copy cut short by running
+/// out of memory is still freed whole, by its address space's `drop`.
+fn copy_tables(
+    from: PhysFrame,
+    to: PhysFrame,
+    level: u8,
+    entries: usize,
+    frames: &mut BootInfoFrameAllocator,
+) -> Option<()> {
+    for (i, entry) in table(from).iter().enumerate().take(entries) {
+        if !entry.flags().contains(PageTableFlags::PRESENT) {
+            continue;
+        }
+        let below = PhysFrame::containing_address(entry.addr());
+        let frame = frames.allocate_frame()?;
+        if level > 1 {
+            table(frame).zero();
+            table(to)[i].set_frame(frame, entry.flags());
+            copy_tables(below, frame, level - 1, 512, frames)?;
+        } else {
+            let (source, target) =
+                (phys_ptr(below.start_address())?, phys_ptr(frame.start_address())?);
+            // Safety: a page of the program's, and a frame just allocated.
+            unsafe { core::ptr::copy_nonoverlapping(source, target, 4096) };
+            table(to)[i].set_frame(frame, entry.flags());
+        }
+    }
+    Some(())
 }
 
 /// The page table in `frame`, through the physical-memory map.

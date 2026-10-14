@@ -1,7 +1,7 @@
 use crate::io::interrupts::pic::InterruptIndex;
 use crate::io::interrupts::{gdt, pic};
 use crate::io::ps2::{PS2_CONTROLLER, Ps2InterruptCause};
-use crate::process::{self, KILLED_SIGBUS, KILLED_SIGFPE, KILLED_SIGILL, KILLED_SIGSEGV};
+use crate::process::{self, SIGBUS, SIGFPE, SIGILL, SIGSEGV};
 use crate::{serial_println, thread};
 use core::fmt;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -97,10 +97,10 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
     }
     pic::notify_end_of_interrupt(&InterruptIndex::Keyboard);
 }
-/// A fault in a user program ends that program, with the exit status of the
-/// signal Linux would have sent it. In the kernel it is a bug: say what and
-/// where, and stop, rather than halt silently and look like a freeze.
-fn fault(frame: &InterruptStackFrame, what: fmt::Arguments, status: i32) -> ! {
+/// A fault in a user program ends that program, as the signal Linux would
+/// have sent it would. In the kernel it is a bug: say what and where, and
+/// stop, rather than halt silently and look like a freeze.
+fn fault(frame: &InterruptStackFrame, what: fmt::Arguments, signal: i32) -> ! {
     if frame.code_segment.rpl() == PrivilegeLevel::Ring3 {
         let id = thread::current_process().map_or(0, |process| process.id);
         serial_println!(
@@ -109,7 +109,7 @@ fn fault(frame: &InterruptStackFrame, what: fmt::Arguments, status: i32) -> ! {
             what,
             frame.instruction_pointer.as_u64()
         );
-        process::exit_current(status);
+        process::kill_current(signal);
     }
     crate::serial::panic_print(format_args!("\n*** EXCEPTION: {what} ***\n{frame:#?}\n"));
     crate::hlt_loop();
@@ -123,44 +123,44 @@ extern "x86-interrupt" fn page_fault_handler(
 ) {
     let address = x86_64::registers::control::Cr2::read_raw();
     let what = format_args!("page fault at {address:#x} ({error_code:?})");
-    fault(&stack_frame, what, KILLED_SIGSEGV)
+    fault(&stack_frame, what, SIGSEGV)
 }
 
 extern "x86-interrupt" fn divide_error_handler(frame: InterruptStackFrame) {
-    fault(&frame, format_args!("divide error"), KILLED_SIGFPE)
+    fault(&frame, format_args!("divide error"), SIGFPE)
 }
 
 extern "x86-interrupt" fn debug_handler(frame: InterruptStackFrame) {
     // A program can single-step itself by setting the trap flag.
-    fault(&frame, format_args!("debug trap"), process::KILLED_SIGTRAP)
+    fault(&frame, format_args!("debug trap"), process::SIGTRAP)
 }
 
 extern "x86-interrupt" fn invalid_opcode_handler(frame: InterruptStackFrame) {
-    fault(&frame, format_args!("invalid opcode"), KILLED_SIGILL)
+    fault(&frame, format_args!("invalid opcode"), SIGILL)
 }
 
 extern "x86-interrupt" fn x87_floating_point_handler(frame: InterruptStackFrame) {
-    fault(&frame, format_args!("x87 floating-point exception"), KILLED_SIGFPE)
+    fault(&frame, format_args!("x87 floating-point exception"), SIGFPE)
 }
 
 extern "x86-interrupt" fn simd_floating_point_handler(frame: InterruptStackFrame) {
-    fault(&frame, format_args!("SIMD floating-point exception"), KILLED_SIGFPE)
+    fault(&frame, format_args!("SIMD floating-point exception"), SIGFPE)
 }
 
 extern "x86-interrupt" fn segment_not_present_handler(frame: InterruptStackFrame, error: u64) {
-    fault(&frame, format_args!("segment not present ({error:#x})"), KILLED_SIGBUS)
+    fault(&frame, format_args!("segment not present ({error:#x})"), SIGBUS)
 }
 
 extern "x86-interrupt" fn stack_segment_fault_handler(frame: InterruptStackFrame, error: u64) {
-    fault(&frame, format_args!("stack segment fault ({error:#x})"), KILLED_SIGBUS)
+    fault(&frame, format_args!("stack segment fault ({error:#x})"), SIGBUS)
 }
 
 extern "x86-interrupt" fn general_protection_fault_handler(frame: InterruptStackFrame, error: u64) {
-    fault(&frame, format_args!("general protection fault ({error:#x})"), KILLED_SIGSEGV)
+    fault(&frame, format_args!("general protection fault ({error:#x})"), SIGSEGV)
 }
 
 extern "x86-interrupt" fn alignment_check_handler(frame: InterruptStackFrame, error: u64) {
-    fault(&frame, format_args!("alignment check ({error:#x})"), KILLED_SIGBUS)
+    fault(&frame, format_args!("alignment check ({error:#x})"), SIGBUS)
 }
 extern "x86-interrupt" fn mouse_interrupt_handler(_stack_frame: InterruptStackFrame) {
     if let Some(controller) = PS2_CONTROLLER.lock().as_mut()

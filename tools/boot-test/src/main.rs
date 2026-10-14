@@ -191,8 +191,11 @@ fn e2fsprogs(tool: &str) -> Command {
 const EXT4_TREE: &[(&str, &str)] =
     &[("hello.txt", "hello from ext4\n"), ("dir/nested/deep.txt", "deep\n")];
 
-/// A 16 MiB ext4 file system holding `EXT4_TREE`, as Linux makes them.
+/// A 16 MiB ext4 file system holding `EXT4_TREE`, as Linux makes them, and in
+/// /bin, user/probe for programs to run, and a file marked executable that
+/// isn't a program.
 fn make_ext4(image: &Path) -> Result<(), Box<dyn Error>> {
+    use std::os::unix::fs::PermissionsExt;
     let tree = image.with_extension("tree");
     let _ = std::fs::remove_dir_all(&tree);
     for (path, contents) in EXT4_TREE {
@@ -200,6 +203,11 @@ fn make_ext4(image: &Path) -> Result<(), Box<dyn Error>> {
         std::fs::create_dir_all(path.parent().expect("a file in a directory"))?;
         std::fs::write(path, contents)?;
     }
+    std::fs::create_dir(tree.join("bin"))?;
+    std::fs::copy(env!("CARGO_BIN_FILE_PROBE_probe"), tree.join("bin/probe"))?;
+    let script = tree.join("bin/script");
+    std::fs::write(&script, "#!/bin/sh\necho a script\n")?;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
     let output = e2fsprogs("mke2fs")
         .args(["-q", "-F", "-t", "ext4", "-d"])
         .arg(&tree)
