@@ -4,14 +4,8 @@
 mod common;
 
 use common::*;
-use ext4::{Error, Ext4, File};
-
-fn write_all(file: &mut File, mut buf: &[u8]) {
-    while !buf.is_empty() {
-        let written = file.write(buf).unwrap();
-        buf = &buf[written..];
-    }
-}
+use ext4::{Error, Ext4, Kind};
+use std::os::unix::fs::MetadataExt;
 
 /// Unlike `big`'s, and a few bytes into its last block.
 fn bigger() -> Vec<u8> {
@@ -25,18 +19,15 @@ fn writes_the_tree(test: &str, options: &[&str]) {
     let root = dir.join("tree");
     make_tree(&root);
     let image = image(&dir, &root, options, "64M");
-    let mut fs = Ext4::mount_writable(Box::new(image.clone())).expect("mounts");
+    let fs = Ext4::mount_writable(Box::new(image.clone())).expect("mounts");
 
     fs.create_dir("new").unwrap();
     fs.create_dir("new/deeper").unwrap();
-    write_all(&mut fs.create("new/deeper/bigger.bin").unwrap(), &bigger());
+    write_all(&fs.create("new/deeper/bigger.bin").unwrap(), 0, &bigger());
     // Across the end of a block, in a file that's there.
-    let mut file = fs.open_writable("big.bin").unwrap();
-    file.seek(4000).unwrap();
-    write_all(&mut file, &[0xaa; 200]);
-    drop(file);
+    write_all(&fs.open_writable("big.bin").unwrap(), 4000, &[0xaa; 200]);
     // Emptied first.
-    write_all(&mut fs.create("hello.txt").unwrap(), b"rewritten\n");
+    write_all(&fs.create("hello.txt").unwrap(), 0, b"rewritten\n");
     fs.rename("dir/nested/deep.txt", "new/deep.txt").unwrap();
     // A directory: its `..` must follow it.
     fs.rename("dir", "new/dir").unwrap();
@@ -103,10 +94,8 @@ fn fills_a_directory_until_it_needs_an_index() {
     let fs = Ext4::mount_writable(Box::new(image.clone())).unwrap();
     fs.create_dir("many").unwrap();
     for i in 0..3000 {
-        write_all(
-            &mut fs.create(&format!("many/file-{i:04}")).unwrap(),
-            format!("{i}\n").as_bytes(),
-        );
+        let file = fs.create(&format!("many/file-{i:04}")).unwrap();
+        write_all(&file, 0, format!("{i}\n").as_bytes());
     }
     drop(fs);
 
@@ -127,17 +116,17 @@ fn fills_up_and_stays_consistent() {
     make_tree(&root);
     let image = image(&dir, &root, &["-t", "ext4"], "16M");
     let fs = Ext4::mount_writable(Box::new(image.clone())).unwrap();
-    let mut file = fs.create("full").unwrap();
+    let file = fs.create("full").unwrap();
     let mut total = 0;
     loop {
-        match file.write(&[0x5a; 64 << 10]) {
+        match file.write_at(total as u64, &[0x5a; 64 << 10]) {
             Ok(written) => total += written,
             Err(Error::NoSpace) => break,
             Err(error) => panic!("after {total} bytes: {error:?}"),
         }
     }
     assert!(total > 6 << 20, "full after only {total} bytes");
-    assert_eq!(file.size(), total as u64);
+    assert_eq!(file.size().unwrap(), total as u64);
     drop(file);
     drop(fs);
     let saved = dir.join("full.img");
@@ -145,9 +134,9 @@ fn fills_up_and_stays_consistent() {
     fsck(&saved).unwrap();
 
     // Room again once it's gone.
-    let mut fs = Ext4::mount_writable(Box::new(image.clone())).unwrap();
+    let fs = Ext4::mount_writable(Box::new(image.clone())).unwrap();
     fs.remove_file("full").unwrap();
-    write_all(&mut fs.create("after").unwrap(), &[0x5a; 1 << 20]);
+    write_all(&fs.create("after").unwrap(), 0, &[0x5a; 1 << 20]);
     drop(fs);
     image.save(&saved);
     fsck(&saved).unwrap();
@@ -160,7 +149,7 @@ fn refuses_what_linux_refuses() {
     let root = dir.join("tree");
     make_tree(&root);
     let image = image(&dir, &root, &["-t", "ext4"], "64M");
-    let mut fs = Ext4::mount_writable(Box::new(image.clone())).unwrap();
+    let fs = Ext4::mount_writable(Box::new(image.clone())).unwrap();
     // lwext4 alone would make the missing directories on the way.
     assert_eq!(fs.create("missing/file").err(), Some(Error::NotFound));
     assert_eq!(fs.create_dir("missing/dir").err(), Some(Error::NotFound));
@@ -178,7 +167,7 @@ fn refuses_what_linux_refuses() {
     // lwext4 alone would cut `dir` off, in a loop of its own.
     assert_eq!(fs.rename("dir", "dir/nested/dir").err(), Some(Error::InvalidArgument));
     // lwext4 alone would write to a file opened for reading.
-    assert_eq!(fs.open("hello.txt").unwrap().write(b"no").err(), Some(Error::ReadOnly));
+    assert_eq!(fs.open("hello.txt").unwrap().write_at(0, b"no").err(), Some(Error::ReadOnly));
     drop(fs);
 
     let saved = dir.join("refused.img");
@@ -199,13 +188,13 @@ fn read_only_mounts_write_nothing() {
     let root = dir.join("tree");
     make_tree(&root);
     let image = image(&dir, &root, &["-t", "ext4"], "64M");
-    let mut fs = Ext4::mount(Box::new(image.clone())).unwrap();
+    let fs = Ext4::mount(Box::new(image.clone())).unwrap();
     assert_eq!(fs.create("new").err(), Some(Error::ReadOnly));
     assert_eq!(fs.open_writable("hello.txt").err(), Some(Error::ReadOnly));
     assert_eq!(fs.create_dir("new").err(), Some(Error::ReadOnly));
     assert_eq!(fs.rename("hello.txt", "moved").err(), Some(Error::ReadOnly));
     assert_eq!(fs.remove_file("hello.txt").err(), Some(Error::ReadOnly));
-    assert_eq!(fs.open("hello.txt").unwrap().write(b"no").err(), Some(Error::ReadOnly));
+    assert_eq!(fs.open("hello.txt").unwrap().write_at(0, b"no").err(), Some(Error::ReadOnly));
     drop(fs);
     assert!(image.writes.lock().unwrap().is_empty());
 }
@@ -223,4 +212,110 @@ fn reads_but_wont_write_features_it_cant_keep_up() {
     assert_eq!(read_all(&fs, "hello.txt"), b"hello from ext4\n");
     drop(fs);
     assert!(image.writes.lock().unwrap().is_empty());
+}
+
+#[test]
+fn open_files_keep_their_own_place() {
+    let _serial = serial();
+    let dir = workspace("places");
+    let root = dir.join("tree");
+    make_tree(&root);
+    let image = image(&dir, &root, &["-t", "ext4"], "64M");
+    let fs = Ext4::mount_writable(Box::new(image.clone())).unwrap();
+    write_all(&fs.create("f").unwrap(), 0, b"0123456789");
+    let reader = fs.open("f").unwrap();
+    let mut buf = [0; 16];
+    assert_eq!(reader.read_at(4, &mut buf).unwrap(), 6);
+    // Emptied through another handle: the first sees the new end, and lwext4
+    // alone would read on past it.
+    let writer = fs.create("f").unwrap();
+    assert_eq!(reader.read_at(4, &mut buf).unwrap(), 0);
+    write_all(&writer, 0, b"ab");
+    assert_eq!(reader.read_at(0, &mut buf).unwrap(), 2);
+    assert_eq!(&buf[..2], b"ab");
+    // Past the end: zeros in between, where lwext4 alone would put "z" at the
+    // end.
+    write_all(&writer, 6, b"z");
+    assert_eq!(reader.read_at(0, &mut buf).unwrap(), 7);
+    assert_eq!(&buf[..7], b"ab\0\0\0\0z");
+    assert_eq!(reader.metadata().unwrap().size, 7);
+    drop((reader, writer, fs));
+
+    let saved = dir.join("written.img");
+    image.save(&saved);
+    fsck(&saved).unwrap();
+    assert_eq!(debugfs(&saved, "cat f"), b"ab\0\0\0\0z");
+}
+
+#[test]
+fn open_files_cant_be_removed() {
+    let _serial = serial();
+    let dir = workspace("busy");
+    let root = dir.join("tree");
+    make_tree(&root);
+    let image = image(&dir, &root, &["-t", "ext4"], "64M");
+    let fs = Ext4::mount_writable(Box::new(image.clone())).unwrap();
+    let (first, second) = (fs.open("hello.txt").unwrap(), fs.open("hello.txt").unwrap());
+    assert_eq!(fs.remove_file("hello.txt").err(), Some(Error::Busy));
+    drop(first);
+    assert_eq!(fs.remove_file("hello.txt").err(), Some(Error::Busy));
+    drop(second);
+    fs.remove_file("hello.txt").unwrap();
+    drop(fs);
+    let saved = dir.join("written.img");
+    image.save(&saved);
+    fsck(&saved).unwrap();
+}
+
+#[test]
+fn files_keep_their_file_system_mounted() {
+    let _serial = serial();
+    let dir = workspace("outlive");
+    let root = dir.join("tree");
+    make_tree(&root);
+    let image = image(&dir, &root, &["-t", "ext4"], "64M");
+    let fs = Ext4::mount_writable(Box::new(image.clone())).unwrap();
+    let file = fs.create("late").unwrap();
+    let listing = fs.open_dir("/").unwrap();
+    drop(fs);
+    write_all(&file, 0, b"after the mount's owner let go\n");
+    assert_eq!(listing.metadata().unwrap().kind, Kind::Directory);
+    drop(file);
+    // Still mounted: what's on the image isn't finished yet.
+    let saved = dir.join("written.img");
+    image.save(&saved);
+    assert!(debugfs_ls(&saved, "/").contains(&String::from("late")));
+    drop(listing);
+    // Unmounted now, cleanly, and the slot given back.
+    image.save(&saved);
+    fsck(&saved).unwrap();
+    assert_eq!(debugfs(&saved, "cat late"), b"after the mount's owner let go\n");
+    Ext4::mount(Box::new(image)).unwrap();
+}
+
+#[test]
+fn says_what_stat_says() {
+    let _serial = serial();
+    let dir = workspace("stat");
+    let root = dir.join("tree");
+    make_tree(&root);
+    let image = image(&dir, &root, &["-t", "ext4"], "64M");
+    let fs = Ext4::mount(Box::new(image)).unwrap();
+    // As Linux would say of the tree mke2fs copied.
+    for path in ["hello.txt", "dir", "big.bin", "link"] {
+        let ours = fs.metadata(path).unwrap();
+        let theirs = std::fs::symlink_metadata(root.join(path)).unwrap();
+        assert_eq!(ours.permissions, theirs.mode() & 0o7777, "{path}");
+        assert_eq!(ours.links, theirs.nlink() as u32, "{path}");
+        assert_eq!(ours.modified as i64, theirs.mtime(), "{path}");
+        if ours.kind != Kind::Directory {
+            assert_eq!(ours.size, theirs.size(), "{path}");
+        }
+    }
+    assert_eq!(fs.metadata("/").unwrap().inode, 2, "the root's inode");
+    assert_eq!(fs.metadata("big.bin").unwrap().blocks, (3 << 20) / 512);
+    // An entry's inode is the one its name leads to.
+    for entry in fs.read_dir("/").unwrap() {
+        assert_eq!(entry.inode, fs.metadata(&entry.name).unwrap().inode, "{}", entry.name);
+    }
 }

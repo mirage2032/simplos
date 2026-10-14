@@ -9,10 +9,14 @@
 //! callers should wait on a sleeping lock of their own first, so that a
 //! thread waiting on the disk doesn't leave others spinning on this one.
 //!
-//! Every change is on the device when the call making it returns: lwext4's
-//! cache writes through, and on a file system with a journal each change
-//! is a transaction there first, so a crash leaves it whole or not made.
-//! There's no `fsync` to call. (The data in files isn't journaled, as with
+//! Open files and directories own their place in the mount, so they can be
+//! kept by whatever outlives a borrow, such as a program's file descriptors.
+//!
+//! Every change is on the device when the call making it returns. With a
+//! journal, it's a transaction there, so a crash leaves it whole or not
+//! made, and lwext4 writes the blocks to their places in its own time;
+//! without one, lwext4's cache writes them through. There's no `fsync` to
+//! call. (The data in files isn't journaled, as with
 //! Linux's default `data=ordered`: a crash in the middle of overwriting a
 //! file can leave it part old, part new. And removing a file over 16 MiB
 //! takes a transaction per 16 MiB: a crash can leave it there, shorter.)
@@ -30,6 +34,7 @@ use alloc::boxed::Box;
 use alloc::ffi::CString;
 use alloc::format;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ffi::{CStr, c_char, c_int, c_void};
 use spin::Mutex;
@@ -64,6 +69,8 @@ pub enum Error {
     NoSpace,
     /// Such as moving a directory into itself.
     InvalidArgument,
+    /// Such as removing a file that's open.
+    Busy,
     /// As many file systems are mounted as can be.
     TooManyMounts,
     OutOfMemory,
@@ -80,6 +87,7 @@ fn check(errno: c_int) -> Result<(), Error> {
         2 => Error::NotFound,
         5 => Error::Io,
         12 => Error::OutOfMemory,
+        16 => Error::Busy,
         17 => Error::AlreadyExists,
         20 => Error::NotADirectory,
         21 => Error::IsADirectory,
@@ -104,13 +112,27 @@ pub enum Kind {
 pub struct DirEntry {
     pub name: String,
     pub kind: Kind,
+    pub inode: u32,
 }
 
+/// What `stat` tells of a file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Metadata {
+    pub inode: u32,
     pub kind: Kind,
     /// The permission bits: `0o755` and the like.
     pub permissions: u32,
+    pub links: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub size: u64,
+    /// Space it takes, in 512-byte units, as `stat` counts it.
+    pub blocks: u64,
+    /// Seconds since 1970. lwext4 sets none of these: they're what Linux
+    /// last set, or 0.
+    pub accessed: u32,
+    pub modified: u32,
+    pub changed: u32,
 }
 
 /// Which of lwext4's mount slots are taken. Every call into lwext4 holds
@@ -122,12 +144,19 @@ static LWEXT4: Mutex<[bool; MOUNTS]> = Mutex::new([false; MOUNTS]);
 /// build.rs.
 pub const MOUNTS: usize = 4;
 
-/// A mounted file system.
+/// A mounted file system. Files and directories opened on it keep it
+/// mounted until they're closed too.
 pub struct Ext4 {
+    mount: Arc<Mount>,
+}
+
+/// What a mount holds, unmounted when the last `Ext4`, `File` or `Dir`
+/// holding it is gone.
+struct Mount {
     slot: usize,
     /// lwext4's names for the device and where it is mounted.
     device_name: CString,
-    mount_point: String,
+    mount_point: CString,
     device: *mut ffi::BlockDev,
     writable: bool,
     /// How far `attach` got, for `Drop` to undo.
@@ -136,11 +165,13 @@ pub struct Ext4 {
     journaling: bool,
     /// Boxed twice so lwext4 can hold a thin pointer to it.
     _ours: Box<Box<dyn BlockDevice>>,
+    /// The inodes of the files open on it, once for each time one's open.
+    open: Mutex<Vec<u32>>,
 }
 
 // Safety: lwext4's state is only touched with `LWEXT4` held.
-unsafe impl Send for Ext4 {}
-unsafe impl Sync for Ext4 {}
+unsafe impl Send for Mount {}
+unsafe impl Sync for Mount {}
 
 impl Ext4 {
     /// Mount the file system on `device`, read-only. Nothing is written to
@@ -165,80 +196,55 @@ impl Ext4 {
         if device.is_null() {
             return Err(Error::OutOfMemory);
         }
-        let mut fs = Ext4 {
+        let mut mount = Mount {
             slot,
             device_name: CString::new(format!("sd{slot}")).unwrap(),
-            mount_point: format!("/mp{slot}/"),
+            mount_point: CString::new(format!("/mp{slot}/")).unwrap(),
             device,
             writable,
             registered: false,
             mounted: false,
             journaling: false,
             _ours: ours,
+            open: Mutex::new(Vec::new()),
         };
-        // The slot stays taken until `fs`'s `Drop` has undone whatever
+        // The slot stays taken until `mount`'s `Drop` has undone whatever
         // `attach` managed, if it fails: that takes the lock, so it runs
         // after this function lets go of it.
         slots[slot] = true;
-        let mounted = fs.attach();
+        let mounted = mount.attach();
         drop(slots);
-        mounted.map(|()| fs)
-    }
-
-    /// Register the device with lwext4 and mount it; `LWEXT4` is held.
-    fn attach(&mut self) -> Result<(), Error> {
-        let mount_point = CString::new(self.mount_point.as_str()).unwrap();
-        // Safety: the names are NUL-terminated, the device is ours.
-        unsafe {
-            check(ffi::ext4_device_register(self.device, self.device_name.as_ptr()))?;
-            self.registered = true;
-            check(ffi::ext4_mount(
-                self.device_name.as_ptr(),
-                mount_point.as_ptr(),
-                !self.writable,
-            ))?;
-            self.mounted = true;
-            let needs_recovery = ffi::simplos_ext4_needs_recovery(mount_point.as_ptr()) != 0;
-            if !self.writable {
-                return if needs_recovery { Err(Error::NeedsRecovery) } else { Ok(()) };
-            }
-            if ffi::simplos_ext4_read_only(mount_point.as_ptr()) != 0 {
-                return Err(Error::Unsupported);
-            }
-            if needs_recovery {
-                check(ffi::ext4_recover(mount_point.as_ptr()))?;
-            }
-            check(ffi::ext4_journal_start(mount_point.as_ptr()))?;
-            self.journaling = true;
-        }
-        Ok(())
+        mounted.map(|()| Ext4 { mount: Arc::new(mount) })
     }
 
     /// lwext4's path for `path`, which is relative to the file system's root.
     fn path(&self, path: &str) -> Result<CString, Error> {
-        let full = format!("{}{}", self.mount_point, path.trim_start_matches('/'));
+        let mount_point = self.mount.mount_point.to_str().unwrap();
+        let full = format!("{mount_point}{}", path.trim_start_matches('/'));
         CString::new(full).map_err(|_| Error::NotFound)
     }
 
+    /// What's known of the file at `path`. A symbolic link is described
+    /// itself, not followed.
     pub fn metadata(&self, path: &str) -> Result<Metadata, Error> {
         let path = self.path(path)?;
         let _lwext4 = LWEXT4.lock();
-        let mut mode = 0;
+        let mut inode = 0;
         // Safety: a NUL-terminated path on our mount.
-        check(unsafe { ffi::ext4_mode_get(path.as_ptr(), &mut mode) })?;
-        let kind = match mode & 0o170000 {
-            0o100000 => Kind::File,
-            0o040000 => Kind::Directory,
-            0o120000 => Kind::Symlink,
-            _ => Kind::Other,
-        };
-        Ok(Metadata { kind, permissions: mode & 0o7777 })
+        check(unsafe { ffi::simplos_ext4_inode_of(path.as_ptr(), &mut inode) })?;
+        self.mount.stat(inode)
     }
 
     /// The entries of the directory at `path`, without `.` and `..`.
     pub fn read_dir(&self, path: &str) -> Result<Vec<DirEntry>, Error> {
+        Ok(self.open_dir(path)?.entries)
+    }
+
+    /// Open the directory at `path`, as it is now.
+    pub fn open_dir(&self, path: &str) -> Result<Dir, Error> {
         // lwext4 says ENOENT for a file; Linux says ENOTDIR.
-        if self.metadata(path)?.kind != Kind::Directory {
+        let metadata = self.metadata(path)?;
+        if metadata.kind != Kind::Directory {
             return Err(Error::NotADirectory);
         }
         let path = self.path(path)?;
@@ -251,11 +257,12 @@ impl Ext4 {
         }
         let mut entries = Vec::new();
         let mut name = [0u8; 255];
-        let mut kind = 0;
+        let (mut kind, mut inode) = (0, 0);
         loop {
             // Safety: `dir` is open; `name` holds the longest name ext4 has.
             let length = unsafe {
-                ffi::simplos_ext4_dir_next(dir, name.as_mut_ptr().cast(), name.len(), &mut kind)
+                let name = name.as_mut_ptr().cast();
+                ffi::simplos_ext4_dir_next(dir, name, 255, &mut kind, &mut inode)
             };
             let Ok(length) = usize::try_from(length) else { break };
             let name = &name[..length];
@@ -268,33 +275,34 @@ impl Ext4 {
                 7 => Kind::Symlink,
                 _ => Kind::Other,
             };
-            entries.push(DirEntry { name: String::from_utf8_lossy(name).into_owned(), kind });
+            let name = String::from_utf8_lossy(name).into_owned();
+            entries.push(DirEntry { name, kind, inode });
         }
         // Safety: opened above, closed once.
         unsafe { ffi::simplos_ext4_dir_close(dir) };
-        Ok(entries)
+        Ok(Dir { mount: self.mount.clone(), inode: metadata.inode, entries })
     }
 
     /// Open the file at `path` for reading.
-    pub fn open(&self, path: &str) -> Result<File<'_>, Error> {
+    pub fn open(&self, path: &str) -> Result<File, Error> {
         self.open_with(path, O_RDONLY)
     }
 
     /// Open the file at `path` for reading and writing.
-    pub fn open_writable(&self, path: &str) -> Result<File<'_>, Error> {
+    pub fn open_writable(&self, path: &str) -> Result<File, Error> {
         self.open_with(path, O_RDWR)
     }
 
     /// Open the file at `path` for reading and writing, emptied first, or
     /// made if there's none.
-    pub fn create(&self, path: &str) -> Result<File<'_>, Error> {
+    pub fn create(&self, path: &str) -> Result<File, Error> {
         self.open_with(path, O_RDWR | O_CREAT | O_TRUNC)
     }
 
     /// `flags` are open(2)'s.
-    fn open_with(&self, path: &str, flags: c_int) -> Result<File<'_>, Error> {
+    fn open_with(&self, path: &str, flags: c_int) -> Result<File, Error> {
         let writable = flags & O_RDWR != 0;
-        if writable && !self.writable {
+        if writable && !self.mount.writable {
             return Err(Error::ReadOnly);
         }
         match self.metadata(path) {
@@ -312,7 +320,10 @@ impl Ext4 {
         if raw.is_null() {
             return Err(check(error).err().unwrap_or(Error::Io));
         }
-        Ok(File { _fs: self, raw, writable })
+        // Safety: just opened.
+        let inode = unsafe { ffi::simplos_ext4_file_inode(raw) };
+        self.mount.open.lock().push(inode);
+        Ok(File { mount: self.mount.clone(), raw, inode, writable })
     }
 
     /// Make a directory at `path`.
@@ -328,16 +339,22 @@ impl Ext4 {
         check(unsafe { ffi::ext4_dir_mk(path.as_ptr()) })
     }
 
-    /// Remove the file at `path`. It takes `&mut self` so that no file is
-    /// open meanwhile: lwext4 would free an open file, which would go on
-    /// writing into blocks no longer its own.
-    pub fn remove_file(&mut self, path: &str) -> Result<(), Error> {
+    /// Remove the file at `path`, unless it's open.
+    ///
+    /// shortcut: Linux removes the name of an open file and keeps the file
+    /// until it's closed; lwext4 would free it at once, under whoever has it
+    /// open, so it's refused. Doing it Linux's way needs the orphan list.
+    pub fn remove_file(&self, path: &str) -> Result<(), Error> {
+        let metadata = self.metadata(path)?;
         // lwext4 says nothing to a directory, and leaves it.
-        if self.metadata(path)?.kind == Kind::Directory {
+        if metadata.kind == Kind::Directory {
             return Err(Error::IsADirectory);
         }
         let path = self.path(path)?;
         let _lwext4 = LWEXT4.lock();
+        if self.mount.open.lock().contains(&metadata.inode) {
+            return Err(Error::Busy);
+        }
         // Safety: as in `metadata`.
         check(unsafe { ffi::ext4_fremove(path.as_ptr()) })
     }
@@ -373,18 +390,72 @@ const O_RDWR: c_int = 0o2;
 const O_CREAT: c_int = 0o100;
 const O_TRUNC: c_int = 0o1000;
 
-impl Drop for Ext4 {
+impl Mount {
+    /// Register the device with lwext4 and mount it; `LWEXT4` is held.
+    fn attach(&mut self) -> Result<(), Error> {
+        let mount_point = self.mount_point.as_ptr();
+        // Safety: the names are NUL-terminated, the device is ours.
+        unsafe {
+            check(ffi::ext4_device_register(self.device, self.device_name.as_ptr()))?;
+            self.registered = true;
+            check(ffi::ext4_mount(self.device_name.as_ptr(), mount_point, !self.writable))?;
+            self.mounted = true;
+            let needs_recovery = ffi::simplos_ext4_needs_recovery(mount_point) != 0;
+            if !self.writable {
+                return if needs_recovery { Err(Error::NeedsRecovery) } else { Ok(()) };
+            }
+            if ffi::simplos_ext4_read_only(mount_point) != 0 {
+                return Err(Error::Unsupported);
+            }
+            if needs_recovery {
+                check(ffi::ext4_recover(mount_point))?;
+            }
+            check(ffi::ext4_journal_start(mount_point))?;
+            self.journaling = true;
+        }
+        Ok(())
+    }
+
+    /// What's known of inode `inode`; `LWEXT4` is held.
+    fn stat(&self, inode: u32) -> Result<Metadata, Error> {
+        let mut stat = ffi::Stat::default();
+        // Safety: the mount point is NUL-terminated, and `inode` came from
+        // lwext4.
+        check(unsafe { ffi::simplos_ext4_stat(self.mount_point.as_ptr(), inode, &mut stat) })?;
+        let kind = match stat.mode & 0o170000 {
+            0o100000 => Kind::File,
+            0o040000 => Kind::Directory,
+            0o120000 => Kind::Symlink,
+            _ => Kind::Other,
+        };
+        Ok(Metadata {
+            inode,
+            kind,
+            permissions: stat.mode & 0o7777,
+            links: stat.links,
+            uid: stat.uid,
+            gid: stat.gid,
+            size: stat.size,
+            blocks: stat.blocks,
+            accessed: stat.accessed,
+            modified: stat.modified,
+            changed: stat.changed,
+        })
+    }
+}
+
+impl Drop for Mount {
     fn drop(&mut self) {
         let mut slots = LWEXT4.lock();
-        let mount_point = CString::new(self.mount_point.as_str()).unwrap();
+        let mount_point = self.mount_point.as_ptr();
         // Safety: undoes what `attach` did, and only that: lwext4 would
         // unmount a mount that failed, and crash on its half-made state.
         unsafe {
             if self.journaling {
-                ffi::ext4_journal_stop(mount_point.as_ptr());
+                ffi::ext4_journal_stop(mount_point);
             }
             if self.mounted {
-                ffi::ext4_umount(mount_point.as_ptr());
+                ffi::ext4_umount(mount_point);
             }
             if self.registered {
                 ffi::ext4_device_unregister(self.device_name.as_ptr());
@@ -395,41 +466,95 @@ impl Drop for Ext4 {
     }
 }
 
-/// An open file. It borrows its file system, which stays mounted meanwhile.
-pub struct File<'fs> {
-    _fs: &'fs Ext4,
+/// An open directory, with its entries as they were when it was opened.
+pub struct Dir {
+    mount: Arc<Mount>,
+    inode: u32,
+    entries: Vec<DirEntry>,
+}
+
+impl Dir {
+    /// Without `.` and `..`.
+    pub fn entries(&self) -> &[DirEntry] {
+        &self.entries
+    }
+
+    pub fn metadata(&self) -> Result<Metadata, Error> {
+        let _lwext4 = LWEXT4.lock();
+        self.mount.stat(self.inode)
+    }
+}
+
+/// An open file. Reads and writes say where, as `pread` and `pwrite` do:
+/// whoever opened it keeps its own place in it.
+pub struct File {
+    mount: Arc<Mount>,
     raw: *mut ffi::File,
+    inode: u32,
     /// lwext4 would write to a file opened only for reading.
     writable: bool,
 }
 
-impl File<'_> {
-    pub fn size(&self) -> u64 {
+// Safety: as for `Mount`.
+unsafe impl Send for File {}
+unsafe impl Sync for File {}
+
+impl File {
+    pub fn metadata(&self) -> Result<Metadata, Error> {
         let _lwext4 = LWEXT4.lock();
-        // Safety: open until `drop`.
-        unsafe { ffi::ext4_fsize(self.raw) }
+        self.mount.stat(self.inode)
     }
 
-    /// Read from where the last read stopped, into `buf`: how many bytes,
-    /// 0 at the end.
-    pub fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+    pub fn size(&self) -> Result<u64, Error> {
+        Ok(self.metadata()?.size)
+    }
+
+    /// Read into `buf` from `offset` on: how many bytes, 0 at or past the
+    /// end.
+    pub fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, Error> {
         let _lwext4 = LWEXT4.lock();
+        // lwext4 would read on past the end of a file another handle has
+        // made shorter since.
+        if offset >= self.mount.stat(self.inode)?.size {
+            return Ok(0);
+        }
         let mut read = 0;
         // Safety: open until `drop`; `buf` is writable for its length.
-        check(unsafe { ffi::ext4_fread(self.raw, buf.as_mut_ptr().cast(), buf.len(), &mut read) })?;
+        check(unsafe {
+            ffi::simplos_ext4_file_seek(self.raw, offset);
+            ffi::ext4_fread(self.raw, buf.as_mut_ptr().cast(), buf.len(), &mut read)
+        })?;
         Ok(read)
     }
 
-    /// Write `buf` from where the last read or write stopped: how many
-    /// bytes, fewer if the file system fills up.
-    pub fn write(&mut self, buf: &[u8]) -> Result<usize, Error> {
+    /// Write `buf` from `offset` on: how many bytes, fewer if the file
+    /// system fills up. Past the end, the gap is filled with zeros.
+    ///
+    /// shortcut: lwext4 can't leave the gap a hole that takes no space, as
+    /// Linux does; a write far past the end can fill the disk with zeros.
+    pub fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize, Error> {
         if !self.writable {
             return Err(Error::ReadOnly);
         }
         let _lwext4 = LWEXT4.lock();
+        // lwext4 would put what's written past the end at the end.
+        let mut end = self.mount.stat(self.inode)?.size;
+        while end < offset {
+            let zeros = [0; 4096];
+            let gap = (offset - end).min(zeros.len() as u64) as usize;
+            end += self.write_locked(end, &zeros[..gap])? as u64;
+        }
+        self.write_locked(offset, buf)
+    }
+
+    /// `write_at` within the file or at its end; `LWEXT4` is held.
+    fn write_locked(&self, offset: u64, buf: &[u8]) -> Result<usize, Error> {
         let mut written = 0;
         // Safety: open until `drop`; `buf` is readable for its length.
-        check(unsafe { ffi::ext4_fwrite(self.raw, buf.as_ptr().cast(), buf.len(), &mut written) })?;
+        check(unsafe {
+            ffi::simplos_ext4_file_seek(self.raw, offset);
+            ffi::ext4_fwrite(self.raw, buf.as_ptr().cast(), buf.len(), &mut written)
+        })?;
         // lwext4 loses why a write fell short (its `Finish:` overwrites
         // the error); running out of space is the likely reason.
         if written == 0 && !buf.is_empty() {
@@ -437,23 +562,16 @@ impl File<'_> {
         }
         Ok(written)
     }
-
-    /// Make the next read or write start at `offset` from the start of the
-    /// file, which can't be past its end.
-    pub fn seek(&mut self, offset: u64) -> Result<(), Error> {
-        const SEEK_SET: u32 = 0;
-        let offset = i64::try_from(offset).map_err(|_| Error::InvalidArgument)?;
-        let _lwext4 = LWEXT4.lock();
-        // Safety: open until `drop`.
-        check(unsafe { ffi::ext4_fseek(self.raw, offset, SEEK_SET) })
-    }
 }
 
-impl Drop for File<'_> {
+impl Drop for File {
     fn drop(&mut self) {
         let _lwext4 = LWEXT4.lock();
-        // Safety: opened in `Ext4::open`, closed once.
+        // Safety: opened in `Ext4::open_with`, closed once.
         unsafe { ffi::simplos_ext4_file_close(self.raw) };
+        let mut open = self.mount.open.lock();
+        let at = open.iter().position(|inode| *inode == self.inode).expect("it was opened");
+        open.swap_remove(at);
     }
 }
 
@@ -524,6 +642,21 @@ mod ffi {
         _opaque: [u8; 0],
     }
 
+    /// `struct simplos_ext4_stat` in `glue.c`.
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct Stat {
+        pub mode: u32,
+        pub uid: u32,
+        pub gid: u32,
+        pub links: u32,
+        pub size: u64,
+        pub blocks: u64,
+        pub accessed: u32,
+        pub modified: u32,
+        pub changed: u32,
+    }
+
     unsafe extern "C" {
         pub fn simplos_ext4_device_new(device: *mut c_void, sectors: u64) -> *mut BlockDev;
         pub fn simplos_ext4_device_free(device: *mut BlockDev);
@@ -534,7 +667,11 @@ mod ffi {
             flags: c_int,
             error: *mut c_int,
         ) -> *mut File;
+        pub fn simplos_ext4_file_inode(file: *mut File) -> u32;
+        pub fn simplos_ext4_file_seek(file: *mut File, offset: u64);
         pub fn simplos_ext4_file_close(file: *mut File) -> c_int;
+        pub fn simplos_ext4_inode_of(path: *const c_char, inode: *mut u32) -> c_int;
+        pub fn simplos_ext4_stat(mount_point: *const c_char, inode: u32, stat: *mut Stat) -> c_int;
         pub fn simplos_ext4_dir_open(path: *const c_char, error: *mut c_int) -> *mut Dir;
         pub fn simplos_ext4_dir_close(dir: *mut Dir);
         pub fn simplos_ext4_dir_next(
@@ -542,6 +679,7 @@ mod ffi {
             name: *mut c_char,
             capacity: usize,
             kind: *mut u8,
+            inode: *mut u32,
         ) -> c_int;
 
         pub fn ext4_device_register(device: *mut BlockDev, name: *const c_char) -> c_int;
@@ -558,7 +696,6 @@ mod ffi {
         pub fn ext4_dir_mk(path: *const c_char) -> c_int;
         pub fn ext4_fremove(path: *const c_char) -> c_int;
         pub fn ext4_frename(path: *const c_char, new_path: *const c_char) -> c_int;
-        pub fn ext4_mode_get(path: *const c_char, mode: *mut u32) -> c_int;
         pub fn ext4_fread(
             file: *mut File,
             buf: *mut c_void,
@@ -571,7 +708,5 @@ mod ffi {
             size: usize,
             written: *mut usize,
         ) -> c_int;
-        pub fn ext4_fseek(file: *mut File, offset: i64, origin: u32) -> c_int;
-        pub fn ext4_fsize(file: *mut File) -> u64;
     }
 }

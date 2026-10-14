@@ -67,10 +67,10 @@ fn survives_a_crash_at_any_write() {
     let mut hello = String::from("hello.txt");
     let mut removed = String::from("dir/nested/deep.txt");
     for time in ["a", "b"] {
-        let mut fs = Ext4::mount_writable(Box::new(image.clone())).unwrap();
+        let fs = Ext4::mount_writable(Box::new(image.clone())).unwrap();
         fs.create_dir(time).unwrap();
-        let mut file = fs.create(&format!("{time}/new.txt")).unwrap();
-        assert_eq!(file.write(b"new\n").unwrap(), 4);
+        let file = fs.create(&format!("{time}/new.txt")).unwrap();
+        assert_eq!(file.write_at(0, b"new\n").unwrap(), 4);
         drop(file);
         fs.rename(&hello, &format!("{time}/hello.txt")).unwrap();
         hello = format!("{time}/hello.txt");

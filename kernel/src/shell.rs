@@ -29,7 +29,9 @@ commands:
   cat PATH      print a file on the ext4 disk
   info          all of the above
   run [MODE]    run the user program in the ramdisk: hello,
-                sleep [MS], float, bad-calls, fault or exit";
+                sleep [MS], float, bad-calls, fault or exit;
+                on the ext4 disk: cat PATH.., ls PATH, stat PATH,
+                write PATH TEXT, append PATH TEXT";
 
 /// What a key changed, so the caller repaints no more than it has to. Ordered
 /// by how much, so several keys combine with `max`.
@@ -204,14 +206,14 @@ fn ls(path: &str) -> String {
 fn cat(path: &str) -> String {
     let root = fs::ROOT.lock();
     let Some(fs) = root.as_ref() else { return String::from("cat: no ext4 disk") };
-    let mut file = match fs.open(path) {
-        Ok(file) => file,
+    let (file, size) = match fs.open(path).and_then(|file| Ok((file.size()?, file))) {
+        Ok((size, file)) => (file, size),
         Err(error) => return format!("cat: {path}: {error:?}"),
     };
-    let mut contents = vec![0; file.size() as usize];
+    let mut contents = vec![0; size as usize];
     let mut done = 0;
     while done < contents.len() {
-        match file.read(&mut contents[done..]) {
+        match file.read_at(done as u64, &mut contents[done..]) {
             Ok(0) => break,
             Ok(read) => done += read,
             Err(error) => return format!("cat: {path}: {error:?}"),

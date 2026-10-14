@@ -8,6 +8,8 @@
 //! checked against its page tables (`AddressSpace::read` and `write`): a bad
 //! one is EFAULT, never a fault in the kernel.
 
+mod files;
+
 use crate::io::interrupts::gdt;
 use crate::memory::USER_END;
 use crate::process::{self, LOWEST, MMAP_END, MMAP_START, Process, pages};
@@ -133,8 +135,15 @@ extern "sysv64" fn dispatch(frame: &Frame) -> i64 {
 fn call(nr: u64, [a0, a1, a2, a3, _a4, _a5]: [u64; 6]) -> i64 {
     let process = thread::current_process().expect("system calls come from programs");
     match nr {
-        1 => write(&process, a0, a1, a2),
+        0 => files::read(&process, a0, a1, a2),
+        1 => files::write(&process, a0, a1, a2),
+        2 => files::open(&process, files::AT_FDCWD, a0, a1),
+        3 => files::close(&process, a0),
+        // stat and lstat: the same, as no symbolic link is followed yet.
+        4 | 6 => files::newfstatat(&process, files::AT_FDCWD, a0, a1, 0),
+        5 => files::fstat(&process, a0, a1),
         7 => poll(&process, a0, a1),
+        8 => files::lseek(&process, a0, a1, a2),
         9 => mmap(&process, a0, a1, a2, a3),
         10 => mprotect(&process, a0, a1, a2),
         11 => munmap(&process, a0, a1),
@@ -142,19 +151,28 @@ fn call(nr: u64, [a0, a1, a2, a3, _a4, _a5]: [u64; 6]) -> i64 {
         13 => rt_sigaction(&process, a0, a2, a3),
         14 => rt_sigprocmask(&process, a2, a3),
         16 => -ENOTTY,
+        17 => files::pread(&process, a0, a1, a2, a3),
+        18 => files::pwrite(&process, a0, a1, a2, a3),
         35 => clock_nanosleep(&process, CLOCK_MONOTONIC, 0, a0),
         // exit, exit_group: one thread per program, so the same.
         60 | 231 => {
+            files::close_all(&process);
             drop(process);
             process::exit_current((a0 & 0xFF) as i32)
         }
+        72 => files::fcntl(&process, a0, a1, a2),
+        // fsync, fdatasync.
+        74 | 75 => files::fsync(&process, a0),
         131 => sigaltstack(&process, a1),
         158 => arch_prctl(&process, a0, a1),
         // gettid: one thread per program, so its id is the program's.
         186 => process.id as i64,
         // set_tid_address: nothing to clear at exit with one thread per program.
+        217 => files::getdents64(&process, a0, a1, a2),
         218 => process.id as i64,
         230 => clock_nanosleep(&process, a0, a1, a2),
+        257 => files::open(&process, a0, a1, a2),
+        262 => files::newfstatat(&process, a0, a1, a2, a3),
         _ => {
             serial_println!("simplos: process {}: no system call {}", process.id, nr);
             -ENOSYS
@@ -162,26 +180,10 @@ fn call(nr: u64, [a0, a1, a2, a3, _a4, _a5]: [u64; 6]) -> i64 {
     }
 }
 
-/// Standard output and error both go to the program's `output`.
-fn write(process: &Process, fd: u64, buf: u64, len: u64) -> i64 {
-    if fd != 1 && fd != 2 {
-        return -EBADF;
-    }
-    // Writing less than asked is allowed, and keeps a huge `len` from
-    // emptying the kernel's heap.
-    let mut bytes = vec![0; len.min(64 * 1024) as usize];
-    if process.memory.lock().space.read(buf, &mut bytes).is_none() {
-        return -EFAULT;
-    }
-    (process.output.lock())(&bytes);
-    bytes.len() as i64
-}
-
-/// Rust's start-up asks whether descriptors 0-2 are open: they are, and
-/// nothing else is.
+/// Which descriptors are open, which is what Rust's start-up asks of 0-2.
 ///
-/// shortcut: never waits, and never reports anything readable; a real poll
-/// comes with files.
+/// shortcut: never waits, and never reports anything readable or writable;
+/// nothing a program has open can make it wait yet.
 fn poll(process: &Process, fds: u64, count: u64) -> i64 {
     const POLLNVAL: i16 = 0x20;
     if count > 1024 {
@@ -197,7 +199,7 @@ fn poll(process: &Process, fds: u64, count: u64) -> i64 {
     for entry in table.as_chunks_mut::<8>().0 {
         let fd = i32::from_le_bytes(entry[..4].try_into().unwrap());
         // A negative fd is skipped, as poll's caller intends.
-        let revents = if fd < 0 || fd <= 2 { 0 } else { POLLNVAL };
+        let revents = if fd < 0 || files::is_open(process, fd) { 0 } else { POLLNVAL };
         entry[6..].copy_from_slice(&revents.to_le_bytes());
         ready += i64::from(revents != 0);
     }

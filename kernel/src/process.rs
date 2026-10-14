@@ -11,6 +11,7 @@
 //!                        end of the lower half (see `syscall.rs`).
 
 use crate::elf::{self, Elf};
+use crate::fs;
 use crate::io::interrupts::gdt;
 use crate::memory::AddressSpace;
 use crate::thread::{self, WaitQueue};
@@ -59,6 +60,9 @@ pub struct Process {
     exited: WaitQueue,
     /// Where it writes to its standard output and error.
     pub output: Mutex<Output>,
+    /// Its file descriptors, by number; `None` for one that's closed. Taken
+    /// only with interrupts on, by the program's own system calls.
+    pub files: Mutex<Vec<Option<Arc<fs::Handle>>>>,
 }
 
 /// What a program's standard output and error are written to.
@@ -108,6 +112,7 @@ pub fn spawn(
         status: AtomicI32::new(RUNNING),
         exited: WaitQueue::new(),
         output: Mutex::new(Box::new(output)),
+        files: Mutex::new(vec![Some(Arc::new(fs::Handle::Console)); 3]),
     });
     let user = UserState {
         process: process.clone(),
