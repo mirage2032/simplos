@@ -47,11 +47,11 @@ jobs:
           sudo apt-get install --no-install-recommends -y qemu-system-x86
 
       # Honours rust-toolchain.toml, including its components and the
-      # x86_64-unknown-none target. Pull requests only read the cache; a
-      # promotion's run saves it.
+      # x86_64-unknown-none and x86_64-unknown-linux-musl targets. Pull requests
+      # only read the cache; a promotion's run saves it.
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          # There is no workspace: three separate crates with three target
+          # There is no workspace: four separate crates with four target
           # directories, plus the vendored bootloader's own, which the nested
           # `cargo install` runs fill with a rebuilt `core` for two custom
           # 16-bit and 32-bit targets. Leaving that one out doubles the run.
@@ -59,13 +59,14 @@ jobs:
             kernel -> target
             fullkernel -> target
             tools/boot-test -> target
+            user/probe -> target
             vendor/bootloader -> target
           cache-save-if: ${{ github.event_name != 'pull_request' }}
 
       # vendor/ is upstream code with its own style; only what we write.
       - name: Format
         run: |
-          for crate in kernel fullkernel tools/boot-test; do
+          for crate in kernel fullkernel tools/boot-test user/probe; do
             echo "::group::$crate"
             (cd "$crate" && cargo fmt --check)
             echo "::endgroup::"
@@ -76,7 +77,7 @@ jobs:
       # and worth knowing before someone goes looking for why.
       - name: Lint
         run: |
-          for crate in kernel fullkernel tools/boot-test; do
+          for crate in kernel fullkernel tools/boot-test user/probe; do
             echo "::group::$crate"
             (cd "$crate" && cargo clippy --all-targets -- -D warnings)
             echo "::endgroup::"

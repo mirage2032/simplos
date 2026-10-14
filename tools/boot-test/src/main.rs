@@ -76,9 +76,14 @@ fn run(kernel: &Path, firmware: Firmware) -> Result<bool, Box<dyn Error>> {
     // `cargo clean`, and left in place afterwards so a failing test can be
     // booted by hand with the exact image that failed.
     let image = kernel.with_extension(format!("{}.img", name.to_lowercase()));
+    let probe = PathBuf::from(env!("CARGO_BIN_FILE_PROBE_probe"));
     match firmware {
-        Firmware::Bios => bootloader::BiosBoot::new(kernel).create_disk_image(&image)?,
-        Firmware::Uefi => bootloader::UefiBoot::new(kernel).create_disk_image(&image)?,
+        Firmware::Bios => {
+            bootloader::BiosBoot::new(kernel).set_ramdisk(&probe).create_disk_image(&image)?
+        }
+        Firmware::Uefi => {
+            bootloader::UefiBoot::new(kernel).set_ramdisk(&probe).create_disk_image(&image)?
+        }
     }
     // Blank scratch disks for tests/disk.rs to write to, one per controller
     // kind, sized differently so the test can tell which is which. Recreated
