@@ -2,7 +2,7 @@
 //! the ext4 file system or the console.
 
 use super::{EBADF, EFAULT, EINVAL};
-use crate::fs::{self, Handle, ROOT};
+use crate::fs::{self, Handle};
 use crate::pipe;
 use crate::process::Process;
 use alloc::string::String;
@@ -128,30 +128,30 @@ pub fn open(process: &Process, dirfd: u64, path: u64, flags: u64, mode: u64) -> 
         if let Some(device) = fs::device(&path) {
             return install(process, device);
         }
-        let root = ROOT.lock();
-        let fs = root.as_ref().ok_or(ENOENT)?;
-        let found = fs.metadata(&path);
-        let handle = match found {
+        let tree = fs::lock();
+        let handle = match tree.metadata(&path) {
             Ok(Metadata { kind: Kind::Directory, .. }) => {
                 if access != O_RDONLY || flags & O_CREAT != 0 {
                     return Err(EISDIR);
                 }
-                let dir = fs.open_dir(&path).map_err(fs::errno)?;
-                Handle::Dir { dir, path, next: 0.into() }
+                let (dir, entries) = tree.open_dir(&path).map_err(fs::errno)?;
+                Handle::Dir { dir, entries, path, next: 0.into() }
             }
             Ok(_) if flags & O_DIRECTORY != 0 => return Err(ENOTDIR),
             Ok(_) if flags & O_CREAT != 0 && flags & O_EXCL != 0 => return Err(EEXIST),
             Err(ext4::Error::NotFound) if flags & O_CREAT != 0 => {
-                let file = fs.create(&path).map_err(fs::errno)?;
-                fs.set_permissions(&path, permissions(process, mode)).map_err(fs::errno)?;
+                let disk = tree.disk(&path).map_err(fs::errno)?;
+                let file = disk.create(&path).map_err(fs::errno)?;
+                disk.set_permissions(&path, permissions(process, mode)).map_err(fs::errno)?;
                 file_handle(file, access, flags)
             }
             Err(error) => return Err(fs::errno(error)),
             Ok(_) => {
+                let disk = tree.disk(&path).map_err(fs::errno)?;
                 let file = match access {
-                    O_RDONLY => fs.open(&path),
-                    _ if flags & O_TRUNC != 0 => fs.create(&path),
-                    _ => fs.open_writable(&path),
+                    O_RDONLY => disk.open(&path),
+                    _ if flags & O_TRUNC != 0 => disk.create(&path),
+                    _ => disk.open_writable(&path),
                 };
                 file_handle(file.map_err(fs::errno)?, access, flags)
             }
@@ -180,7 +180,7 @@ fn file_handle(file: ext4::File, access: u64, flags: u64) -> Handle {
 
 pub fn close(process: &Process, fd: u64) -> i64 {
     // Closing a file is a call into the file system.
-    let _root = ROOT.lock();
+    let _tree = fs::lock();
     let handle = process.files.lock().get_mut(fd as usize).and_then(Option::take);
     match handle {
         Some(handle) => {
@@ -193,7 +193,7 @@ pub fn close(process: &Process, fd: u64) -> i64 {
 
 /// Close every descriptor, as a program ends.
 pub fn close_all(process: &Process) {
-    let _root = ROOT.lock();
+    let _tree = fs::lock();
     let files = core::mem::take(&mut *process.files.lock());
     drop(files);
 }
@@ -243,7 +243,7 @@ fn read_at(process: &Process, fd: u64, buf: u64, count: u64, at: Option<u64>) ->
         Handle::Dir { .. } => Err(EISDIR),
         Handle::File { read: false, .. } => Err(EBADF),
         Handle::File { file, offset, .. } => {
-            let _root = ROOT.lock();
+            let _tree = fs::lock();
             let from = at.unwrap_or_else(|| offset.load(Relaxed));
             let mut data = vec![0; count];
             let read = file.read_at(from, &mut data).map_err(fs::errno)?;
@@ -274,7 +274,7 @@ fn write_at(process: &Process, fd: u64, buf: u64, count: u64, at: Option<u64>) -
         Handle::Pipe(end) => end.write(&data).map(|written| written as i64).ok_or(EPIPE),
         Handle::Dir { .. } | Handle::File { write: false, .. } => Err(EBADF),
         Handle::File { file, append, offset, .. } => {
-            let _root = ROOT.lock();
+            let _tree = fs::lock();
             // At the end for a file opened to append, even with `pwrite`, as
             // on Linux.
             let to = match (append, at) {
@@ -301,7 +301,7 @@ pub fn lseek(process: &Process, fd: u64, offset: u64, whence: u64) -> i64 {
             Handle::Console | Handle::Pipe(_) => Err(ESPIPE),
             Handle::Null | Handle::Zero => Ok(0),
             Handle::File { file, offset: place, .. } => {
-                let _root = ROOT.lock();
+                let _tree = fs::lock();
                 let from = match whence {
                     SEEK_SET => 0,
                     SEEK_CUR => place.load(Relaxed),
@@ -328,29 +328,12 @@ pub fn lseek(process: &Process, fd: u64, offset: u64, whence: u64) -> i64 {
 
 /// The descriptor's file's metadata.
 fn metadata(handle: &Handle) -> Result<Metadata> {
-    // What isn't on the disk has its type in `permissions`.
-    let special = |mode| Metadata {
-        inode: 0,
-        kind: Kind::Other,
-        permissions: mode,
-        links: 1,
-        uid: 0,
-        gid: 0,
-        size: 0,
-        blocks: 0,
-        accessed: 0,
-        modified: 0,
-        changed: 0,
-    };
-    let _root = ROOT.lock();
+    let tree = fs::lock();
     match handle {
-        // Character devices, as a terminal is.
-        Handle::Console => Ok(special(0o020620)),
-        Handle::Null | Handle::Zero => Ok(special(0o020666)),
-        // A FIFO.
-        Handle::Pipe(_) => Ok(special(0o010600)),
         Handle::File { file, .. } => file.metadata().map_err(fs::errno),
-        Handle::Dir { dir, .. } => dir.metadata().map_err(fs::errno),
+        Handle::Dir { dir: Some(dir), .. } => dir.metadata().map_err(fs::errno),
+        Handle::Dir { path, .. } => tree.metadata(path).map_err(fs::errno),
+        special => Ok(fs::special(special).expect("not on the disk")),
     }
 }
 
@@ -405,14 +388,7 @@ pub fn newfstatat(process: &Process, dirfd: u64, path: u64, buf: u64, flags: u64
             true => String::new(),
             false => lookup(process, dirfd, &path)?,
         };
-        if let Some(device) = fs::device(&path) {
-            return put_stat(process, &metadata(&device)?, buf);
-        }
-        let metadata = {
-            let root = ROOT.lock();
-            let fs = root.as_ref().ok_or(ENOENT)?;
-            fs.metadata(&path).map_err(fs::errno)?
-        };
+        let metadata = fs::lock().metadata(&path).map_err(fs::errno)?;
         put_stat(process, &metadata, buf)
     })())
 }
@@ -422,10 +398,10 @@ pub fn newfstatat(process: &Process, dirfd: u64, path: u64, buf: u64, flags: u64
 pub fn getdents64(process: &Process, fd: u64, buf: u64, count: u64) -> i64 {
     ret((|| {
         let handle = handle(process, fd)?;
-        let Handle::Dir { dir, next, .. } = &*handle else { return Err(ENOTDIR) };
+        let Handle::Dir { entries, next, .. } = &*handle else { return Err(ENOTDIR) };
         let mut out = Vec::new();
         let mut at = next.load(Relaxed);
-        for entry in dir.entries().iter().skip(at) {
+        for entry in entries.iter().skip(at) {
             let name = entry.name.as_bytes();
             // Inode, offset, length and type, then the name and its NUL,
             // padded so the next one starts 8-byte aligned.
@@ -447,7 +423,7 @@ pub fn getdents64(process: &Process, fd: u64, buf: u64, count: u64) -> i64 {
             out.resize(start + length, 0);
             at += 1;
         }
-        if out.is_empty() && at < dir.entries().len() {
+        if out.is_empty() && at < entries.len() {
             // Not even one fits.
             return Err(EINVAL);
         }
@@ -494,10 +470,10 @@ pub fn fcntl(process: &Process, fd: u64, command: u64, arg: u64) -> i64 {
 pub fn mkdirat(process: &Process, dirfd: u64, path: u64, mode: u64) -> i64 {
     ret((|| {
         let path = lookup(process, dirfd, &path_at(process, path)?)?;
-        let root = ROOT.lock();
-        let fs = root.as_ref().ok_or(ENOENT)?;
-        fs.create_dir(&path).map_err(fs::errno)?;
-        fs.set_permissions(&path, permissions(process, mode)).map_err(fs::errno)?;
+        let tree = fs::lock();
+        let disk = tree.disk(&path).map_err(fs::errno)?;
+        disk.create_dir(&path).map_err(fs::errno)?;
+        disk.set_permissions(&path, permissions(process, mode)).map_err(fs::errno)?;
         Ok(0)
     })())
 }
@@ -507,16 +483,16 @@ pub fn unlinkat(process: &Process, dirfd: u64, path: u64, flags: u64) -> i64 {
     ret((|| {
         let name = path_at(process, path)?;
         let path = lookup(process, dirfd, &name)?;
-        let root = ROOT.lock();
-        let fs = root.as_ref().ok_or(ENOENT)?;
+        let tree = fs::lock();
+        let disk = tree.disk(&path).map_err(fs::errno)?;
         let removed = match flags & AT_REMOVEDIR {
-            0 => fs.remove_file(&path),
+            0 => disk.remove_file(&path),
             // `lookup` takes these out, which would remove the wrong
             // directory; Linux refuses them.
             _ => match name.trim_end_matches('/').rsplit('/').next() {
                 Some(".") => return Err(EINVAL),
                 Some("..") => return Err(ENOTEMPTY),
-                _ => fs.remove_dir(&path),
+                _ => disk.remove_dir(&path),
             },
         };
         removed.map_err(fs::errno)?;
@@ -542,12 +518,13 @@ pub fn renameat2(
         }
         let from = lookup(process, from_dirfd, &path_at(process, from)?)?;
         let to = lookup(process, to_dirfd, &path_at(process, to)?)?;
-        let root = ROOT.lock();
-        let fs = root.as_ref().ok_or(ENOENT)?;
-        if flags & RENAME_NOREPLACE != 0 && fs.metadata(&to).is_ok() {
+        let tree = fs::lock();
+        if flags & RENAME_NOREPLACE != 0 && tree.metadata(&to).is_ok() {
             return Err(EEXIST);
         }
-        fs.rename(&from, &to).map_err(fs::errno)?;
+        // Both on the disk: nothing else can be written.
+        tree.disk(&to).map_err(fs::errno)?;
+        tree.disk(&from).map_err(fs::errno)?.rename(&from, &to).map_err(fs::errno)?;
         Ok(0)
     })())
 }
@@ -555,9 +532,7 @@ pub fn renameat2(
 pub fn chdir(process: &Process, path: u64) -> i64 {
     ret((|| {
         let path = lookup(process, AT_FDCWD, &path_at(process, path)?)?;
-        let root = ROOT.lock();
-        let fs = root.as_ref().ok_or(ENOENT)?;
-        if fs.metadata(&path).map_err(fs::errno)?.kind != Kind::Directory {
+        if fs::lock().metadata(&path).map_err(fs::errno)?.kind != Kind::Directory {
             return Err(ENOTDIR);
         }
         *process.cwd.lock() = path;
@@ -633,7 +608,7 @@ pub fn dup3(process: &Process, fd: u64, to: u64, flags: u64, dup2: bool) -> i64 
             return Err(EBADF);
         }
         // Closing what was there is a call into the file system.
-        let _root = ROOT.lock();
+        let _tree = fs::lock();
         let replaced = {
             let mut files = process.files.lock();
             if to >= files.len() {

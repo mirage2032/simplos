@@ -80,8 +80,15 @@ NVMe isn't supported, and on many real PCs that is where the disk is.
 
 The kernel mounts the first disk holding an ext4 (or ext3, or ext2) file
 system to read and write, replaying its journal first if it wasn't unmounted
-cleanly, and the shell's `ls` and `cat` show what's on it. To try it, make one
-from a directory and attach it:
+cleanly, as the root of every path; with no such disk, the root is an empty
+directory that can't be written. Either way, `/dev` holds `null`, `zero` and
+`tty`, mounted over whatever the disk has there, as on Linux. The shell's `ls`
+and `cat` show what's there.
+
+`cargo run` attaches `fullkernel/disk.img`, which it makes the first time
+with e2fsprogs' `mke2fs` and keeps, so what's written to it is there next
+time; delete it to start afresh. To use a disk of your own, make one from a
+directory and attach it, and the kernel finds it first:
 
 ```sh
 mkdir -p tree && echo hello > tree/hello.txt
@@ -108,7 +115,7 @@ has the user program read it, and `run` lists its other modes. For now:
 - a file that's open can't be removed or renamed over (`EBUSY`);
 - pipes always wait (no `O_NONBLOCK`), and writing to one nobody reads is
   `EPIPE` without `SIGPIPE`, as there are no signals yet;
-- `/dev` holds just those three, and can't be listed;
+- `/dev` holds just those three, and can't be written;
 - standard input is always at its end, and close-on-exec means nothing until
   there's an `execve`.
 

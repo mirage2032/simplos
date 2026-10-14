@@ -114,7 +114,7 @@ fn failed(path: &str, error: &str) -> (i32, String) {
 #[test_case]
 fn a_program_reads_files_and_lists_directories() {
     assert_eq!(run(&["cat", "/hello.txt", "/dir/nested/deep.txt"]), ok("hello from ext4\ndeep\n"));
-    assert_eq!(run(&["ls", "/"]), ok("dir/\nhello.txt\nlost+found/\n"));
+    assert_eq!(run(&["ls", "/"]), ok("dev/\ndir/\nhello.txt\nlost+found/\n"));
     assert_eq!(run(&["ls", "/dir/nested"]), ok("deep.txt\n"));
     // Relative to the working directory, the root; and the long way round.
     assert_eq!(run(&["cat", "hello.txt"]), ok("hello from ext4\n"));
@@ -242,7 +242,7 @@ fn a_program_makes_and_removes_directories() {
     // unlinkat, each relative to the directory above.
     assert_eq!(run(&["write", "/made/a/b/again.txt", "x"]), ok(""));
     assert_eq!(run(&["rm-r", "/made"]), ok(""));
-    assert_eq!(run(&["ls", "/"]), ok("dir/\nhello.txt\nlost+found/\n"));
+    assert_eq!(run(&["ls", "/"]), ok("dev/\ndir/\nhello.txt\nlost+found/\n"));
 }
 
 #[test_case]
@@ -355,4 +355,43 @@ fn bad_pipe_calls_are_refused() {
     // EBADF for a descriptor that isn't open and one past the most there can
     // be, EFAULT for ends to go in the kernel's half, EINVAL for O_NONBLOCK.
     assert_eq!(run(&["bad-pipes"]), ok("-9 -9 -14 -22\n"));
+}
+
+#[test_case]
+fn the_devices_are_in_dev() {
+    // Wherever the disk has it or not: mounted over it, as on Linux.
+    assert_eq!(run(&["ls", "/dev"]), ok("null\ntty\nzero\n"));
+    assert_eq!(run(&["stat", "/dev"]), ok("0 dir 755\n0 dir 755\n"));
+    assert_eq!(run(&["cd", "/dev", "null"]), ok("/dev\n"));
+    assert_eq!(run(&["cd", "/dev/..", "hello.txt"]), ok("/\nhello from ext4\n"));
+    // Nothing to make, remove or move there.
+    let read_only = "Read-only file system (os error 30)";
+    assert_eq!(run(&["mkdir", "/dev/new"]), failed("/dev/new", read_only));
+    assert_eq!(run(&["rm", "/dev/null"]), failed("/dev/null", read_only));
+    assert_eq!(run(&["write", "/dev/new", "x"]), failed("/dev/new", read_only));
+    assert_eq!(run(&["mv", "/hello.txt", "/dev/hello.txt"]), failed("/hello.txt", read_only));
+}
+
+#[test_case]
+fn without_a_disk_there_is_still_a_root() {
+    fs::unmount();
+    // All of it before the disk goes back, whatever it says.
+    let seen = [
+        run(&["ls", "/"]),
+        run(&["stat", "/"]),
+        run(&["cat", "/dev/null"]),
+        run(&["cat", "/hello.txt"]),
+        run(&["write", "/new.txt", "x"]),
+    ];
+    fs::init();
+    assert_eq!(
+        seen,
+        [
+            ok("dev/\n"),
+            ok("0 dir 755\n0 dir 755\n"),
+            ok(""),
+            failed("/hello.txt", "No such file or directory (os error 2)"),
+            failed("/new.txt", "Read-only file system (os error 30)"),
+        ]
+    );
 }
