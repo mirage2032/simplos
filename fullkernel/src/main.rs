@@ -5,8 +5,12 @@
 //! gdb server is always on). Anything else is passed through to QEMU, so
 //! `cargo run -- -fw_cfg name=opt/simplos/fb,string=1024x768` asks the kernel
 //! for a smaller framebuffer without rebuilding it.
+//!
+//! An ext4 disk goes with it, `disk.img` here, made the first time and kept,
+//! so what's written to it is there next time; delete it to start afresh.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 fn main() {
     // Set by the build script, which creates both images.
@@ -39,6 +43,11 @@ fn main() {
         }
     });
 
+    // After any of the caller's, whose ext4 disk the kernel then finds first.
+    if let Some(disk) = disk() {
+        cmd.arg("-drive").arg(format!("format=raw,file={}", disk.display()));
+    }
+
     // KVM when the host can give it to us, software emulation when it can't —
     // CI runners and containers have no `/dev/kvm`, and hardcoding `-accel kvm`
     // made `cargo run` fail outright there. `-cpu host` only means anything with
@@ -60,4 +69,38 @@ fn main() {
 
     let mut child = cmd.spawn().unwrap();
     child.wait().unwrap();
+}
+
+/// The ext4 disk to attach: `disk.img`, made with e2fsprogs' mke2fs if it
+/// isn't there yet. None, with a note, if it can't be.
+fn disk() -> Option<PathBuf> {
+    let here = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let image = here.join("disk.img");
+    if image.exists() {
+        return Some(image);
+    }
+    let tree = here.join("target/disk-tree");
+    std::fs::create_dir_all(&tree).ok()?;
+    std::fs::write(tree.join("hello.txt"), "hello from the ext4 disk\n").ok()?;
+    // Where Linux and Homebrew put it: often not on PATH.
+    let mke2fs = [
+        "/usr/sbin/mke2fs",
+        "/opt/homebrew/opt/e2fsprogs/sbin/mke2fs",
+        "/usr/local/opt/e2fsprogs/sbin/mke2fs",
+    ]
+    .into_iter()
+    .find(|path| Path::new(path).exists())
+    .unwrap_or("mke2fs");
+    let made = Command::new(mke2fs)
+        .args(["-q", "-t", "ext4", "-d"])
+        .arg(&tree)
+        .arg(&image)
+        .arg("64M")
+        .stdout(Stdio::null())
+        .status();
+    if made.is_ok_and(|status| status.success()) {
+        return Some(image);
+    }
+    eprintln!("note: no ext4 disk: couldn't make {} with mke2fs (e2fsprogs)", image.display());
+    None
 }

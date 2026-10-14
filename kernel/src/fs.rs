@@ -1,17 +1,18 @@
-//! File systems. For now that's one: the first ext4 disk found, mounted to
-//! read and write by [`init`], as the root of every path.
+//! File systems, as one tree: at the root, the first ext4 disk found, mounted
+//! to read and write by [`init`], or with no disk an empty directory that
+//! can't be written; and at /dev, the devices.
 //!
-//! Every call into it, through a path or through an open file, holds
-//! [`ROOT`]'s lock, and whoever waits for it sleeps.
+//! Every call into them, through a path or through an open file, holds
+//! [`ROOT`]'s lock ([`lock`]), and whoever waits for it sleeps.
 
 use crate::io::disk;
 use crate::serial_println;
-use crate::thread::SleepLock;
+use crate::thread::{SleepLock, SleepLockGuard};
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, AtomicUsize};
-use ext4::{BlockDevice, Ext4};
+use ext4::{BlockDevice, DirEntry, Error, Ext4, Kind, Metadata};
 
 /// The mounted file system, if a disk had one. Calls into it can wait on the
 /// disk for a long time, so whoever waits for them sleeps.
@@ -75,7 +76,10 @@ pub enum Handle {
         offset: AtomicU64,
     },
     Dir {
-        dir: ext4::Dir,
+        /// The disk's handle on it, if it's on the disk.
+        dir: Option<ext4::Dir>,
+        /// As they were when it was opened, with what's mounted in it.
+        entries: Vec<DirEntry>,
         /// From the root, for paths relative to it (`openat` and the like).
         path: String,
         /// The next entry `getdents64` hands out.
@@ -83,16 +87,137 @@ pub enum Handle {
     },
 }
 
-/// The device at `path`, a path from the root, if it's one.
+/// What's in /dev: each device's name and inode number. The numbers are
+/// ones ext4 keeps for itself and never shows (its bad-blocks list, quotas
+/// and boot loader), so no file on the disk has them.
 ///
-/// shortcut: just these three, which programs open by name; /dev can't be
-/// listed, and device nodes on the disk aren't looked at.
+/// shortcut: just these three; device nodes on the disk aren't looked at.
+const DEVICES: [(&str, u32); 3] = [("null", 3), ("tty", 4), ("zero", 5)];
+/// /dev's own.
+const DEV_INODE: u32 = 1;
+
+/// The device at `path`, a path from the root, if it's one.
 pub fn device(path: &str) -> Option<Handle> {
-    match path {
-        "dev/null" => Some(Handle::Null),
-        "dev/zero" => Some(Handle::Zero),
-        "dev/tty" => Some(Handle::Console),
+    match on(path) {
+        On::Devices("null") => Some(Handle::Null),
+        On::Devices("zero") => Some(Handle::Zero),
+        On::Devices("tty") => Some(Handle::Console),
         _ => None,
+    }
+}
+
+/// What a handle that isn't a file on the disk is, as `stat` tells it. Its
+/// type goes in `permissions`, as ext4's `Kind` has nothing for it.
+pub fn special(handle: &Handle) -> Option<Metadata> {
+    let (inode, mode) = match handle {
+        // Character devices, as a terminal is.
+        Handle::Console => (4, 0o020620),
+        Handle::Null => (3, 0o020666),
+        Handle::Zero => (5, 0o020666),
+        // A FIFO.
+        Handle::Pipe(_) => (0, 0o010600),
+        Handle::File { .. } | Handle::Dir { .. } => return None,
+    };
+    Some(Metadata { kind: Kind::Other, links: 1, ..directory(inode, mode) })
+}
+
+/// A directory that isn't on the disk.
+fn directory(inode: u32, permissions: u32) -> Metadata {
+    Metadata {
+        inode,
+        kind: Kind::Directory,
+        permissions,
+        links: 2,
+        uid: 0,
+        gid: 0,
+        size: 0,
+        blocks: 0,
+        accessed: 0,
+        modified: 0,
+        changed: 0,
+    }
+}
+
+/// Which file system a path from the root is on: the devices, with the
+/// name within /dev ("" for /dev itself), or else the disk.
+enum On<'p> {
+    Devices(&'p str),
+    Disk,
+}
+
+fn on(path: &str) -> On<'_> {
+    match path.strip_prefix("dev") {
+        Some("") => On::Devices(""),
+        Some(rest) => rest.strip_prefix('/').map_or(On::Disk, On::Devices),
+        None => On::Disk,
+    }
+}
+
+/// The whole tree, held: every call into a file system holds it, so that
+/// what a system call looks at stays as it was while it acts on it.
+pub fn lock() -> Tree<'static> {
+    Tree { disk: ROOT.lock() }
+}
+
+pub struct Tree<'a> {
+    disk: SleepLockGuard<'a, Option<Ext4>>,
+}
+
+impl Tree<'_> {
+    /// What's at `path`, a path from the root.
+    pub fn metadata(&self, path: &str) -> Result<Metadata, Error> {
+        match on(path) {
+            On::Devices("") => Ok(directory(DEV_INODE, 0o755)),
+            On::Devices(_) => {
+                device(path).and_then(|device| special(&device)).ok_or(Error::NotFound)
+            }
+            On::Disk => match self.disk.as_ref() {
+                Some(disk) => disk.metadata(path),
+                // The empty root, with ext4's root's inode number.
+                None if path.is_empty() => Ok(directory(2, 0o755)),
+                None => Err(Error::NotFound),
+            },
+        }
+    }
+
+    /// The directory at `path`: the disk's handle on it if it's on the disk,
+    /// and what's in it, with whatever is mounted there.
+    pub fn open_dir(&self, path: &str) -> Result<(Option<ext4::Dir>, Vec<DirEntry>), Error> {
+        let (dir, mut entries) = match on(path) {
+            On::Devices("") => {
+                let entry = |(name, inode): (&str, u32)| DirEntry {
+                    name: name.into(),
+                    kind: Kind::Other,
+                    inode,
+                };
+                (None, DEVICES.into_iter().map(entry).collect())
+            }
+            On::Devices(_) => {
+                return Err(self.metadata(path).err().unwrap_or(Error::NotADirectory));
+            }
+            On::Disk => match self.disk.as_ref() {
+                Some(disk) => {
+                    let dir = disk.open_dir(path)?;
+                    let entries = dir.entries().to_vec();
+                    (Some(dir), entries)
+                }
+                None if path.is_empty() => (None, Vec::new()),
+                None => return Err(Error::NotFound),
+            },
+        };
+        if path.is_empty() && !entries.iter().any(|entry| entry.name == "dev") {
+            entries.push(DirEntry { name: "dev".into(), kind: Kind::Directory, inode: DEV_INODE });
+        }
+        Ok((dir, entries))
+    }
+
+    /// The disk, for what only it can do: making, changing and removing
+    /// files. Neither /dev nor the root without a disk can be written.
+    pub fn disk(&self, path: &str) -> Result<&Ext4, Error> {
+        match on(path) {
+            On::Devices(_) => Err(Error::ReadOnly),
+            On::Disk => self.disk.as_ref().ok_or(Error::ReadOnly),
+        }
     }
 }
 
@@ -137,6 +262,14 @@ pub fn errno(error: ext4::Error) -> i64 {
         Unsupported => 95,
         Other(errno) => errno.into(),
     }
+}
+
+#[test_case]
+fn paths_go_to_the_file_system_they_are_on() {
+    assert!(matches!(on("dev"), On::Devices("")));
+    assert!(matches!(on("dev/null"), On::Devices("null")));
+    assert!(matches!(on("devices/x"), On::Disk));
+    assert!(matches!(on(""), On::Disk));
 }
 
 #[test_case]

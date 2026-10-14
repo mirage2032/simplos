@@ -25,7 +25,7 @@ commands:
   time          RTC time (unix seconds)
   uptime        timer ticks and HPET time since boot
   disks         disks found at boot
-  ls [PATH]     list a directory on the ext4 disk
+  ls [PATH]     list a directory: the ext4 disk's, or /dev
   cat PATH      print a file on the ext4 disk
   info          all of the above
   run [MODE]    run the user program in the ramdisk: hello,
@@ -183,14 +183,11 @@ fn disks() -> String {
     out
 }
 
-/// The entries of the directory at `path` on the ext4 disk, sorted, with a
-/// `/` after each directory's name.
+/// The entries of the directory at `path`, sorted, with a `/` after each
+/// directory's name.
 fn ls(path: &str) -> String {
-    let root = fs::ROOT.lock();
-    let Some(fs) = root.as_ref() else { return String::from("ls: no ext4 disk") };
-    let path = if path.is_empty() { "/" } else { path };
-    match fs.read_dir(path) {
-        Ok(mut entries) => {
+    match fs::lock().open_dir(&fs::resolve("", path)) {
+        Ok((_, mut entries)) => {
             entries.sort_by(|a, b| a.name.cmp(&b.name));
             let names = entries.into_iter().map(|entry| match entry.kind {
                 ext4::Kind::Directory => entry.name + "/",
@@ -202,11 +199,18 @@ fn ls(path: &str) -> String {
     }
 }
 
-/// The file at `path` on the ext4 disk, as text.
+/// The file at `path`, as text: a file on the disk, as there's nothing to
+/// read in the devices.
 fn cat(path: &str) -> String {
-    let root = fs::ROOT.lock();
-    let Some(fs) = root.as_ref() else { return String::from("cat: no ext4 disk") };
-    let (file, size) = match fs.open(path).and_then(|file| Ok((file.size()?, file))) {
+    let tree = fs::lock();
+    let at = fs::resolve("", path);
+    let file = match tree.metadata(&at).map(|metadata| metadata.kind) {
+        Ok(ext4::Kind::File) => tree.disk(&at).and_then(|disk| disk.open(&at)),
+        Ok(ext4::Kind::Directory) => Err(ext4::Error::IsADirectory),
+        Ok(_) => Err(ext4::Error::Unsupported),
+        Err(error) => Err(error),
+    };
+    let (file, size) = match file.and_then(|file| Ok((file.size()?, file))) {
         Ok((size, file)) => (file, size),
         Err(error) => return format!("cat: {path}: {error:?}"),
     };
@@ -285,7 +289,14 @@ fn ls_and_cat_show_the_ext4_disk() {
     // The disk tools/boot-test attaches: hello.txt and dir/nested/deep.txt.
     let mut shell = Shell::new(10, 80);
     typed(&mut shell, "ls\n");
-    assert_eq!(shell.history[shell.history.len() - 3..], ["dir/", "hello.txt", "lost+found/"]);
+    assert_eq!(
+        shell.history[shell.history.len() - 4..],
+        ["dev/", "dir/", "hello.txt", "lost+found/"]
+    );
+    typed(&mut shell, "ls /dev\n");
+    assert_eq!(shell.history[shell.history.len() - 3..], ["null", "tty", "zero"]);
+    typed(&mut shell, "cat /dev/null\n");
+    assert_eq!(shell.history.last().unwrap(), "cat: /dev/null: Unsupported");
     typed(&mut shell, "ls dir/nested\n");
     assert_eq!(shell.history.last().unwrap(), "deep.txt");
     typed(&mut shell, "cat hello.txt\n");

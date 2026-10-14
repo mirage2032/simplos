@@ -9,3 +9,6 @@ vendor/bootloader/target
 
 # Release images, produced by scripts/build-images.sh.
 /dist
+
+# The ext4 disk `cargo run` makes and keeps, which is the user's.
+/fullkernel/disk.img
