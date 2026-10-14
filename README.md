@@ -109,7 +109,7 @@ the right firmware and the right framebuffer mode.
 | `user/probe/` | a user program: ordinary Rust with `std`, built for Linux (static musl). Both images and every test boot carry it as the bootloader's ramdisk, and the shell's `run` runs it. |
 | `vendor/bootloader/` | [rust-osdev/bootloader](https://github.com/rust-osdev/bootloader) 0.11.17, vendored and patched. |
 | `vendor/ps2/` | the `ps2` crate, with its `x86_64` dependency bumped. |
-| `fs/ext4/` | ext4 (and ext3 and ext2) file systems: a Rust interface over the vendored lwext4, tested on the host against images made by e2fsprogs. |
+| `fs/ext4/` | ext4 (and ext3 and ext2) file systems, read and written with a journal: a Rust interface over the vendored lwext4, tested on the host against e2fsprogs. |
 | `vendor/lwext4/` | [lwext4](https://github.com/gkostka/lwext4), the C library `fs/ext4` uses for now. |
 | `scripts/` | `build-images.sh`, `smoke-test.sh`, `boot-test.sh`. |
 
@@ -123,17 +123,50 @@ be added to the others that need it.
 ### The vendored lwext4
 
 `vendor/lwext4` is upstream [lwext4](https://github.com/gkostka/lwext4) at
-commit `58bcf89` (2022-09-22), unchanged: its `src/` and `include/` without the
-mkfs and MBR code, which nothing uses. It is GPL-2.0 (its extents and xattr
-code are "GPL-2.0 or later"), like simplos.
+commit `58bcf89` (2022-09-22): its `src/` and `include/` without the mkfs and
+MBR code, which nothing uses. It is GPL-2.0 (its extents and xattr code are
+"GPL-2.0 or later"), like simplos. It has four local fixes, each marked
+`LOCAL PATCH` in the source, all found by `fs/ext4`'s tests:
+
+- **`src/ext4.c`, renaming a directory** — the block holding its `..` entry
+  was changed without its checksum, which e2fsck then finds wrong on any file
+  system with metadata checksums, as Linux makes them by default.
+- **`src/ext4_dir_idx.c`, making a directory** — part of its first block was
+  set after the block's checksum was taken, from memory not yet set: the
+  checksum was wrong whenever that memory wasn't zero.
+- **`src/ext4.c`, removing a file** — the file was emptied in one transaction
+  and unlinked in the next, so a crash in between left it there, empty. Now
+  emptying it (up to 16 MiB, which is one step) is part of the unlinking's
+  transaction.
+- **`src/ext4_journal.c`, unmounting** — the journal is now marked empty
+  before the file system is marked as not needing it, not after: a crash in
+  between left a clean file system with a full journal. And the journal's
+  sequence number carries on rather than going back to 0, which let
+  transactions left from one mount pass for the next mount's, so that a crash
+  replayed old blocks over new ones.
 
 `fs/ext4` compiles it with the host's C compiler and a few settings in its
 `build.rs`: no debug `printf`, lwext4's own errno values, and `malloc` and
 friends from Rust's allocator. Nothing outside `fs/ext4` sees it, so it can be
-replaced by Rust code without touching the rest. Two of its habits are handled
-there rather than patched: it mounts a file system whose journal still needs
-replaying as if it were clean, and unmounting after a failed mount crashes.
-Building `fs/ext4`'s tests needs e2fsprogs (`mke2fs`, `debugfs`) installed.
+replaced by Rust code without touching the rest. Its habits that differ from
+Linux's are handled there rather than patched: it would mount a file system
+whose journal needs replaying as if it were clean, make the missing
+directories on the way to a new file, say nothing to making a directory that's
+there or unlinking a directory, move a directory into itself, write to a file
+opened for reading, quietly mount read-only what it can't write, and crash
+unmounting after a failed mount.
+
+What it still can't do: rename onto a name that's there (refused, where Linux
+replaces it), remove a file over 16 MiB in one transaction, set timestamps,
+or seek past the end of a file. Every change is written through to the
+device before the call returns, which is simple and slow.
+
+Building and running `fs/ext4`'s tests needs e2fsprogs (`mke2fs`, `e2fsck`,
+`debugfs`) and `gzip`. Every test that writes ends with `e2fsck -fn` on the
+result. `tests/journal.rs` replays `tests/linux-crash.img.gz`, a disk Linux's
+own ext4 driver left with changes still in its journal (`tests/linux-crash.sh`,
+run as root, makes it again), and cuts the power at every write a run of
+changes makes, checking that both e2fsck and `fs/ext4` recover from each.
 
 ### The vendored bootloader
 

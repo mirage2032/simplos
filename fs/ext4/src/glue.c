@@ -69,14 +69,16 @@ void simplos_ext4_device_free(struct ext4_blockdev *bd)
 	ext4_free(bd);
 }
 
-ext4_file *simplos_ext4_file_open(const char *path, const char *flags, int *error)
+/* `flags` are open(2)'s, which lwext4 shares. ext4_fopen2, unlike ext4_fopen,
+ * journals the file's creation. */
+ext4_file *simplos_ext4_file_open(const char *path, int flags, int *error)
 {
 	ext4_file *file = ext4_calloc(1, sizeof(*file));
 	if (!file) {
 		*error = ENOMEM;
 		return NULL;
 	}
-	*error = ext4_fopen(file, path, flags);
+	*error = ext4_fopen2(file, path, flags);
 	if (*error != EOK) {
 		ext4_free(file);
 		return NULL;
@@ -133,4 +135,15 @@ int simplos_ext4_needs_recovery(const char *mount_point)
 	if (ext4_get_sblock(mount_point, &sb) != EOK)
 		return 1;
 	return ext4_sb_feature_incom(sb, EXT4_FINCOM_RECOVER) ? 1 : 0;
+}
+
+/* Whether the file system has a read-only compatible feature lwext4 doesn't
+ * know, which it can read but not write: asked to mount such a file system
+ * read-write, lwext4 quietly mounts it read-only. */
+int simplos_ext4_read_only(const char *mount_point)
+{
+	struct ext4_sblock *sb;
+	if (ext4_get_sblock(mount_point, &sb) != EOK)
+		return 1;
+	return (ext4_get32(sb, features_read_only) & ~CONFIG_SUPPORTED_FRO_COM) != 0;
 }

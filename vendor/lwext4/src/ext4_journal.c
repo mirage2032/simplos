@@ -1430,6 +1430,18 @@ int jbd_journal_stop(struct jbd_journal *journal)
 			 DBG_WARN "There are still block records "
 			 	  "in this journal session!\n");
 
+	/* LOCAL PATCH: the journal is marked empty before the file system is
+	 * marked as not needing it, as Linux does; the other way round, a
+	 * crash in between leaves a clean file system with a full journal.
+	 * And its sequence carries on, rather than starting again at 0: the
+	 * transactions left in it would pass for the next mount's. */
+	journal->start = 0;
+	journal->trans_id = journal->alloc_trans_id;
+	jbd_journal_write_sb(journal);
+	r = jbd_write_sb(journal->jbd_fs);
+	if (r != EOK)
+		return r;
+
 	features_incompatible =
 		ext4_get32(&jbd_fs->inode_ref.fs->sb,
 			   features_incompatible);
@@ -1437,15 +1449,8 @@ int jbd_journal_stop(struct jbd_journal *journal)
 	ext4_set32(&jbd_fs->inode_ref.fs->sb,
 			features_incompatible,
 			features_incompatible);
-	r = ext4_sb_write(jbd_fs->bdev,
+	return ext4_sb_write(jbd_fs->bdev,
 			&jbd_fs->inode_ref.fs->sb);
-	if (r != EOK)
-		return r;
-
-	journal->start = 0;
-	journal->trans_id = 0;
-	jbd_journal_write_sb(journal);
-	return jbd_write_sb(journal->jbd_fs);
 }
 
 /**@brief  Allocate a block in the journal.
