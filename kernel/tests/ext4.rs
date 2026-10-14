@@ -71,6 +71,7 @@ fn reads_what_linux_wrote() {
     assert_eq!(
         names,
         [
+            ("bin".into(), Kind::Directory),
             ("dir".into(), Kind::Directory),
             ("hello.txt".into(), Kind::File),
             ("lost+found".into(), Kind::Directory)

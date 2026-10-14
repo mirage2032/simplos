@@ -1,6 +1,8 @@
 //! User programs: Linux x86-64 executables, run in ring 3 in an address space
 //! of their own. Each runs on one thread, whose system calls `syscall.rs`
-//! handles, and which a fault ends without touching anything else.
+//! handles, and which a fault ends without touching anything else. A program
+//! can copy itself (`fork`), replace itself with another (`exec`), and wait
+//! for the copies it made to end.
 //!
 //! The lower half of a program's address space:
 //!
@@ -17,12 +19,13 @@ use crate::memory::AddressSpace;
 use crate::thread::{self, WaitQueue};
 use alloc::boxed::Box;
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 use spin::Mutex;
 use x86_64::VirtAddr;
+use x86_64::instructions::interrupts;
 use x86_64::registers::control::{Cr0, Cr0Flags, Cr3, Cr3Flags, Cr4, Cr4Flags};
 use x86_64::registers::model_specific::FsBase;
 use x86_64::structures::paging::page::PageRange;
@@ -44,31 +47,59 @@ pub const MMAP_END: u64 = STACK_TOP - STACK_SIZE - 0x10_0000;
 /// What `status` holds until the program ends.
 const RUNNING: i32 = i32::MIN;
 
-/// Exit statuses for programs a fault ended, as a shell reports them: 128 plus
-/// the signal Linux would have sent.
-pub const KILLED_SIGSEGV: i32 = 128 + 11;
-pub const KILLED_SIGILL: i32 = 128 + 4;
-pub const KILLED_SIGFPE: i32 = 128 + 8;
-pub const KILLED_SIGTRAP: i32 = 128 + 5;
-pub const KILLED_SIGBUS: i32 = 128 + 7;
+/// The signals Linux would send for a fault, which end a program here.
+pub const SIGILL: i32 = 4;
+pub const SIGTRAP: i32 = 5;
+pub const SIGBUS: i32 = 7;
+pub const SIGFPE: i32 = 8;
+pub const SIGSEGV: i32 = 11;
+
+/// The exit status of a program a segmentation fault ended, as a shell
+/// reports it: 128 plus the signal.
+pub const KILLED_SIGSEGV: i32 = 128 + SIGSEGV;
+
+/// Why a program couldn't be loaded, for the system call's errno.
+pub const NO_MEMORY: &str = "out of memory";
+pub const TOO_LONG: &str = "arguments too long for the stack";
 
 pub struct Process {
     pub id: u64,
-    pml4: PhysFrame,
     /// Taken only with interrupts on, by the program's own system calls.
     pub memory: Mutex<Memory>,
+    /// `RUNNING`, then how it ended, as `wait4` reports it: what it passed
+    /// to `exit` shifted up a byte, or the signal that ended it.
     status: AtomicI32,
     exited: WaitQueue,
-    /// Where it writes to its standard output and error.
-    pub output: Mutex<Output>,
+    /// Where it writes to its standard output and error, shared with the
+    /// programs it starts.
+    pub output: Arc<Mutex<Output>>,
     /// Its file descriptors, by number; `None` for one that's closed. Taken
     /// only with interrupts on, by the program's own system calls.
-    pub files: Mutex<Vec<Option<Arc<fs::Handle>>>>,
+    pub files: Mutex<Vec<Option<Fd>>>,
     /// Where its relative paths start: a path from the root, without the
     /// leading slash, as `fs::resolve` makes them.
     pub cwd: Mutex<String>,
     /// The permission bits taken off what it creates.
     pub umask: AtomicU32,
+    /// The program it's a copy of; none for one the kernel started.
+    parent: Weak<Process>,
+    /// The copies it made that it hasn't waited for, ended or not. Taken only
+    /// with interrupts off, as `wait4` looks at them from
+    /// `WaitQueue::wait_until`.
+    ///
+    /// shortcut: one that ends keeps its memory until it's waited for, and
+    /// those never waited for go with their parent rather than to an init.
+    pub children: Mutex<Vec<Arc<Process>>>,
+    /// Woken as each of them ends.
+    pub child_exited: WaitQueue,
+}
+
+/// A file descriptor: what it refers to, shared with its copies, and whether
+/// `exec` closes it.
+#[derive(Clone)]
+pub struct Fd {
+    pub handle: Arc<fs::Handle>,
+    pub cloexec: bool,
 }
 
 /// What a program's standard output and error are written to.
@@ -84,13 +115,30 @@ pub struct Memory {
 }
 
 impl Process {
-    /// Block until the program ends, and return its exit status: what it
-    /// passed to `exit`, or 128 plus a signal number if a fault ended it.
+    /// Block until the program ends, and return its exit status as a shell
+    /// reports it: what it passed to `exit`, or 128 plus the signal that
+    /// ended it.
     pub fn wait(&self) -> i32 {
-        self.exited.wait_until(|| self.status.load(Ordering::Acquire) != RUNNING);
-        self.status.load(Ordering::Acquire)
+        self.exited.wait_until(|| self.ended().is_some());
+        let status = self.ended().expect("it ended");
+        match status & 0x7F {
+            0 => status >> 8,
+            signal => 128 + signal,
+        }
+    }
+
+    /// How it ended, as `wait4` reports it, if it has.
+    pub fn ended(&self) -> Option<i32> {
+        Some(self.status.load(Ordering::Acquire)).filter(|&status| status != RUNNING)
+    }
+
+    /// Its parent's id; 0 if it has none.
+    pub fn parent_id(&self) -> u64 {
+        self.parent.upgrade().map_or(0, |parent| parent.id)
     }
 }
+
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Load `elf` into a new address space and start it on a thread of its own,
 /// with `args` as its arguments (the first being its name, by convention).
@@ -111,31 +159,27 @@ pub fn spawn_with(
     output: impl FnMut(&[u8]) + Send + 'static,
     files: Vec<Option<Arc<fs::Handle>>>,
 ) -> Result<Arc<Process>, &'static str> {
-    const NO_MEMORY: &str = "out of memory";
-    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-
-    let mut space = AddressSpace::new().ok_or(NO_MEMORY)?;
-    let image = load(&mut space, elf)?;
-    let rsp = build_stack(&mut space, args, &image)?;
+    let args: Vec<&[u8]> = args.iter().map(|arg| arg.as_bytes()).collect();
+    let (memory, start) = program(elf, &args, &[])?;
+    let pml4 = memory.space.pml4();
+    let files = files.into_iter().map(|file| file.map(|handle| Fd { handle, cloexec: false }));
     let process = Arc::new(Process {
         id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
-        pml4: space.pml4(),
-        memory: Mutex::new(Memory {
-            space,
-            brk_start: image.end,
-            brk: image.end,
-            mmap_next: MMAP_START,
-        }),
+        memory: Mutex::new(memory),
         status: AtomicI32::new(RUNNING),
         exited: WaitQueue::new(),
-        output: Mutex::new(Box::new(output)),
-        files: Mutex::new(files),
+        output: Arc::new(Mutex::new(Box::new(output))),
+        files: Mutex::new(files.collect()),
         cwd: Mutex::new(String::new()),
         umask: AtomicU32::new(0o022),
+        parent: Weak::new(),
+        children: Mutex::new(Vec::new()),
+        child_exited: WaitQueue::new(),
     });
     let user = UserState {
         process: process.clone(),
-        start: (image.entry, rsp),
+        start,
+        pml4,
         kernel_stack_top: VirtAddr::zero(),
         fs_base: 0,
         fpu: FpuState::new(),
@@ -144,13 +188,94 @@ pub fn spawn_with(
     Ok(process)
 }
 
-/// End the current thread's program with `status`, from one of its system
-/// calls or a fault it caused. Its memory is freed once its thread is reaped
-/// and whoever waits for it lets go.
-pub fn exit_current(status: i32) -> ! {
+/// `elf` loaded into a new address space, with `args` and `env` on its
+/// stack, and the registers to start it with.
+fn program(elf: &[u8], args: &[&[u8]], env: &[&[u8]]) -> Result<(Memory, Registers), &'static str> {
+    let mut space = AddressSpace::new().ok_or(NO_MEMORY)?;
+    let image = load(&mut space, elf)?;
+    let rsp = build_stack(&mut space, args, env, &image)?;
+    let memory = Memory { space, brk_start: image.end, brk: image.end, mmap_next: MMAP_START };
+    Ok((memory, Registers { rip: image.entry, rsp, ..Registers::default() }))
+}
+
+/// A copy of `parent`, the current thread's program, as `fork` makes: its
+/// memory, descriptors, working directory and umask, started on a thread of
+/// its own with `registers`. Its id, or `None` when memory runs out.
+pub fn fork(parent: &Arc<Process>, registers: Registers) -> Option<u64> {
+    let memory = {
+        let memory = parent.memory.lock();
+        Memory { space: memory.space.duplicate()?, ..*memory }
+    };
+    let pml4 = memory.space.pml4();
+    let child = Arc::new(Process {
+        id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+        memory: Mutex::new(memory),
+        status: AtomicI32::new(RUNNING),
+        exited: WaitQueue::new(),
+        output: parent.output.clone(),
+        files: Mutex::new(parent.files.lock().clone()),
+        cwd: Mutex::new(parent.cwd.lock().clone()),
+        umask: AtomicU32::new(parent.umask.load(Ordering::Relaxed)),
+        parent: Arc::downgrade(parent),
+        children: Mutex::new(Vec::new()),
+        child_exited: WaitQueue::new(),
+    });
+    let user = thread::with_current_user(|user| user.fork(child.clone(), pml4, registers))?;
+    thread::spawn_user(Box::new(user))?;
+    // Even if it has already ended, it's there to be waited for: the parent
+    // can't wait until this returns.
+    interrupts::without_interrupts(|| parent.children.lock().push(child.clone()));
+    Some(child.id)
+}
+
+/// Replace `process`, the current thread's program, with `elf`, given `args`
+/// and `env`: its memory, `fs` and SSE registers start afresh. The registers
+/// to enter it with; or why it couldn't be loaded, and nothing has changed.
+pub fn exec(
+    process: &Process,
+    elf: &[u8],
+    args: &[&[u8]],
+    env: &[&[u8]],
+) -> Result<Registers, &'static str> {
+    let (memory, start) = program(elf, args, env)?;
+    let pml4 = memory.space.pml4();
+    let old = core::mem::replace(&mut *process.memory.lock(), memory);
+    thread::with_current_user(|user| user.start_over(pml4));
+    // Only now that the CPU is off its page tables.
+    drop(old);
+    Ok(start)
+}
+
+/// End the current thread's program as `exit` does, with `code`, from one of
+/// its system calls.
+pub fn exit_current(code: i32) -> ! {
+    end_current((code & 0xFF) << 8)
+}
+
+/// End the current thread's program as `signal` would have, from a fault it
+/// caused.
+pub fn kill_current(signal: i32) -> ! {
+    end_current(signal)
+}
+
+/// End the current thread's program, which ended as `status` says. Its memory
+/// is freed once its thread is reaped and whoever waits for it lets go.
+fn end_current(status: i32) -> ! {
     if let Some(process) = thread::current_process() {
+        // Closing files can wait on the disk, and a fault comes here with
+        // interrupts off.
+        interrupts::enable();
+        // Now, not when it's freed: whoever reads its pipes waits for them
+        // to close.
+        let tree = fs::lock();
+        let files = core::mem::take(&mut *process.files.lock());
+        drop(files);
+        drop(tree);
         process.status.store(status, Ordering::Release);
         process.exited.wake_all();
+        if let Some(parent) = process.parent.upgrade() {
+            parent.child_exited.wake_all();
+        }
     }
     thread::exit()
 }
@@ -160,8 +285,10 @@ pub fn exit_current(status: i32) -> ! {
 /// otherwise leave for the next thread to see or to clobber.
 pub struct UserState {
     pub process: Arc<Process>,
-    /// Where the thread first enters ring 3, and its stack pointer there.
-    pub start: (u64, u64),
+    /// What the thread first enters ring 3 with.
+    pub start: Registers,
+    /// The program's page table.
+    pml4: PhysFrame,
     /// The top of the thread's kernel stack, where the CPU switches to from
     /// ring 3. Set by `thread::spawn_user`.
     pub kernel_stack_top: VirtAddr,
@@ -174,9 +301,9 @@ impl UserState {
     /// The thread is about to run: give the CPU its page table, its `fs`, its
     /// stack for entering the kernel and its SSE registers.
     pub fn switch_in(&self) {
-        if Cr3::read().0 != self.process.pml4 {
+        if Cr3::read().0 != self.pml4 {
             // Safety: the program's page table, whose upper half is the kernel's.
-            unsafe { Cr3::write(self.process.pml4, Cr3Flags::empty()) };
+            unsafe { Cr3::write(self.pml4, Cr3Flags::empty()) };
         }
         FsBase::write(VirtAddr::new(self.fs_base));
         gdt::set_kernel_stack(self.kernel_stack_top);
@@ -200,6 +327,29 @@ impl UserState {
     pub fn set_fs_base(&mut self, base: u64) {
         self.fs_base = base;
         FsBase::write(VirtAddr::new(base));
+    }
+
+    /// The state for a copy of this thread, which must be the running one,
+    /// running `process` on page table `pml4` from `start`: its `fs` and SSE
+    /// registers as they are now.
+    fn fork(&self, process: Arc<Process>, pml4: PhysFrame, start: Registers) -> UserState {
+        let mut fpu = FpuState::new();
+        // Safety: as in `switch_out`; the CPU holds this thread's registers.
+        unsafe { core::arch::asm!("fxsave64 [{}]", in(reg) &mut fpu, options(nostack)) };
+        let kernel_stack_top = VirtAddr::zero();
+        UserState { process, start, pml4, kernel_stack_top, fs_base: self.fs_base, fpu }
+    }
+
+    /// Start afresh on page table `pml4`, as `exec` does, with `fs` and the
+    /// SSE registers as a new program's. Only for the running thread.
+    fn start_over(&mut self, pml4: PhysFrame) {
+        self.pml4 = pml4;
+        // Safety: the program's new page table, whose upper half is the kernel's.
+        unsafe { Cr3::write(pml4, Cr3Flags::empty()) };
+        self.set_fs_base(0);
+        self.fpu = FpuState::new();
+        // Safety: as in `switch_in`.
+        unsafe { core::arch::asm!("fxrstor64 [{}]", in(reg) &self.fpu, options(nostack)) };
     }
 }
 
@@ -233,44 +383,91 @@ pub fn init() {
     crate::syscall::init();
 }
 
-/// Drop to ring 3 at `rip` with stack `rsp`, never to return: the program's
-/// thread comes back to the kernel only through system calls and interrupts,
-/// each on a fresh stack, and leaves through `exit_current`.
-pub fn enter_user(rip: u64, rsp: u64) -> ! {
+/// A program's registers: what it enters ring 3 with.
+#[derive(Clone, Copy, Default)]
+pub struct Registers {
+    pub rax: u64,
+    pub rbx: u64,
+    pub rcx: u64,
+    pub rdx: u64,
+    pub rsi: u64,
+    pub rdi: u64,
+    pub rbp: u64,
+    pub r8: u64,
+    pub r9: u64,
+    pub r10: u64,
+    pub r11: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+    pub r15: u64,
+    pub rip: u64,
+    /// Only the arithmetic flags, direction and single-stepping are taken;
+    /// interrupts are always on.
+    pub rflags: u64,
+    pub rsp: u64,
+}
+
+/// Drop to ring 3 with `registers`, never to return: the program's thread
+/// comes back to the kernel only through system calls and interrupts, each
+/// on a fresh stack, and leaves through `exit_current` or `kill_current`.
+pub fn enter_user(registers: Registers) -> ! {
     let selectors = gdt::selectors();
+    // Carry, parity, adjust, zero, sign, trap, direction and overflow.
+    const USER_FLAGS: u64 = 0xDD5;
     // Interrupts on in ring 3, and bit 1, which is always set.
-    const RFLAGS: u64 = 0x202;
+    const ALWAYS: u64 = 0x202;
+    let Registers {
+        rax, rbx, rcx, rdx, rsi, rdi, rbp, r8, r9, r10, r11, r12, r13, r14, r15, ..
+    } = registers;
+    // Popped into the registers in this order, then what `iretq` takes.
+    let frame = [
+        rax,
+        rbx,
+        rcx,
+        rdx,
+        rsi,
+        rdi,
+        rbp,
+        r8,
+        r9,
+        r10,
+        r11,
+        r12,
+        r13,
+        r14,
+        r15,
+        registers.rip,
+        u64::from(selectors.user_code_selector.0),
+        registers.rflags & USER_FLAGS | ALWAYS,
+        registers.rsp,
+        u64::from(selectors.user_data_selector.0),
+    ];
     // Safety: the thread's address space is active (`switch_in`), with the
-    // program loaded and `rsp` in its stack. The kernel's registers are
-    // cleared so the program can't read them.
+    // program loaded. Every register is the program's by the `iretq`, so it
+    // sees nothing of the kernel's. Interrupts stay off until then, as the
+    // stack is the frame.
     unsafe {
         core::arch::asm!(
-            "push {ss}",
-            "push {rsp}",
-            "push {rflags}",
-            "push {cs}",
-            "push {rip}",
-            "xor eax, eax",
-            "xor ebx, ebx",
-            "xor ecx, ecx",
-            "xor edx, edx",
-            "xor esi, esi",
-            "xor edi, edi",
-            "xor ebp, ebp",
-            "xor r8d, r8d",
-            "xor r9d, r9d",
-            "xor r10d, r10d",
-            "xor r11d, r11d",
-            "xor r12d, r12d",
-            "xor r13d, r13d",
-            "xor r14d, r14d",
-            "xor r15d, r15d",
+            "cli",
+            "mov rsp, {}",
+            "pop rax",
+            "pop rbx",
+            "pop rcx",
+            "pop rdx",
+            "pop rsi",
+            "pop rdi",
+            "pop rbp",
+            "pop r8",
+            "pop r9",
+            "pop r10",
+            "pop r11",
+            "pop r12",
+            "pop r13",
+            "pop r14",
+            "pop r15",
             "iretq",
-            ss = in(reg) u64::from(selectors.user_data_selector.0),
-            rsp = in(reg) rsp,
-            rflags = in(reg) RFLAGS,
-            cs = in(reg) u64::from(selectors.user_code_selector.0),
-            rip = in(reg) rip,
+            in(reg) &frame,
             options(noreturn),
         )
     }
@@ -307,7 +504,7 @@ fn load(space: &mut AddressSpace, file: &[u8]) -> Result<Image, &'static str> {
                 if segment.flags & elf::PF_X == 0 {
                     flags |= PageTableFlags::NO_EXECUTE;
                 }
-                space.map(pages(start, stop), flags).ok_or("out of memory")?;
+                space.map(pages(start, stop), flags).ok_or(NO_MEMORY)?;
                 space.load(start, elf.contents(&segment)).ok_or(outside)?;
                 end = end.max(stop);
                 // Without a PT_PHDR, the headers are in the segment that
@@ -331,12 +528,13 @@ fn load(space: &mut AddressSpace, file: &[u8]) -> Result<Image, &'static str> {
 }
 
 /// Map the stack and lay it out as Linux does for a new program: from the
-/// stack pointer up, `argc`, the `argv` pointers, an empty environment, and
+/// stack pointer up, `argc`, the `argv` pointers, the `envp` pointers, and
 /// the auxiliary vector, which tells musl where its program headers (and so
 /// its thread-local storage) are; the strings above them.
 fn build_stack(
     space: &mut AddressSpace,
-    args: &[&str],
+    args: &[&[u8]],
+    env: &[&[u8]],
     image: &Image,
 ) -> Result<u64, &'static str> {
     const AT_NULL: u64 = 0;
@@ -346,28 +544,26 @@ fn build_stack(
     const AT_PAGESZ: u64 = 6;
     const AT_ENTRY: u64 = 9;
     const AT_RANDOM: u64 = 25;
-    let too_long = "arguments too long for the stack";
 
     let bottom = STACK_TOP - STACK_SIZE;
     let flags = PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
-    space.map(pages(bottom, STACK_TOP), flags).ok_or("out of memory")?;
+    space.map(pages(bottom, STACK_TOP), flags).ok_or(NO_MEMORY)?;
 
     let mut top = STACK_TOP;
     let mut push = |space: &mut AddressSpace, bytes: &[u8]| {
         top = top.checked_sub(bytes.len() as u64).filter(|&top| top > bottom + 4096)?;
         space.load(top, bytes).map(|()| top)
     };
-    let random = push(space, &random_bytes()).ok_or(too_long)?;
-    let mut argv = Vec::with_capacity(args.len());
-    for arg in args {
-        let mut string = vec![0; arg.len() + 1];
-        string[..arg.len()].copy_from_slice(arg.as_bytes());
-        argv.push(push(space, &string).ok_or(too_long)?);
-    }
-
+    let random = push(space, &random_bytes()).ok_or(TOO_LONG)?;
     let mut words = vec![args.len() as u64];
-    words.extend(argv);
-    words.extend([0, 0]); // the end of `argv`, and an empty environment
+    for strings in [args, env] {
+        for string in strings {
+            let mut terminated = vec![0; string.len() + 1];
+            terminated[..string.len()].copy_from_slice(string);
+            words.push(push(space, &terminated).ok_or(TOO_LONG)?);
+        }
+        words.push(0);
+    }
     words.extend([
         AT_PHDR,
         image.phdr,
@@ -388,9 +584,9 @@ fn build_stack(
     // `argc` on a 16-byte boundary, as the ABI requires at entry.
     let rsp = (top - bytes.len() as u64) & !0xF;
     if rsp <= bottom + 4096 {
-        return Err(too_long);
+        return Err(TOO_LONG);
     }
-    space.load(rsp, &bytes).ok_or(too_long)?;
+    space.load(rsp, &bytes).ok_or(TOO_LONG)?;
     Ok(rsp)
 }
 

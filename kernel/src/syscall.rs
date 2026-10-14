@@ -9,10 +9,11 @@
 //! one is EFAULT, never a fault in the kernel.
 
 mod files;
+mod processes;
 
 use crate::io::interrupts::gdt;
 use crate::memory::USER_END;
-use crate::process::{self, LOWEST, MMAP_END, MMAP_START, Process, pages};
+use crate::process::{self, LOWEST, MMAP_END, MMAP_START, Process, Registers, pages};
 use crate::{serial_println, thread};
 use alloc::vec;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -66,8 +67,16 @@ pub fn set_kernel_stack(top: VirtAddr) {
 
 /// What `entry` saves, from its last push up: `syscall` and Linux promise a
 /// program that every register but `rax`, `rcx` and `r11` survives a call.
+/// The ones the calls themselves keep are saved for `fork`, which hands all of
+/// them to the copy.
 #[repr(C)]
 struct Frame {
+    r15: u64,
+    r14: u64,
+    r13: u64,
+    r12: u64,
+    rbp: u64,
+    rbx: u64,
     nr: u64,
     r9: u64,
     r8: u64,
@@ -81,8 +90,8 @@ struct Frame {
     rsp: u64,
 }
 
-/// Where `syscall` lands. Ten pushes onto the 16-byte aligned stack top leave
-/// it aligned again for the call.
+/// Where `syscall` lands. Sixteen pushes onto the 16-byte aligned stack top
+/// leave it aligned again for the call.
 #[unsafe(naked)]
 unsafe extern "C" fn entry() {
     core::arch::naked_asm!(
@@ -98,9 +107,16 @@ unsafe extern "C" fn entry() {
         "push r8",
         "push r9",
         "push rax",
+        "push rbx",
+        "push rbp",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
         "mov rdi, rsp",
         "call {dispatch}",
-        "add rsp, 8",
+        // Past the ones `dispatch` kept, and the call's number.
+        "add rsp, 56",
         "pop r9",
         "pop r8",
         "pop r10",
@@ -117,24 +133,51 @@ unsafe extern "C" fn entry() {
     );
 }
 
+impl Frame {
+    /// The program's registers as `sysret` would leave them, with `rax` the
+    /// call's result.
+    fn registers(&self, rax: u64) -> Registers {
+        Registers {
+            rax,
+            rbx: self.rbx,
+            rcx: self.rip,
+            rdx: self.rdx,
+            rsi: self.rsi,
+            rdi: self.rdi,
+            rbp: self.rbp,
+            r8: self.r8,
+            r9: self.r9,
+            r10: self.r10,
+            r11: self.rflags,
+            r12: self.r12,
+            r13: self.r13,
+            r14: self.r14,
+            r15: self.r15,
+            rip: self.rip,
+            rflags: self.rflags,
+            rsp: self.rsp,
+        }
+    }
+}
+
 extern "sysv64" fn dispatch(frame: &Frame) -> i64 {
     // A `syscall` in the last bytes of the lower half would have `sysret`
     // return to a non-canonical address, which faults in ring 0 on the
     // program's stack: Intel CPUs' sysret bug. Nothing is ever mapped there,
     // but this doesn't rely on it.
     if frame.rip >= USER_END {
-        process::exit_current(process::KILLED_SIGSEGV);
+        process::kill_current(process::SIGSEGV);
     }
     interrupts::enable();
-    let args = [frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9];
-    let result = call(frame.nr, args);
+    let result = call(frame);
     interrupts::disable();
     result
 }
 
-fn call(nr: u64, [a0, a1, a2, a3, a4, _a5]: [u64; 6]) -> i64 {
+fn call(frame: &Frame) -> i64 {
     let process = thread::current_process().expect("system calls come from programs");
-    match nr {
+    let [a0, a1, a2, a3, a4] = [frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8];
+    match frame.nr {
         0 => files::read(&process, a0, a1, a2),
         1 => files::write(&process, a0, a1, a2),
         2 => files::open(&process, files::AT_FDCWD, a0, a1, a2),
@@ -157,12 +200,25 @@ fn call(nr: u64, [a0, a1, a2, a3, a4, _a5]: [u64; 6]) -> i64 {
         32 => files::dup(&process, a0),
         33 => files::dup3(&process, a0, a1, 0, true),
         35 => clock_nanosleep(&process, CLOCK_MONOTONIC, 0, a0),
+        39 => process.id as i64,
+        // The copy starts as the call returns, with 0 its result.
+        56 => processes::clone(&process, frame.registers(0), a0, a1),
+        // fork, vfork.
+        57 | 58 => processes::clone(&process, frame.registers(0), processes::SIGCHLD, 0),
+        59 => match processes::execve(&process, a0, a1, a2) {
+            Ok(registers) => {
+                // Nothing on this stack is ever dropped.
+                drop(process);
+                process::enter_user(registers)
+            }
+            Err(errno) => -errno,
+        },
         // exit, exit_group: one thread per program, so the same.
         60 | 231 => {
-            files::close_all(&process);
             drop(process);
-            process::exit_current((a0 & 0xFF) as i32)
+            process::exit_current(a0 as i32)
         }
+        61 => processes::wait4(&process, a0, a1, a2, a3),
         72 => files::fcntl(&process, a0, a1, a2),
         79 => files::getcwd(&process, a0, a1),
         80 => files::chdir(&process, a0),
@@ -171,6 +227,7 @@ fn call(nr: u64, [a0, a1, a2, a3, a4, _a5]: [u64; 6]) -> i64 {
         84 => files::unlinkat(&process, files::AT_FDCWD, a0, files::AT_REMOVEDIR),
         87 => files::unlinkat(&process, files::AT_FDCWD, a0, 0),
         95 => files::umask(&process, a0),
+        110 => process.parent_id() as i64,
         // fsync, fdatasync.
         74 | 75 => files::fsync(&process, a0),
         131 => sigaltstack(&process, a1),
@@ -190,7 +247,7 @@ fn call(nr: u64, [a0, a1, a2, a3, a4, _a5]: [u64; 6]) -> i64 {
         293 => files::pipe2(&process, a0, a1),
         316 => files::renameat2(&process, a0, a1, a2, a3, a4),
         _ => {
-            serial_println!("simplos: process {}: no system call {}", process.id, nr);
+            serial_println!("simplos: process {}: no system call {}", process.id, frame.nr);
             -ENOSYS
         }
     }

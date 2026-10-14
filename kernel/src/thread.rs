@@ -347,8 +347,8 @@ extern "C" fn start() -> ! {
     interrupts::enable();
     // Whoever switched here may have just exited.
     reap();
-    if let Some((rip, rsp)) = user {
-        process::enter_user(rip, rsp);
+    if let Some(registers) = user {
+        process::enter_user(registers);
     }
     entry.expect("a new thread has an entry or a program")();
     exit()

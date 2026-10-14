@@ -282,6 +282,12 @@ fn run_starts_the_program_in_the_ramdisk() {
     assert_eq!(shell.history.last().unwrap(), "hello from user space");
     typed(&mut shell, "run fault\n");
     assert_eq!(shell.history.last().unwrap(), "[exit status 139]");
+    // Which runs itself again, from the ext4 disk tools/boot-test attaches.
+    typed(&mut shell, "run spawn /bin/probe hello\n");
+    assert_eq!(
+        shell.history[shell.history.len() - 2..],
+        ["hello from user space", "exit status: 0"]
+    );
 }
 
 #[test_case]
@@ -290,8 +296,8 @@ fn ls_and_cat_show_the_ext4_disk() {
     let mut shell = Shell::new(10, 80);
     typed(&mut shell, "ls\n");
     assert_eq!(
-        shell.history[shell.history.len() - 4..],
-        ["dev/", "dir/", "hello.txt", "lost+found/"]
+        shell.history[shell.history.len() - 5..],
+        ["bin/", "dev/", "dir/", "hello.txt", "lost+found/"]
     );
     typed(&mut shell, "ls /dev\n");
     assert_eq!(shell.history[shell.history.len() - 3..], ["null", "tty", "zero"]);

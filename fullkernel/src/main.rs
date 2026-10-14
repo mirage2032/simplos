@@ -7,7 +7,9 @@
 //! for a smaller framebuffer without rebuilding it.
 //!
 //! An ext4 disk goes with it, `disk.img` here, made the first time and kept,
-//! so what's written to it is there next time; delete it to start afresh.
+//! so what's written to it is there next time; delete it to start afresh. It
+//! starts with `hello.txt`, and user/probe as `/bin/probe`, for programs to
+//! run.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -82,6 +84,8 @@ fn disk() -> Option<PathBuf> {
     let tree = here.join("target/disk-tree");
     std::fs::create_dir_all(&tree).ok()?;
     std::fs::write(tree.join("hello.txt"), "hello from the ext4 disk\n").ok()?;
+    std::fs::create_dir_all(tree.join("bin")).ok()?;
+    std::fs::copy(env!("PROBE_PATH"), tree.join("bin/probe")).ok()?;
     // Where Linux and Homebrew put it: often not on PATH.
     let mke2fs = [
         "/usr/sbin/mke2fs",

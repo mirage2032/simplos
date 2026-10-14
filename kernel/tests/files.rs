@@ -114,7 +114,7 @@ fn failed(path: &str, error: &str) -> (i32, String) {
 #[test_case]
 fn a_program_reads_files_and_lists_directories() {
     assert_eq!(run(&["cat", "/hello.txt", "/dir/nested/deep.txt"]), ok("hello from ext4\ndeep\n"));
-    assert_eq!(run(&["ls", "/"]), ok("dev/\ndir/\nhello.txt\nlost+found/\n"));
+    assert_eq!(run(&["ls", "/"]), ok("bin/\ndev/\ndir/\nhello.txt\nlost+found/\n"));
     assert_eq!(run(&["ls", "/dir/nested"]), ok("deep.txt\n"));
     // Relative to the working directory, the root; and the long way round.
     assert_eq!(run(&["cat", "hello.txt"]), ok("hello from ext4\n"));
@@ -242,7 +242,7 @@ fn a_program_makes_and_removes_directories() {
     // unlinkat, each relative to the directory above.
     assert_eq!(run(&["write", "/made/a/b/again.txt", "x"]), ok(""));
     assert_eq!(run(&["rm-r", "/made"]), ok(""));
-    assert_eq!(run(&["ls", "/"]), ok("dev/\ndir/\nhello.txt\nlost+found/\n"));
+    assert_eq!(run(&["ls", "/"]), ok("bin/\ndev/\ndir/\nhello.txt\nlost+found/\n"));
 }
 
 #[test_case]
