@@ -2,6 +2,7 @@
 name = "simplos-os"         # or any other name
 version = "0.1.1"
 edition = "2024"
+license = "GPL-2.0-only"
 
 [build-dependencies]
 bootloader = {git = "https://github.com/rust-osdev/bootloader.git"}
