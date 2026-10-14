@@ -11,6 +11,7 @@ pub mod elf;
 pub mod fs;
 pub mod io;
 pub mod memory;
+pub mod pipe;
 pub mod process;
 pub mod shell;
 pub mod syscall;

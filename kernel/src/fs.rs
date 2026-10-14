@@ -58,9 +58,14 @@ pub fn unmount() {
 /// What a file descriptor refers to. Copies of a descriptor share one, and
 /// with it the place they're at in a file.
 pub enum Handle {
-    /// Standard input, output and error: the program's `output`, and no
-    /// input.
+    /// Standard input, output and error, and /dev/tty: the program's
+    /// `output`, and no input.
     Console,
+    /// /dev/null: nothing to read, and what's written goes nowhere.
+    Null,
+    /// /dev/zero: as many zeros as are read, and what's written goes nowhere.
+    Zero,
+    Pipe(crate::pipe::PipeEnd),
     File {
         file: ext4::File,
         read: bool,
@@ -76,6 +81,19 @@ pub enum Handle {
         /// The next entry `getdents64` hands out.
         next: AtomicUsize,
     },
+}
+
+/// The device at `path`, a path from the root, if it's one.
+///
+/// shortcut: just these three, which programs open by name; /dev can't be
+/// listed, and device nodes on the disk aren't looked at.
+pub fn device(path: &str) -> Option<Handle> {
+    match path {
+        "dev/null" => Some(Handle::Null),
+        "dev/zero" => Some(Handle::Zero),
+        "dev/tty" => Some(Handle::Console),
+        _ => None,
+    }
 }
 
 /// `path` made absolute against the directory `base`, and with `.`, `..`

@@ -3,7 +3,7 @@
 //! argument picks what it does, so one binary covers every test.
 
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{FileExt, PermissionsExt};
 use std::time::Duration;
@@ -78,11 +78,59 @@ fn main() {
             let contents = or_fail(&arg(3), fs::read(arg(3)));
             or_fail(&arg(3), io::stdout().write_all(&contents));
         }
+        // A pipe within the program: through it and out, then into one no
+        // one reads any more.
+        Some("pipe") => {
+            let (mut reader, mut writer) = or_fail("pipe", io::pipe());
+            or_fail("pipe", writer.write_all(b"through a pipe\n"));
+            drop(writer);
+            print!("{}", or_fail("pipe", io::read_to_string(&mut reader)));
+            let (reader, mut writer) = or_fail("pipe", io::pipe());
+            drop(reader);
+            match writer.write_all(b"to no one") {
+                Ok(()) => println!("written to no one"),
+                Err(error) => println!("{error}"),
+            }
+        }
+        // Standard output made a copy of PATH's descriptor, with dup2, then
+        // TEXT printed: into PATH.
+        Some("dup-out") => {
+            let file = or_fail(&arg(2), fs::File::create(arg(2)));
+            let copied = syscall(33, file.as_raw_fd() as usize, 1, 0);
+            println!("{} {copied}", arg(3));
+        }
+        // dup of a descriptor that isn't open, dup2 to one past the most
+        // there can be, pipe2 into the kernel's half, and pipe2 asked not
+        // to wait, which isn't there yet.
+        Some("bad-pipes") => {
+            let closed = syscall(32, 1000, 0, 0);
+            let far = syscall(33, 1, 5000, 0);
+            let kernel = syscall(293, 0xFFFF_8000_0000_0000, 0, 0);
+            let mut fds = [0i32; 2];
+            let nonblocking = syscall(293, fds.as_mut_ptr() as usize, 0o4000, 0);
+            println!("{closed} {far} {kernel} {nonblocking}");
+        }
         // End with PATH open, for the kernel to close.
         Some("hold") => std::mem::forget(or_fail(&arg(2), fs::File::open(arg(2)))),
         // Files, through std::fs, as any program would use them.
+        // With no paths, or `-`, standard input, as it comes.
         Some("cat") => {
-            for path in std::env::args().skip(2) {
+            let mut paths: Vec<String> = std::env::args().skip(2).collect();
+            if paths.is_empty() {
+                paths.push(String::from("-"));
+            }
+            for path in paths {
+                if path == "-" {
+                    let mut chunk = vec![0; 64 << 10];
+                    loop {
+                        let read = or_fail(&path, io::stdin().read(&mut chunk));
+                        if read == 0 {
+                            break;
+                        }
+                        or_fail(&path, io::stdout().write_all(&chunk[..read]));
+                    }
+                    continue;
+                }
                 let contents = or_fail(&path, fs::read(&path));
                 or_fail(&path, io::stdout().write_all(&contents));
             }
