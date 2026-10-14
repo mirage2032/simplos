@@ -1,5 +1,6 @@
 //! Kernel threads take turns, each on a stack of its own, can't keep the CPU
-//! to themselves, and give their stacks back when they finish.
+//! to themselves, sleep and wait without using it, and give their stacks back
+//! when they finish.
 
 #![no_std]
 #![no_main]
@@ -15,8 +16,9 @@ use alloc::vec::Vec;
 use bootloader_api::{BootInfo, entry_point};
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use simplos::io::hpet;
 use simplos::memory::STACKS_START;
-use simplos::thread::{spawn, yield_now};
+use simplos::thread::{WaitQueue, sleep, spawn, yield_now};
 use spin::Mutex;
 
 entry_point!(main, config = &simplos::BOOTLOADER_CONFIG);
@@ -138,4 +140,40 @@ fn threads_switch_while_another_holds_the_heap() {
     }
     stop.store(true, Ordering::Relaxed);
     wait_for(&stop);
+}
+
+#[test_case]
+fn sleep_waits_at_least_as_long_as_asked() {
+    // With no other thread ready, so the idle thread has to run meanwhile:
+    // without one, there's nothing to switch to.
+    let start = hpet::elapsed_millis().expect("QEMU has an HPET");
+    sleep(50);
+    let slept = hpet::elapsed_millis().unwrap() - start;
+    assert!((50..250).contains(&slept), "asked for 50 ms, slept {slept}");
+}
+
+#[test_case]
+fn a_waiting_thread_sleeps_until_woken() {
+    static QUEUE: WaitQueue = WaitQueue::new();
+    let go = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicBool::new(false));
+    let (waiter_go, waiter_done) = (go.clone(), done.clone());
+    spawn(move || {
+        QUEUE.wait_until(|| waiter_go.load(Ordering::Relaxed));
+        waiter_done.store(true, Ordering::Relaxed);
+    })
+    .expect("memory for a stack");
+    for _ in 0..5 {
+        yield_now();
+    }
+    // True now, but the waiter only looks again when woken: if it were
+    // polling instead of asleep, it would be done after these turns.
+    go.store(true, Ordering::Relaxed);
+    for _ in 0..5 {
+        yield_now();
+    }
+    assert!(!done.load(Ordering::Relaxed), "the waiter ran without being woken");
+    QUEUE.wake_all();
+    wait_for(&done);
+    assert!(done.load(Ordering::Relaxed));
 }
