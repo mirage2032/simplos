@@ -10,6 +10,7 @@ pub mod allocator;
 pub mod io;
 pub mod memory;
 pub mod shell;
+pub mod thread;
 
 pub use io::console::CONSOLE;
 pub use io::serial;
@@ -50,6 +51,7 @@ pub const KERNEL_BASE: u64 = 0xFFFF_FFFF_8000_0000;
 //   (next free entries)    kernel stack, boot info,    placed by the bootloader
 //                          framebuffer, ramdisk
 //   0xFFFF_C000_0000_0000  heap                        allocator::HEAP_START
+//   0xFFFF_D000_0000_0000  kernel thread stacks        memory::STACKS_START
 //   0xFFFF_FFFF_8000_0000  kernel image                KERNEL_BASE
 #[allow(deprecated)]
 pub static BOOTLOADER_CONFIG: BootloaderConfig = {
@@ -124,6 +126,7 @@ pub fn pre_init(boot_info: &'static mut BootInfo) {
         allocator::init_heap(&mut mapper, &mut frame_allocator)
             .expect("heap initialization failed");
         *memory::FRAMES.lock() = Some(frame_allocator);
+        *memory::PAGE_TABLE.lock() = Some(mapper);
 
         // Initialize display with framebuffer
         let fb = boot_info.framebuffer.take().expect("No framebuffer found");

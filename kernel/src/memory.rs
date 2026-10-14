@@ -1,9 +1,11 @@
 use bootloader_api::info::{MemoryRegionKind, MemoryRegions};
+use core::sync::atomic::{AtomicU64, Ordering};
 use spin::{Mutex, Once};
 use x86_64::{
     PhysAddr, VirtAddr,
     structures::paging::{
-        FrameAllocator, FrameDeallocator, OffsetPageTable, PageTable, PhysFrame, Size4KiB,
+        FrameAllocator, FrameDeallocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags,
+        PhysFrame, Size4KiB,
     },
 };
 
@@ -65,7 +67,84 @@ pub fn phys_ptr(addr: PhysAddr) -> Option<*mut u8> {
 
 /// The frame allocator `pre_init` used for the heap, kept for everything after
 /// that needs physical memory: drivers, and soon page tables and processes.
+/// Take `PAGE_TABLE` first when holding both.
 pub static FRAMES: Mutex<Option<BootInfoFrameAllocator>> = Mutex::new(None);
+
+/// The page table `pre_init` mapped the heap with, kept for mapping kernel
+/// memory later. Every future address space will share its upper half.
+pub static PAGE_TABLE: Mutex<Option<OffsetPageTable<'static>>> = Mutex::new(None);
+
+/// Where kernel thread stacks are mapped: a PML4 entry of its own, see the
+/// layout in `lib.rs`.
+pub const STACKS_START: u64 = 0xFFFF_D000_0000_0000;
+
+/// Pages in a kernel thread's stack: 80 KiB, what the bootloader gives the
+/// boot thread, so code that runs there runs on any thread.
+const STACK_PAGES: u64 = 20;
+
+/// A kernel thread's stack, with an unmapped guard page below it so that an
+/// overflow faults instead of running into whatever is mapped underneath.
+/// Unmapped, and its frames freed, when dropped.
+pub struct KernelStack {
+    /// The lowest mapped page; the guard page is the one below.
+    bottom: Page,
+}
+
+impl KernelStack {
+    /// `None` when memory runs out.
+    pub fn new() -> Option<KernelStack> {
+        // shortcut: a slot's addresses are never reused, only its frames, so
+        // after about 6 million stacks this returns None; keep a free list of
+        // slots if anything ever spawns that many.
+        const SLOT_BYTES: u64 = (STACK_PAGES + 1) * 4096;
+        static NEXT_SLOT: AtomicU64 = AtomicU64::new(0);
+        let slot = NEXT_SLOT.fetch_add(1, Ordering::Relaxed);
+        // The region is one PML4 entry, 512 GiB.
+        if slot >= (1 << 39) / SLOT_BYTES {
+            return None;
+        }
+        let guard = STACKS_START + slot * SLOT_BYTES;
+        let stack = KernelStack { bottom: Page::containing_address(VirtAddr::new(guard)) + 1 };
+
+        // After `stack`, so on an early return these are released before its
+        // `drop` takes them again to undo a partial mapping.
+        let mut pages = PAGE_TABLE.lock();
+        let mut frames = FRAMES.lock();
+        let (pages, frames) = (pages.as_mut()?, frames.as_mut()?);
+        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
+        for page in stack.pages() {
+            let frame = frames.allocate_frame()?;
+            // Safety: the page is in this stack's slot, which nothing else uses.
+            unsafe { pages.map_to(page, frame, flags, frames) }.ok()?.flush();
+        }
+        Some(stack)
+    }
+
+    /// One past the highest byte, which is where a stack starts.
+    pub fn top(&self) -> VirtAddr {
+        (self.bottom + STACK_PAGES).start_address()
+    }
+
+    fn pages(&self) -> impl Iterator<Item = Page> {
+        Page::range(self.bottom, self.bottom + STACK_PAGES)
+    }
+}
+
+impl Drop for KernelStack {
+    fn drop(&mut self) {
+        let mut pages = PAGE_TABLE.lock();
+        let mut frames = FRAMES.lock();
+        let (Some(pages), Some(frames)) = (pages.as_mut(), frames.as_mut()) else { return };
+        for page in self.pages() {
+            // Pages `new` never got to are simply not mapped.
+            if let Ok((frame, flush)) = pages.unmap(page) {
+                flush.flush();
+                // Safety: unmapped just now, and nothing else ever mapped it.
+                unsafe { frames.deallocate_frame(frame) };
+            }
+        }
+    }
+}
 
 /// A zeroed 4 KiB frame for a device to DMA into, as its physical address and
 /// a pointer the kernel can use. `None` once memory runs out or before boot.
@@ -154,4 +233,28 @@ impl FrameDeallocator<Size4KiB> for BootInfoFrameAllocator {
         unsafe { link(frame).write(below) };
         self.freed = Some(frame);
     }
+}
+
+#[test_case]
+fn kernel_stacks_sit_above_a_guard_page() {
+    use x86_64::structures::paging::Translate;
+    let mapped = |addr: VirtAddr| {
+        PAGE_TABLE
+            .lock()
+            .as_ref()
+            .expect("pre_init keeps the page table")
+            .translate_addr(addr)
+            .is_some()
+    };
+    let stack = KernelStack::new().expect("memory for a stack");
+    let (top, bottom) = (stack.top() - 8u64, stack.bottom.start_address());
+    // Safety: both ends of the stack just mapped.
+    unsafe {
+        top.as_mut_ptr::<u64>().write(1);
+        bottom.as_mut_ptr::<u64>().write(1);
+    }
+    assert!(mapped(top) && mapped(bottom));
+    assert!(!mapped(bottom - 1u64), "the guard page below the stack is mapped");
+    drop(stack);
+    assert!(!mapped(top) && !mapped(bottom), "a dropped stack is still mapped");
 }
