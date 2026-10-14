@@ -17,7 +17,9 @@ const ENOTDIR: i64 = 20;
 const EISDIR: i64 = 21;
 const EMFILE: i64 = 24;
 const ESPIPE: i64 = 29;
+const ERANGE: i64 = 34;
 const ENAMETOOLONG: i64 = 36;
+const ENOTEMPTY: i64 = 39;
 
 const O_ACCMODE: u64 = 3;
 const O_RDONLY: u64 = 0;
@@ -31,6 +33,8 @@ const O_DIRECTORY: u64 = 0o200000;
 /// A `dirfd` that means the working directory.
 pub const AT_FDCWD: u64 = -100i64 as u64;
 const AT_EMPTY_PATH: u64 = 0x1000;
+/// For `unlinkat`: remove a directory, as `rmdir` does.
+pub const AT_REMOVEDIR: u64 = 0x200;
 
 /// The most one read or write moves: a program asking for more gets less,
 /// as it may, and can't empty the kernel's heap.
@@ -95,14 +99,15 @@ fn path_at(process: &Process, addr: u64) -> Result<String> {
 }
 
 /// `path`, from the root, as `dirfd` says where it starts.
-///
-/// shortcut: the working directory is always the root, until `chdir`.
 fn lookup(process: &Process, dirfd: u64, path: &str) -> Result<String> {
     if path.is_empty() {
         return Err(ENOENT);
     }
-    if path.starts_with('/') || dirfd == AT_FDCWD {
+    if path.starts_with('/') {
         return Ok(fs::resolve("", path));
+    }
+    if dirfd == AT_FDCWD {
+        return Ok(fs::resolve(&process.cwd.lock(), path));
     }
     match &*handle(process, dirfd)? {
         Handle::Dir { path: base, .. } => Ok(fs::resolve(base, path)),
@@ -110,7 +115,7 @@ fn lookup(process: &Process, dirfd: u64, path: &str) -> Result<String> {
     }
 }
 
-pub fn open(process: &Process, dirfd: u64, path: u64, flags: u64) -> i64 {
+pub fn open(process: &Process, dirfd: u64, path: u64, flags: u64, mode: u64) -> i64 {
     ret((|| {
         let access = flags & O_ACCMODE;
         if access == O_ACCMODE {
@@ -132,6 +137,7 @@ pub fn open(process: &Process, dirfd: u64, path: u64, flags: u64) -> i64 {
             Ok(_) if flags & O_CREAT != 0 && flags & O_EXCL != 0 => return Err(EEXIST),
             Err(ext4::Error::NotFound) if flags & O_CREAT != 0 => {
                 let file = fs.create(&path).map_err(fs::errno)?;
+                fs.set_permissions(&path, permissions(process, mode)).map_err(fs::errno)?;
                 file_handle(file, access, flags)
             }
             Err(error) => return Err(fs::errno(error)),
@@ -146,6 +152,14 @@ pub fn open(process: &Process, dirfd: u64, path: u64, flags: u64) -> i64 {
         };
         install(process, handle)
     })())
+}
+
+/// What a new file asked to have `mode` gets: less what the umask takes off.
+///
+/// shortcut: set just after it's made, so a crash in between leaves it with
+/// lwext4's 0666 or 0777.
+fn permissions(process: &Process, mode: u64) -> u32 {
+    mode as u32 & 0o7777 & !process.umask.load(Relaxed)
 }
 
 fn file_handle(file: ext4::File, access: u64, flags: u64) -> Handle {
@@ -440,6 +454,97 @@ pub fn fcntl(process: &Process, fd: u64, command: u64, arg: u64) -> i64 {
             _ => Err(EINVAL),
         }
     })())
+}
+
+pub fn mkdirat(process: &Process, dirfd: u64, path: u64, mode: u64) -> i64 {
+    ret((|| {
+        let path = lookup(process, dirfd, &path_at(process, path)?)?;
+        let root = ROOT.lock();
+        let fs = root.as_ref().ok_or(ENOENT)?;
+        fs.create_dir(&path).map_err(fs::errno)?;
+        fs.set_permissions(&path, permissions(process, mode)).map_err(fs::errno)?;
+        Ok(0)
+    })())
+}
+
+/// `unlink`, or with `AT_REMOVEDIR`, `rmdir`.
+pub fn unlinkat(process: &Process, dirfd: u64, path: u64, flags: u64) -> i64 {
+    ret((|| {
+        let name = path_at(process, path)?;
+        let path = lookup(process, dirfd, &name)?;
+        let root = ROOT.lock();
+        let fs = root.as_ref().ok_or(ENOENT)?;
+        let removed = match flags & AT_REMOVEDIR {
+            0 => fs.remove_file(&path),
+            // `lookup` takes these out, which would remove the wrong
+            // directory; Linux refuses them.
+            _ => match name.trim_end_matches('/').rsplit('/').next() {
+                Some(".") => return Err(EINVAL),
+                Some("..") => return Err(ENOTEMPTY),
+                _ => fs.remove_dir(&path),
+            },
+        };
+        removed.map_err(fs::errno)?;
+        Ok(0)
+    })())
+}
+
+/// `rename`, `renameat` and `renameat2`, which may be asked not to replace
+/// anything.
+pub fn renameat2(
+    process: &Process,
+    from_dirfd: u64,
+    from: u64,
+    to_dirfd: u64,
+    to: u64,
+    flags: u64,
+) -> i64 {
+    const RENAME_NOREPLACE: u64 = 1;
+    ret((|| {
+        // Not RENAME_EXCHANGE nor RENAME_WHITEOUT, yet.
+        if flags & !RENAME_NOREPLACE != 0 {
+            return Err(EINVAL);
+        }
+        let from = lookup(process, from_dirfd, &path_at(process, from)?)?;
+        let to = lookup(process, to_dirfd, &path_at(process, to)?)?;
+        let root = ROOT.lock();
+        let fs = root.as_ref().ok_or(ENOENT)?;
+        if flags & RENAME_NOREPLACE != 0 && fs.metadata(&to).is_ok() {
+            return Err(EEXIST);
+        }
+        fs.rename(&from, &to).map_err(fs::errno)?;
+        Ok(0)
+    })())
+}
+
+pub fn chdir(process: &Process, path: u64) -> i64 {
+    ret((|| {
+        let path = lookup(process, AT_FDCWD, &path_at(process, path)?)?;
+        let root = ROOT.lock();
+        let fs = root.as_ref().ok_or(ENOENT)?;
+        if fs.metadata(&path).map_err(fs::errno)?.kind != Kind::Directory {
+            return Err(ENOTDIR);
+        }
+        *process.cwd.lock() = path;
+        Ok(0)
+    })())
+}
+
+/// The working directory, NUL-terminated: its length with the NUL.
+pub fn getcwd(process: &Process, buf: u64, size: u64) -> i64 {
+    ret((|| {
+        let cwd = alloc::format!("/{}\0", process.cwd.lock());
+        if cwd.len() as u64 > size {
+            return Err(ERANGE);
+        }
+        process.memory.lock().space.write(buf, cwd.as_bytes()).ok_or(EFAULT)?;
+        Ok(cwd.len() as i64)
+    })())
+}
+
+/// Set the umask, and say what it was.
+pub fn umask(process: &Process, mask: u64) -> i64 {
+    process.umask.swap(mask as u32 & 0o777, Relaxed).into()
 }
 
 /// Every change is on the disk by the time the call that made it returns.

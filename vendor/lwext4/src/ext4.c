@@ -1338,6 +1338,48 @@ Finish:
 
 }
 
+/* LOCAL PATCH: remove the file `inode`, whose name is the last part of
+ * `path` (from `name_off` on) in the directory `parent_inode`, as
+ * ext4_fremove does, but within the caller's transaction. */
+static int ext4_remove_target(struct ext4_mountpoint *mp, const char *path,
+			      uint32_t parent_inode, uint32_t name_off,
+			      uint32_t inode)
+{
+	bool is_goal;
+	struct ext4_inode_ref parent, child;
+	int r = ext4_fs_get_inode_ref(&mp->fs, parent_inode, &parent);
+	if (r != EOK)
+		return r;
+	r = ext4_fs_get_inode_ref(&mp->fs, inode, &child);
+	if (r != EOK) {
+		ext4_fs_put_inode_ref(&parent);
+		return r;
+	}
+	if (ext4_inode_type(&mp->fs.sb, child.inode) ==
+	    EXT4_INODE_MODE_DIRECTORY) {
+		r = EISDIR;
+		goto Finish;
+	}
+	if (ext4_inode_get_links_cnt(child.inode) == 1) {
+		r = ext4_trunc_inode(mp, child.index, 0);
+		if (r != EOK)
+			goto Finish;
+	}
+	path += name_off;
+	r = ext4_unlink(mp, &parent, &child, path,
+			ext4_path_check(path, &is_goal));
+	if (r != EOK)
+		goto Finish;
+	if (!ext4_inode_get_links_cnt(child.inode)) {
+		ext4_inode_set_del_time(child.inode, -1L);
+		r = ext4_fs_free_inode(&child);
+	}
+Finish:
+	ext4_fs_put_inode_ref(&child);
+	ext4_fs_put_inode_ref(&parent);
+	return r;
+}
+
 int ext4_frename(const char *path, const char *new_path)
 {
 	int r;
@@ -1380,6 +1422,23 @@ int ext4_frename(const char *path, const char *new_path)
 		goto Finish;
 
 	child_loaded = true;
+
+	/* LOCAL PATCH: a file already at `new_path` is replaced, in this same
+	 * transaction, as rename(2) promises: a crash leaves one file or the
+	 * other there, never neither. (src/lib.rs keeps directories away.) */
+	uint32_t target_parent, target_name_off;
+	r = ext4_generic_open2(&f, new_path, O_RDONLY, EXT4_DE_UNKNOWN,
+			       &target_parent, &target_name_off);
+	if (r == EOK) {
+		uint32_t target = f.inode;
+		ext4_fclose(&f);
+		r = ext4_remove_target(mp, new_path, target_parent,
+				       target_name_off, target);
+	} else if (r == ENOENT) {
+		r = EOK;
+	}
+	if (r != EOK)
+		goto Finish;
 
 	r = ext4_create_hardlink(new_path, &child_ref, true);
 	if (r != EOK)

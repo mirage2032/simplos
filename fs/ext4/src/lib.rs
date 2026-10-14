@@ -71,6 +71,8 @@ pub enum Error {
     InvalidArgument,
     /// Such as removing a file that's open.
     Busy,
+    /// A directory that would have to be empty isn't.
+    NotEmpty,
     /// As many file systems are mounted as can be.
     TooManyMounts,
     OutOfMemory,
@@ -94,6 +96,7 @@ fn check(errno: c_int) -> Result<(), Error> {
         22 => Error::InvalidArgument,
         28 => Error::NoSpace,
         30 => Error::ReadOnly,
+        39 => Error::NotEmpty,
         95 => Error::Unsupported,
         other => Error::Other(other),
     })
@@ -165,7 +168,8 @@ struct Mount {
     journaling: bool,
     /// Boxed twice so lwext4 can hold a thin pointer to it.
     _ours: Box<Box<dyn BlockDevice>>,
-    /// The inodes of the files open on it, once for each time one's open.
+    /// The inodes of the files and directories open on it, once for each
+    /// time one's open.
     open: Mutex<Vec<u32>>,
 }
 
@@ -237,7 +241,7 @@ impl Ext4 {
 
     /// The entries of the directory at `path`, without `.` and `..`.
     pub fn read_dir(&self, path: &str) -> Result<Vec<DirEntry>, Error> {
-        Ok(self.open_dir(path)?.entries)
+        Ok(core::mem::take(&mut self.open_dir(path)?.entries))
     }
 
     /// Open the directory at `path`, as it is now.
@@ -280,6 +284,7 @@ impl Ext4 {
         }
         // Safety: opened above, closed once.
         unsafe { ffi::simplos_ext4_dir_close(dir) };
+        self.mount.open.lock().push(metadata.inode);
         Ok(Dir { mount: self.mount.clone(), inode: metadata.inode, entries })
     }
 
@@ -359,18 +364,78 @@ impl Ext4 {
         check(unsafe { ffi::ext4_fremove(path.as_ptr()) })
     }
 
-    /// Move the file or directory at `from` to `to`, where there's none.
+    /// Remove the directory at `path`, which must be empty and not open.
+    pub fn remove_dir(&self, path: &str) -> Result<(), Error> {
+        const ROOT: u32 = 2;
+        let metadata = self.metadata(path)?;
+        if metadata.kind != Kind::Directory {
+            return Err(Error::NotADirectory);
+        }
+        if metadata.inode == ROOT {
+            return Err(Error::Busy);
+        }
+        // lwext4 would remove whatever is in it too.
+        if !self.read_dir(path)?.is_empty() {
+            return Err(Error::NotEmpty);
+        }
+        let path = self.path(path)?;
+        let _lwext4 = LWEXT4.lock();
+        if self.mount.open.lock().contains(&metadata.inode) {
+            return Err(Error::Busy);
+        }
+        // Safety: as in `metadata`.
+        check(unsafe { ffi::ext4_dir_rm(path.as_ptr()) })
+    }
+
+    /// Move the file or directory at `from` to `to`. Whatever is at `to`
+    /// already goes: a file in the same transaction, as Linux does it; an
+    /// empty directory, when a directory replaces it, just before.
+    ///
+    /// shortcut: a directory replacing one isn't one transaction, so a crash
+    /// in between leaves neither at `to`; Linux has nothing of the kind. And
+    /// what's replaced can't be open, as with `remove_file`.
     pub fn rename(&self, from: &str, to: &str) -> Result<(), Error> {
         let (from, to) = (from.trim_matches('/'), to.trim_matches('/'));
+        // The root stays where it is.
+        if from.is_empty() || to.is_empty() {
+            return Err(Error::Busy);
+        }
         // lwext4 would cut the directory off from the root, in a loop.
         if to.strip_prefix(from).is_some_and(|rest| rest.starts_with('/')) {
             return Err(Error::InvalidArgument);
         }
+        let source = self.metadata(from)?;
+        let replaced = match self.metadata(to) {
+            Err(Error::NotFound) => None,
+            Err(error) => return Err(error),
+            // Another name for the same file: nothing to do, as on Linux.
+            Ok(target) if target.inode == source.inode => return Ok(()),
+            Ok(target) => match (source.kind, target.kind) {
+                (Kind::Directory, Kind::Directory) => {
+                    self.remove_dir(to)?;
+                    None
+                }
+                (Kind::Directory, _) => return Err(Error::NotADirectory),
+                (_, Kind::Directory) => return Err(Error::IsADirectory),
+                _ => Some(target.inode),
+            },
+        };
         self.check_parent(to)?;
         let (from, to) = (self.path(from)?, self.path(to)?);
         let _lwext4 = LWEXT4.lock();
+        if replaced.is_some_and(|inode| self.mount.open.lock().contains(&inode)) {
+            return Err(Error::Busy);
+        }
         // Safety: as in `metadata`.
         check(unsafe { ffi::ext4_frename(from.as_ptr(), to.as_ptr()) })
+    }
+
+    /// Set the permission bits of the file at `path`: `0o644` and the like.
+    pub fn set_permissions(&self, path: &str, permissions: u32) -> Result<(), Error> {
+        let path = self.path(path)?;
+        let _lwext4 = LWEXT4.lock();
+        // Safety: as in `metadata`.
+        check(unsafe { ffi::ext4_mode_set(path.as_ptr(), permissions & 0o7777) })
     }
 
     /// That the directory `path` would go in is there: lwext4 makes any
@@ -471,6 +536,15 @@ pub struct Dir {
     mount: Arc<Mount>,
     inode: u32,
     entries: Vec<DirEntry>,
+}
+
+impl Drop for Dir {
+    fn drop(&mut self) {
+        let _lwext4 = LWEXT4.lock();
+        let mut open = self.mount.open.lock();
+        let at = open.iter().position(|inode| *inode == self.inode).expect("it was opened");
+        open.swap_remove(at);
+    }
 }
 
 impl Dir {
@@ -694,6 +768,8 @@ mod ffi {
         pub fn ext4_journal_start(mount_point: *const c_char) -> c_int;
         pub fn ext4_journal_stop(mount_point: *const c_char) -> c_int;
         pub fn ext4_dir_mk(path: *const c_char) -> c_int;
+        pub fn ext4_dir_rm(path: *const c_char) -> c_int;
+        pub fn ext4_mode_set(path: *const c_char, mode: u32) -> c_int;
         pub fn ext4_fremove(path: *const c_char) -> c_int;
         pub fn ext4_frename(path: *const c_char, new_path: *const c_char) -> c_int;
         pub fn ext4_fread(

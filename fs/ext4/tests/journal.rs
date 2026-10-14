@@ -60,8 +60,9 @@ fn survives_a_crash_at_any_write() {
     let dir = workspace("crash");
     let root = dir.join("tree");
     make_tree(&root);
+    std::fs::write(root.join("target.txt"), "original\n").unwrap();
     let image = image(&dir, &root, &["-t", "ext4"], "16M");
-    let mut disk = image.bytes();
+    let disk = image.bytes();
     // The same changes, mounted again each time: the journal must tell one
     // time's transactions from another's.
     let mut hello = String::from("hello.txt");
@@ -76,60 +77,84 @@ fn survives_a_crash_at_any_write() {
         hello = format!("{time}/hello.txt");
         fs.remove_file(&removed).unwrap();
         removed = format!("{time}/new.txt");
+        // A file written aside, then renamed over one that's there: the
+        // usual way to replace a file whole.
+        let file = fs.create(&format!("{time}/swap.txt")).unwrap();
+        assert_eq!(file.write_at(0, format!("{time}\n").as_bytes()).unwrap(), 2);
+        drop(file);
+        fs.rename(&format!("{time}/swap.txt"), "target.txt").unwrap();
+        fs.create_dir(&format!("{time}/gone")).unwrap();
+        fs.remove_dir(&format!("{time}/gone")).unwrap();
     }
 
     let writes = image.writes.lock().unwrap().clone();
-    let crashed = dir.join("crashed.img");
-    for cut in 0..=writes.len() {
-        if let Some((sector, data)) = cut.checked_sub(1).map(|last| &writes[last]) {
-            let start = *sector as usize * ext4::SECTOR;
-            disk[start..start + data.len()].copy_from_slice(data);
+    // Each cut on its own, four at a time: e2fsck takes most of the time,
+    // and four is as many mounts as lwext4 has.
+    std::thread::scope(|scope| {
+        for worker in 0..ext4::MOUNTS {
+            let (dir, disk, writes) = (&dir, &disk, &writes);
+            scope.spawn(move || {
+                for cut in (worker..=writes.len()).step_by(ext4::MOUNTS) {
+                    check_cut(dir, worker, cut, disk, &writes[..cut]);
+                }
+            });
         }
+    });
+}
 
-        // Mounted, it's marked as Linux marks it: not clean, but not as having
-        // errors either, which would outlive a crash.
-        let state = u16::from_le_bytes([disk[1024 + 0x3a], disk[1024 + 0x3b]]);
-        assert_eq!(state & 2, 0, "after {cut} writes, the file system says it has errors");
-
-        // e2fsck replaying the journal and nothing more, as Linux would.
-        std::fs::write(&crashed, &disk).unwrap();
-        let replay = e2fsprogs("e2fsck").args(["-y", "-E", "journal_only"]).arg(&crashed).output();
-        let replay = replay.expect("e2fsck, from e2fsprogs");
-        assert!(
-            replay.status.success(),
-            "after {cut} writes, e2fsck can't replay the journal:\n{}{}",
-            String::from_utf8_lossy(&replay.stdout),
-            String::from_utf8_lossy(&replay.stderr)
-        );
-        fsck(&crashed).unwrap_or_else(|problems| {
-            panic!("after {cut} writes, replayed by e2fsck:\n{problems}")
-        });
-
-        let image = Image::new(disk.clone());
-        let fs = Ext4::mount_writable(Box::new(image.clone()))
-            .unwrap_or_else(|error| panic!("after {cut} writes: {error:?}"));
-        let hello: Vec<_> = ["hello.txt", "a/hello.txt", "b/hello.txt"]
-            .into_iter()
-            .filter(|path| fs.metadata(path).is_ok())
-            .collect();
-        assert_eq!(hello.len(), 1, "after {cut} writes, hello.txt is at {hello:?}");
-        assert_eq!(read_all(&fs, hello[0]), b"hello from ext4\n", "after {cut} writes");
-        for new in ["a/new.txt", "b/new.txt"] {
-            if fs.metadata(new).is_ok() {
-                let new = read_all(&fs, new);
-                assert!(
-                    new.is_empty() || new == b"new\n",
-                    "after {cut} writes, new.txt holds {new:?}"
-                );
-            }
-        }
-        if fs.metadata("dir/nested/deep.txt").is_ok() {
-            assert_eq!(read_all(&fs, "dir/nested/deep.txt"), b"deep\n", "after {cut} writes");
-        }
-        assert!(read_all(&fs, "big.bin") == big(), "after {cut} writes, big.bin changed");
-        drop(fs);
-        image.save(&crashed);
-        fsck(&crashed)
-            .unwrap_or_else(|problems| panic!("after {cut} writes, recovered:\n{problems}"));
+/// Cut the power after `writes` have reached `disk`, and recover.
+fn check_cut(dir: &std::path::Path, worker: usize, cut: usize, disk: &[u8], writes: &[Write]) {
+    let mut disk = disk.to_vec();
+    for (sector, data) in writes {
+        let start = *sector as usize * ext4::SECTOR;
+        disk[start..start + data.len()].copy_from_slice(data);
     }
+    let crashed = dir.join(format!("crashed-{worker}.img"));
+    // Mounted, it's marked as Linux marks it: not clean, but not as having
+    // errors either, which would outlive a crash.
+    let state = u16::from_le_bytes([disk[1024 + 0x3a], disk[1024 + 0x3b]]);
+    assert_eq!(state & 2, 0, "after {cut} writes, the file system says it has errors");
+
+    // e2fsck replaying the journal and nothing more, as Linux would.
+    std::fs::write(&crashed, &disk).unwrap();
+    let replay = e2fsprogs("e2fsck").args(["-y", "-E", "journal_only"]).arg(&crashed).output();
+    let replay = replay.expect("e2fsck, from e2fsprogs");
+    assert!(
+        replay.status.success(),
+        "after {cut} writes, e2fsck can't replay the journal:\n{}{}",
+        String::from_utf8_lossy(&replay.stdout),
+        String::from_utf8_lossy(&replay.stderr)
+    );
+    fsck(&crashed)
+        .unwrap_or_else(|problems| panic!("after {cut} writes, replayed by e2fsck:\n{problems}"));
+
+    let image = Image::new(disk.clone());
+    let fs = Ext4::mount_writable(Box::new(image.clone()))
+        .unwrap_or_else(|error| panic!("after {cut} writes: {error:?}"));
+    let hello: Vec<_> = ["hello.txt", "a/hello.txt", "b/hello.txt"]
+        .into_iter()
+        .filter(|path| fs.metadata(path).is_ok())
+        .collect();
+    assert_eq!(hello.len(), 1, "after {cut} writes, hello.txt is at {hello:?}");
+    assert_eq!(read_all(&fs, hello[0]), b"hello from ext4\n", "after {cut} writes");
+    for new in ["a/new.txt", "b/new.txt"] {
+        if fs.metadata(new).is_ok() {
+            let new = read_all(&fs, new);
+            assert!(new.is_empty() || new == b"new\n", "after {cut} writes, new.txt holds {new:?}");
+        }
+    }
+    // Never missing, and never anything but one of the three it's been.
+    assert!(fs.metadata("target.txt").is_ok(), "after {cut} writes, target.txt is missing");
+    let target = read_all(&fs, "target.txt");
+    assert!(
+        [&b"original\n"[..], b"a\n", b"b\n"].contains(&&target[..]),
+        "after {cut} writes, target.txt holds {target:?}"
+    );
+    if fs.metadata("dir/nested/deep.txt").is_ok() {
+        assert_eq!(read_all(&fs, "dir/nested/deep.txt"), b"deep\n", "after {cut} writes");
+    }
+    assert!(read_all(&fs, "big.bin") == big(), "after {cut} writes, big.bin changed");
+    drop(fs);
+    image.save(&crashed);
+    fsck(&crashed).unwrap_or_else(|problems| panic!("after {cut} writes, recovered:\n{problems}"));
 }
