@@ -4,11 +4,14 @@
 use crate::io::interrupts::idt::TIMER_COUNTER;
 use crate::io::interrupts::pit::TIMER_HZ;
 use crate::io::{disk, hpet};
+use crate::process;
 use alloc::format;
 use alloc::string::{String, ToString};
+use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
-use spin::Lazy;
+use spin::{Lazy, Mutex};
 
 pub const PROMPT: &str = "> ";
 
@@ -22,7 +25,9 @@ commands:
   time          RTC time (unix seconds)
   uptime        timer ticks and HPET time since boot
   disks         disks found at boot
-  info          all of the above";
+  info          all of the above
+  run [MODE]    run the user program in the ramdisk:
+                hello, float, bad-calls, fault or exit";
 
 /// What a key changed, so the caller repaints no more than it has to. Ordered
 /// by how much, so several keys combine with `max`.
@@ -100,6 +105,7 @@ impl Shell {
             "time" => time(),
             "uptime" => uptime(),
             "disks" => disks(),
+            "run" => run(args),
             "info" => format!("{}\n{}\n{}\n{}\n{}", boot(), cpu(), time(), uptime(), disks()),
             _ => format!("unknown command: {cmd} (try help)"),
         }
@@ -140,6 +146,26 @@ fn uptime() -> String {
         Some(ms) => format!("{timer}\nHPET: {}.{:03}s", ms / 1000, ms % 1000),
         None => format!("{timer}\nHPET: unavailable"),
     }
+}
+
+/// Run the program in the ramdisk with `args` and wait for it: what it wrote,
+/// and its exit status if that isn't 0.
+fn run(args: &str) -> String {
+    let Some(elf) = crate::ramdisk() else { return String::from("run: no program in the ramdisk") };
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let sink = output.clone();
+    let mut argv = vec!["probe"];
+    argv.extend(args.split_whitespace());
+    let status = match process::spawn(elf, &argv, move |bytes| sink.lock().extend_from_slice(bytes))
+    {
+        Ok(process) => process.wait(),
+        Err(error) => return format!("run: {error}"),
+    };
+    let mut text = String::from_utf8_lossy(&output.lock()).into_owned();
+    if status != 0 {
+        text += &format!("[exit status {status}]");
+    }
+    text
 }
 
 fn disks() -> String {
@@ -198,4 +224,13 @@ fn input_stops_at_screen_width() {
     let mut shell = Shell::new(4, 6);
     typed(&mut shell, "abcdef");
     assert_eq!(shell.line, "abc", "prompt + line + cursor fit in 6 columns");
+}
+
+#[test_case]
+fn run_starts_the_program_in_the_ramdisk() {
+    let mut shell = Shell::new(10, 80);
+    typed(&mut shell, "run hello\n");
+    assert_eq!(shell.history.last().unwrap(), "hello from user space");
+    typed(&mut shell, "run fault\n");
+    assert_eq!(shell.history.last().unwrap(), "[exit status 139]");
 }

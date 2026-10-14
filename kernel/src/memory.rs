@@ -1,11 +1,13 @@
 use bootloader_api::info::{MemoryRegionKind, MemoryRegions};
+use core::ops::Range;
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::{Mutex, Once};
+use x86_64::registers::control::{Cr3, Cr3Flags};
 use x86_64::{
     PhysAddr, VirtAddr,
     structures::paging::{
         FrameAllocator, FrameDeallocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags,
-        PhysFrame, Size4KiB,
+        PhysFrame, Size4KiB, Translate, mapper::TranslateResult, page::PageRange,
     },
 };
 
@@ -19,6 +21,7 @@ use x86_64::{
 /// undefined behavior).
 pub unsafe fn init(physical_memory_offset: VirtAddr) -> OffsetPageTable<'static> {
     PHYS_OFFSET.call_once(|| physical_memory_offset);
+    KERNEL_PML4.call_once(|| Cr3::read().0);
     unsafe {
         let level_4_table = active_level_4_table(physical_memory_offset);
         OffsetPageTable::new(level_4_table, physical_memory_offset)
@@ -27,6 +30,24 @@ pub unsafe fn init(physical_memory_offset: VirtAddr) -> OffsetPageTable<'static>
 
 /// Where all of physical memory is mapped: the start of the upper half.
 pub const PHYS_MAP_BASE: u64 = 0xFFFF_8000_0000_0000;
+
+/// The end of the lower half, which belongs to user programs.
+pub const USER_END: u64 = 0x0000_8000_0000_0000;
+
+/// The page table the bootloader left active: the kernel's own. Kernel threads
+/// run on it, and every address space shares its upper half.
+static KERNEL_PML4: Once<PhysFrame> = Once::new();
+
+/// Switch to the kernel's page table, if another is active. Kernel threads run
+/// on it, so that freeing a program's page tables never pulls them out from
+/// under whoever is running.
+pub fn use_kernel_page_table() {
+    let kernel = *KERNEL_PML4.get().expect("memory::init ran");
+    if Cr3::read().0 != kernel {
+        // Safety: the kernel's page table maps everything the kernel uses.
+        unsafe { Cr3::write(kernel, Cr3Flags::empty()) };
+    }
+}
 
 /// Unmap the lower half, which belongs to user programs. All the bootloader
 /// leaves there are identity mappings of its own GDT and of the trampoline that
@@ -155,6 +176,209 @@ pub fn alloc_dma_frame() -> Option<(PhysAddr, *mut u8)> {
     // Safety: the frame is ours alone and mapped at the physical-memory offset.
     unsafe { ptr.write_bytes(0, 4096) };
     Some((frame.start_address(), ptr))
+}
+
+/// A user program's memory: a PML4 of its own, whose upper half is the
+/// kernel's and whose lower half starts empty. Pages are mapped with fresh,
+/// zeroed frames, and dropping it frees every frame and page table in the
+/// lower half.
+pub struct AddressSpace {
+    pml4: PhysFrame,
+}
+
+impl AddressSpace {
+    /// `None` when memory runs out.
+    pub fn new() -> Option<AddressSpace> {
+        let pml4 = FRAMES.lock().as_mut()?.allocate_frame()?;
+        let space = AddressSpace { pml4 };
+        let table = table(pml4);
+        table.zero();
+        let kernel = PAGE_TABLE.lock();
+        let kernel = kernel.as_ref()?.level_4_table();
+        // Only the top level is copied: below it the kernel half is shared.
+        // shortcut: a top-level kernel entry created after this isn't seen
+        // here; all of them exist by the end of boot, so copy them again if
+        // the kernel ever adds a region later.
+        for i in 256..512 {
+            table[i] = kernel[i].clone();
+        }
+        Some(space)
+    }
+
+    /// What CR3 holds while the program runs.
+    pub fn pml4(&self) -> PhysFrame {
+        self.pml4
+    }
+
+    fn mapper(&mut self) -> OffsetPageTable<'_> {
+        // Safety: the table is this address space's alone, and `&mut self`
+        // keeps this the only reference to it.
+        unsafe { OffsetPageTable::new(table(self.pml4), VirtAddr::new(PHYS_MAP_BASE)) }
+    }
+
+    /// Map fresh zeroed frames over `pages`, accessible to the program, with
+    /// `flags` besides. A page already mapped keeps its frame and gets the
+    /// union of its flags and these. `None` when memory runs out.
+    pub fn map(&mut self, pages: PageRange, flags: PageTableFlags) -> Option<()> {
+        let flags = flags | PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+        // The tables above must let ring 3 through too.
+        let table_flags =
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+        let mut frames = FRAMES.lock();
+        let frames = frames.as_mut()?;
+        let mut mapper = self.mapper();
+        for page in pages {
+            if let TranslateResult::Mapped { flags: old, .. } =
+                mapper.translate(page.start_address())
+            {
+                // Writable if either asks; no-execute only if both do.
+                let nx = PageTableFlags::NO_EXECUTE;
+                let union = ((old | flags) & !nx) | (old & flags & nx);
+                // Safety: the program's own page, keeping its frame.
+                unsafe { mapper.update_flags(page, union) }.ok()?.flush();
+                continue;
+            }
+            let frame = frames.allocate_frame()?;
+            // Zeroed: a frame comes back holding whatever was in it before.
+            // Safety: just allocated, so ours alone.
+            unsafe { phys_ptr(frame.start_address())?.write_bytes(0, 4096) };
+            // Safety: a lower-half page of this address space, unmapped until now.
+            unsafe { mapper.map_to_with_table_flags(page, frame, flags, table_flags, frames) }
+                .ok()?
+                .flush();
+        }
+        Some(())
+    }
+
+    /// Unmap `pages` and free their frames. Pages that aren't mapped are skipped.
+    pub fn unmap(&mut self, pages: PageRange) {
+        let mut frames = FRAMES.lock();
+        let Some(frames) = frames.as_mut() else { return };
+        let mut mapper = self.mapper();
+        for page in pages {
+            if let Ok((frame, flush)) = mapper.unmap(page) {
+                flush.flush();
+                // Safety: unmapped from the only address space that had it.
+                unsafe { frames.deallocate_frame(frame) };
+            }
+        }
+    }
+
+    /// Give the mapped pages among `pages` these flags, besides being present
+    /// and accessible to the program.
+    pub fn protect(&mut self, pages: PageRange, flags: PageTableFlags) {
+        let flags = flags | PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+        let mut mapper = self.mapper();
+        for page in pages {
+            // Safety: the program's own pages, keeping their frames.
+            if let Ok(flush) = unsafe { mapper.update_flags(page, flags) } {
+                flush.flush();
+            }
+        }
+    }
+
+    /// Copy `bytes` to `addr`, whatever the pages' protection: for the loader.
+    pub fn load(&mut self, addr: u64, bytes: &[u8]) -> Option<()> {
+        self.copy(addr, bytes.len(), PageTableFlags::PRESENT, |at, range| {
+            // Safety: `copy` hands out mapped frames, `range.len()` long.
+            unsafe {
+                core::ptr::copy_nonoverlapping(bytes[range.clone()].as_ptr(), at, range.len())
+            }
+        })
+    }
+
+    /// Copy `bytes` to the program's memory at `addr`, which must be mapped
+    /// writable for it. `None` if any of it isn't: the system call's EFAULT.
+    pub fn write(&mut self, addr: u64, bytes: &[u8]) -> Option<()> {
+        let need =
+            PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::WRITABLE;
+        self.copy(addr, bytes.len(), need, |at, range| {
+            // Safety: as in `load`.
+            unsafe {
+                core::ptr::copy_nonoverlapping(bytes[range.clone()].as_ptr(), at, range.len())
+            }
+        })
+    }
+
+    /// Fill `buf` from the program's memory at `addr`, which must be mapped
+    /// for it. `None` if any of it isn't: the system call's EFAULT.
+    pub fn read(&mut self, addr: u64, buf: &mut [u8]) -> Option<()> {
+        let need = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+        self.copy(addr, buf.len(), need, |at, range| {
+            // Safety: as in `load`.
+            unsafe {
+                core::ptr::copy_nonoverlapping(at, buf[range.clone()].as_mut_ptr(), range.len())
+            }
+        })
+    }
+
+    /// Walk `len` bytes from `addr` a page at a time, through the page tables
+    /// rather than the addresses themselves, so it works from any address
+    /// space and an unmapped page is an error instead of a page fault.
+    fn copy(
+        &mut self,
+        addr: u64,
+        len: usize,
+        need: PageTableFlags,
+        mut each: impl FnMut(*mut u8, Range<usize>),
+    ) -> Option<()> {
+        if addr.checked_add(len as u64)? > USER_END {
+            return None;
+        }
+        let mapper = self.mapper();
+        let mut done = 0;
+        while done < len {
+            let at = addr + done as u64;
+            let TranslateResult::Mapped { frame, offset, flags } =
+                mapper.translate(VirtAddr::new(at))
+            else {
+                return None;
+            };
+            if !flags.contains(need) {
+                return None;
+            }
+            let chunk = (len - done).min(4096 - (at % 4096) as usize);
+            each(phys_ptr(frame.start_address() + offset)?, done..done + chunk);
+            done += chunk;
+        }
+        Some(())
+    }
+}
+
+impl Drop for AddressSpace {
+    fn drop(&mut self) {
+        let mut frames = FRAMES.lock();
+        let Some(frames) = frames.as_mut() else { return };
+        free_tables(self.pml4, 4, 256, frames);
+    }
+}
+
+/// Free every frame mapped below `frame`, a page table of `level`, through its
+/// first `entries` entries, then the table itself. Only the lower half's
+/// tables and frames are ever passed here: the upper half's are the kernel's.
+fn free_tables(frame: PhysFrame, level: u8, entries: usize, frames: &mut BootInfoFrameAllocator) {
+    for entry in table(frame).iter().take(entries) {
+        if entry.flags().contains(PageTableFlags::PRESENT) {
+            // Never made: `map` maps 4 KiB pages only.
+            debug_assert!(!entry.flags().contains(PageTableFlags::HUGE_PAGE));
+            let below = PhysFrame::containing_address(entry.addr());
+            if level > 1 {
+                free_tables(below, level - 1, 512, frames);
+            } else {
+                // Safety: a page of the program's, which is gone.
+                unsafe { frames.deallocate_frame(below) };
+            }
+        }
+    }
+    // Safety: a table only the dropped address space used.
+    unsafe { frames.deallocate_frame(frame) };
+}
+
+/// The page table in `frame`, through the physical-memory map.
+fn table(frame: PhysFrame) -> &'static mut PageTable {
+    let ptr = phys_ptr(frame.start_address()).expect("physical memory is mapped");
+    // Safety: page tables are frames of their own; callers hold the only use.
+    unsafe { &mut *ptr.cast::<PageTable>() }
 }
 
 /// Hands out the usable frames in the bootloader's memory map, and takes them

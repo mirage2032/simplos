@@ -1,14 +1,28 @@
 use crate::io::interrupts::pic::InterruptIndex;
 use crate::io::interrupts::{gdt, pic};
 use crate::io::ps2::{PS2_CONTROLLER, Ps2InterruptCause};
-use crate::serial_println;
+use crate::process::{self, KILLED_SIGBUS, KILLED_SIGFPE, KILLED_SIGILL, KILLED_SIGSEGV};
+use crate::{serial_println, thread};
+use core::fmt;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::{Lazy, Mutex};
+use x86_64::PrivilegeLevel;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 pub static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     let mut idt = InterruptDescriptorTable::new();
     idt.breakpoint.set_handler_fn(breakpoint_handler);
     idt.page_fault.set_handler_fn(page_fault_handler);
+    // The faults a user program can cause. Without a handler each would
+    // become a double fault, and one program could stop the machine.
+    idt.divide_error.set_handler_fn(divide_error_handler);
+    idt.debug.set_handler_fn(debug_handler);
+    idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
+    idt.x87_floating_point.set_handler_fn(x87_floating_point_handler);
+    idt.simd_floating_point.set_handler_fn(simd_floating_point_handler);
+    idt.segment_not_present.set_handler_fn(segment_not_present_handler);
+    idt.stack_segment_fault.set_handler_fn(stack_segment_fault_handler);
+    idt.general_protection_fault.set_handler_fn(general_protection_fault_handler);
+    idt.alignment_check.set_handler_fn(alignment_check_handler);
     unsafe {
         idt.double_fault
             .set_handler_fn(double_fault_handler)
@@ -83,20 +97,70 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
     }
     pic::notify_end_of_interrupt(&InterruptIndex::Keyboard);
 }
-/// Also unrecoverable as things stand — nothing here grows a mapping on demand —
-/// so the useful thing is to say which address was touched and stop, rather than
-/// halt silently and look like a freeze.
+/// A fault in a user program ends that program, with the exit status of the
+/// signal Linux would have sent it. In the kernel it is a bug: say what and
+/// where, and stop, rather than halt silently and look like a freeze.
+fn fault(frame: &InterruptStackFrame, what: fmt::Arguments, status: i32) -> ! {
+    if frame.code_segment.rpl() == PrivilegeLevel::Ring3 {
+        let id = thread::current_process().map_or(0, |process| process.id);
+        serial_println!(
+            "simplos: process {}: {} at {:#x}, ended",
+            id,
+            what,
+            frame.instruction_pointer.as_u64()
+        );
+        process::exit_current(status);
+    }
+    crate::serial::panic_print(format_args!("\n*** EXCEPTION: {what} ***\n{frame:#?}\n"));
+    crate::hlt_loop();
+}
+
+/// Nothing grows a mapping on demand yet, so every page fault is fatal: to a
+/// user program, or to the kernel.
 extern "x86-interrupt" fn page_fault_handler(
     stack_frame: InterruptStackFrame,
     error_code: PageFaultErrorCode,
 ) {
-    crate::serial::panic_print(format_args!(
-        "\n*** EXCEPTION: PAGE FAULT ***\naddress: {:?}\nerror: {:?}\n{:#?}\n",
-        x86_64::registers::control::Cr2::read(),
-        error_code,
-        stack_frame
-    ));
-    crate::hlt_loop();
+    let address = x86_64::registers::control::Cr2::read_raw();
+    let what = format_args!("page fault at {address:#x} ({error_code:?})");
+    fault(&stack_frame, what, KILLED_SIGSEGV)
+}
+
+extern "x86-interrupt" fn divide_error_handler(frame: InterruptStackFrame) {
+    fault(&frame, format_args!("divide error"), KILLED_SIGFPE)
+}
+
+extern "x86-interrupt" fn debug_handler(frame: InterruptStackFrame) {
+    // A program can single-step itself by setting the trap flag.
+    fault(&frame, format_args!("debug trap"), process::KILLED_SIGTRAP)
+}
+
+extern "x86-interrupt" fn invalid_opcode_handler(frame: InterruptStackFrame) {
+    fault(&frame, format_args!("invalid opcode"), KILLED_SIGILL)
+}
+
+extern "x86-interrupt" fn x87_floating_point_handler(frame: InterruptStackFrame) {
+    fault(&frame, format_args!("x87 floating-point exception"), KILLED_SIGFPE)
+}
+
+extern "x86-interrupt" fn simd_floating_point_handler(frame: InterruptStackFrame) {
+    fault(&frame, format_args!("SIMD floating-point exception"), KILLED_SIGFPE)
+}
+
+extern "x86-interrupt" fn segment_not_present_handler(frame: InterruptStackFrame, error: u64) {
+    fault(&frame, format_args!("segment not present ({error:#x})"), KILLED_SIGBUS)
+}
+
+extern "x86-interrupt" fn stack_segment_fault_handler(frame: InterruptStackFrame, error: u64) {
+    fault(&frame, format_args!("stack segment fault ({error:#x})"), KILLED_SIGBUS)
+}
+
+extern "x86-interrupt" fn general_protection_fault_handler(frame: InterruptStackFrame, error: u64) {
+    fault(&frame, format_args!("general protection fault ({error:#x})"), KILLED_SIGSEGV)
+}
+
+extern "x86-interrupt" fn alignment_check_handler(frame: InterruptStackFrame, error: u64) {
+    fault(&frame, format_args!("alignment check ({error:#x})"), KILLED_SIGBUS)
 }
 extern "x86-interrupt" fn mouse_interrupt_handler(_stack_frame: InterruptStackFrame) {
     if let Some(controller) = PS2_CONTROLLER.lock().as_mut()

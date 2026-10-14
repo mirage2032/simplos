@@ -1,0 +1,107 @@
+//! User programs: a Linux x86-64 executable (user/probe, from the ramdisk)
+//! runs in ring 3, writes through system calls, and ends, cleanly or by a
+//! fault, without taking anything else with it.
+
+#![no_std]
+#![no_main]
+#![feature(custom_test_frameworks)]
+#![test_runner(simplos::test_runner)]
+#![reexport_test_harness_main = "test_main"]
+
+extern crate alloc;
+
+use alloc::string::String;
+use alloc::sync::Arc;
+use alloc::vec;
+use alloc::vec::Vec;
+use bootloader_api::{BootInfo, entry_point};
+use core::panic::PanicInfo;
+use simplos::process;
+use spin::Mutex;
+
+entry_point!(main, config = &simplos::BOOTLOADER_CONFIG);
+
+fn main(boot_info: &'static mut BootInfo) -> ! {
+    simplos::pre_init(boot_info);
+    test_main();
+    simplos::hlt_loop()
+}
+
+#[panic_handler]
+fn panic(info: &PanicInfo) -> ! {
+    simplos::test_panic_handler(info)
+}
+
+/// A running probe and what it has written so far.
+type Run = (Arc<process::Process>, Arc<Mutex<Vec<u8>>>);
+
+/// Start probe with `args`.
+fn start(args: &[&str]) -> Run {
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let sink = output.clone();
+    let mut argv = vec!["probe"];
+    argv.extend(args);
+    let elf = simplos::ramdisk().expect("tools/boot-test attaches user/probe");
+    let process = process::spawn(elf, &argv, move |bytes| sink.lock().extend_from_slice(bytes))
+        .expect("probe loads");
+    (process, output)
+}
+
+/// Wait for it: its exit status, and everything it wrote to its standard
+/// output and error.
+fn finish((process, output): Run) -> (i32, String) {
+    let status = process.wait();
+    let output = String::from_utf8_lossy(&output.lock()).into_owned();
+    (status, output)
+}
+
+fn run(args: &[&str]) -> (i32, String) {
+    finish(start(args))
+}
+
+#[test_case]
+fn a_program_runs_prints_and_exits() {
+    assert_eq!(run(&["hello"]), (0, String::from("hello from user space\n")));
+}
+
+#[test_case]
+fn a_program_gets_its_arguments() {
+    // On standard error, with the exit status probe picks for it.
+    assert_eq!(run(&["bogus"]), (2, String::from("probe: unknown mode \"bogus\"\n")));
+}
+
+#[test_case]
+fn a_fault_ends_only_the_program() {
+    assert_eq!(run(&["fault"]).0, process::KILLED_SIGSEGV);
+    assert_eq!(run(&["hello"]).0, 0, "a program after the fault");
+}
+
+#[test_case]
+fn bad_system_calls_are_refused() {
+    // A pointer into the kernel's half and one into nothing are EFAULT, and
+    // an unknown call ENOSYS, as on Linux: never the kernel's memory, never a
+    // fault in the kernel.
+    assert_eq!(run(&["bad-calls"]), (0, String::from("-14 -14 -38\n")));
+}
+
+#[test_case]
+fn programs_keep_their_registers_to_themselves() {
+    // Two at once, each preempted many times with its sum in SSE registers
+    // and Rust's thread-locals behind `fs`: unless every switch puts both
+    // away and brings them back, the two corrupt each other.
+    let (a, b) = (start(&["float"]), start(&["float"]));
+    // What the same build prints on Linux.
+    let expected = (0, String::from("1885617375.8495038\n"));
+    assert_eq!(finish(a), expected);
+    assert_eq!(finish(b), expected);
+}
+
+#[test_case]
+fn finished_programs_give_their_memory_back() {
+    // Each run maps about 720 KiB: the program, its stack and their page
+    // tables. 200 runs is more than the test machine's 128 MiB, so this only
+    // finishes if each program's memory is freed when it ends.
+    for _ in 0..200 {
+        assert_eq!(run(&["exit"]).0, 0);
+    }
+}
