@@ -150,18 +150,21 @@ pub fn spawn(
     output: impl FnMut(&[u8]) + Send + 'static,
 ) -> Result<Arc<Process>, &'static str> {
     let tty = Arc::new(fs::Handle::tty(Arc::new(Tty::capture(Box::new(output)))));
-    spawn_with(elf, args, vec![Some(tty); 3])
+    spawn_with(elf, args, &[], vec![Some(tty); 3])
 }
 
-/// `spawn`, with `files` as the program's descriptors to start with, by
-/// number: what its standard input, output and error are, for one.
+/// `spawn`, with `env` as the program's environment, and `files` as its
+/// descriptors to start with, by number: what its standard input, output
+/// and error are, for one.
 pub fn spawn_with(
     elf: &[u8],
     args: &[&str],
+    env: &[&str],
     files: Vec<Option<Arc<fs::Handle>>>,
 ) -> Result<Arc<Process>, &'static str> {
     let args: Vec<&[u8]> = args.iter().map(|arg| arg.as_bytes()).collect();
-    let (memory, start) = program(elf, &args, &[])?;
+    let env: Vec<&[u8]> = env.iter().map(|variable| variable.as_bytes()).collect();
+    let (memory, start) = program(elf, &args, &env)?;
     let pml4 = memory.space.pml4();
     let tty = files.iter().flatten().find_map(|handle| match &**handle {
         fs::Handle::Tty { tty, .. } => Some(tty.clone()),
@@ -191,6 +194,30 @@ pub fn spawn_with(
     };
     thread::spawn_user(Box::new(user)).ok_or(NO_MEMORY)?;
     Ok(process)
+}
+
+/// `spawn_with`, for the program at `path` on the disk: or the errno
+/// `execve` would give for it.
+pub fn spawn_program(
+    path: &str,
+    args: &[&str],
+    env: &[&str],
+    files: Vec<Option<Arc<fs::Handle>>>,
+) -> Result<Arc<Process>, i64> {
+    let elf = fs::read_program(&fs::resolve("", path))?;
+    spawn_with(&elf, args, env, files).map_err(load_errno)
+}
+
+/// The errno for why a program couldn't be loaded.
+pub fn load_errno(error: &str) -> i64 {
+    const E2BIG: i64 = 7;
+    const ENOEXEC: i64 = 8;
+    const ENOMEM: i64 = 12;
+    match error {
+        NO_MEMORY => ENOMEM,
+        TOO_LONG => E2BIG,
+        _ => ENOEXEC,
+    }
 }
 
 /// `elf` loaded into a new address space, with `args` and `env` on its

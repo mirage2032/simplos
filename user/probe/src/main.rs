@@ -308,22 +308,7 @@ fn main() {
         // Standard input in raw mode, as cfmakeraw makes it: COUNT bytes
         // read as they come, each read's shown; then as it was.
         Some("raw") => {
-            const TCGETS: usize = 0x5401;
-            const TCSETS: usize = 0x5402;
-            let mut termios = [0u8; 60];
-            syscall(16, 0, TCGETS, termios.as_mut_ptr() as usize);
-            let saved = termios;
-            let mut clear = |at: usize, bits: u32| {
-                let flags = u32::from_le_bytes(termios[at..at + 4].try_into().unwrap()) & !bits;
-                termios[at..at + 4].copy_from_slice(&flags.to_le_bytes());
-            };
-            // ICRNL and IXON; OPOST; ICANON, ECHO, ISIG and IEXTEN.
-            clear(0, 0o400 | 0o2000);
-            clear(4, 0o1);
-            clear(12, 0o2 | 0o10 | 0o1 | 0o100000);
-            // VMIN and VTIME: a byte at least, waiting as long as it takes.
-            (termios[17 + 6], termios[17 + 5]) = (1, 0);
-            syscall(16, 0, TCSETS, termios.as_ptr() as usize);
+            let saved = raw_mode();
             println!("raw");
             let count: usize = arg(2).parse().unwrap_or(1);
             let mut got = 0;
@@ -335,6 +320,36 @@ fn main() {
             }
             syscall(16, 0, TCSETS, saved.as_ptr() as usize);
             println!("cooked");
+        }
+        // Where the terminal says its cursor is, asked as programs do: with
+        // ESC [ 6 n, the answer coming back as if typed, in raw mode.
+        Some("cursor") => {
+            let saved = raw_mode();
+            or_fail("stdout", io::stdout().write_all(b"\x1b[6n"));
+            or_fail("stdout", io::stdout().flush());
+            let mut answer = Vec::new();
+            while answer.last() != Some(&b'R') && answer.len() < 32 {
+                let mut byte = [0u8];
+                if syscall(0, 0, byte.as_mut_ptr() as usize, 1) <= 0 {
+                    break;
+                }
+                answer.push(byte[0]);
+            }
+            syscall(16, 0, TCSETS, saved.as_ptr() as usize);
+            println!("{:?}", String::from_utf8_lossy(&answer));
+        }
+        // Text in each colour and attribute a terminal has.
+        Some("colors") => {
+            for (first, base) in [(30, "dim"), (90, "bright")] {
+                let names = ["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"];
+                for (n, name) in names.iter().enumerate() {
+                    print!("\x1b[{}m{name} \x1b[{}m{name}\x1b[0m ", first + n, first + n + 10);
+                }
+                println!("({base})");
+            }
+            println!("\x1b[1mbold\x1b[0m \x1b[4munderlined\x1b[0m \x1b[7mreversed\x1b[0m plain");
+            let ramp: String = (0..24).map(|n| format!("\x1b[48;5;{}m ", 232 + n)).collect();
+            println!("{ramp}\x1b[0m");
         }
         // poll on a pipe: with nothing in it, at once and then for 50 ms;
         // then until a copy writes; then once it's gone and that's read. What
@@ -447,6 +462,29 @@ fn main() {
             std::process::exit(2);
         }
     }
+}
+
+const TCGETS: usize = 0x5401;
+const TCSETS: usize = 0x5402;
+
+/// Put standard input in raw mode, as cfmakeraw would: what its settings
+/// were, to put back.
+fn raw_mode() -> [u8; 60] {
+    let mut termios = [0u8; 60];
+    syscall(16, 0, TCGETS, termios.as_mut_ptr() as usize);
+    let saved = termios;
+    let mut clear = |at: usize, bits: u32| {
+        let flags = u32::from_le_bytes(termios[at..at + 4].try_into().unwrap()) & !bits;
+        termios[at..at + 4].copy_from_slice(&flags.to_le_bytes());
+    };
+    // ICRNL and IXON; OPOST; ICANON, ECHO, ISIG and IEXTEN.
+    clear(0, 0o400 | 0o2000);
+    clear(4, 0o1);
+    clear(12, 0o2 | 0o10 | 0o1 | 0o100000);
+    // VMIN and VTIME: a byte at least, waiting as long as it takes.
+    (termios[17 + 6], termios[17 + 5]) = (1, 0);
+    syscall(16, 0, TCSETS, termios.as_ptr() as usize);
+    saved
 }
 
 /// What `result` holds, or else say what went wrong with `path`, and stop.

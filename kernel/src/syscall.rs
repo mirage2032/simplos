@@ -25,6 +25,21 @@ use x86_64::registers::model_specific::{Efer, EferFlags, LStar, SFMask, Star};
 use x86_64::registers::rflags::RFlags;
 use x86_64::structures::paging::PageTableFlags;
 
+/// What Linux's `strerror` says of the errnos that starting a program can
+/// end in, for the kernel to tell whoever's at the console.
+pub fn strerror(errno: i64) -> &'static str {
+    match errno {
+        2 => "No such file or directory",
+        5 => "I/O error",
+        7 => "Argument list too long",
+        8 => "Exec format error",
+        12 => "Cannot allocate memory",
+        13 => "Permission denied",
+        20 => "Not a directory",
+        _ => "Unknown error",
+    }
+}
+
 const EPERM: i64 = 1;
 const EBADF: i64 = 9;
 const ENOMEM: i64 = 12;

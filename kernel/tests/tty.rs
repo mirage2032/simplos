@@ -18,6 +18,7 @@ use alloc::vec::Vec;
 use bootloader_api::{BootInfo, entry_point};
 use core::panic::PanicInfo;
 use simplos::fs::{self, Handle};
+use simplos::init;
 use simplos::process::{self, Process};
 use simplos::thread;
 use simplos::tty::{Termios, Tty};
@@ -54,7 +55,7 @@ fn start(tty: &Arc<Tty>, args: &[&str]) -> Arc<Process> {
     argv.extend(args);
     let elf = simplos::ramdisk().expect("tools/boot-test attaches user/probe");
     let files = vec![Some(Arc::new(Handle::tty(tty.clone()))); 3];
-    process::spawn_with(elf, &argv, files).expect("probe loads")
+    process::spawn_with(elf, &argv, &[], files).expect("probe loads")
 }
 
 /// Run probe with `args` on `tty`: its exit status, and what's on `screen`
@@ -132,8 +133,26 @@ fn a_program_knows_its_terminal() {
     assert_eq!(run(&tty, &screen, &["write", "/dev/tty", "x"]), ok("x"));
     let elf = simplos::ramdisk().unwrap();
     let files = vec![Some(Arc::new(Handle::Null)); 3];
-    let probe = process::spawn_with(elf, &["probe", "write", "/dev/tty", "x"], files);
+    let probe = process::spawn_with(elf, &["probe", "write", "/dev/tty", "x"], &[], files);
     assert_eq!(probe.unwrap().wait(), 1);
+}
+
+#[test_case]
+fn the_first_program_there_is_runs_as_linux_starts_it() {
+    let (tty, screen) = terminal();
+    // None of Linux's are on the disk, so the kernel's shell would be next.
+    init::run(&tty);
+    assert!(init::start(&tty, &init::PROGRAMS, &[]).is_none());
+    // One that isn't there, one that isn't a program, which is said, and
+    // then probe, with Linux's environment.
+    let programs = ["/sbin/init", "/hello.txt", "/bin/probe"];
+    let (path, first) = init::start(&tty, &programs, &["env"]).expect("one of them runs");
+    assert_eq!((path.as_str(), first.wait()), ("/bin/probe", 0));
+    assert_eq!(
+        text(&screen),
+        "/hello.txt is there but couldn't be run: Permission denied\r\n\
+         [\"env\"]\r\nHOME=/\r\nTERM=linux\r\n"
+    );
 }
 
 #[test_case]

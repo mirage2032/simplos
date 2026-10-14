@@ -6,7 +6,7 @@ use crate::io::interrupts::idt::TIMER_COUNTER;
 use crate::io::interrupts::pit::TIMER_HZ;
 use crate::io::{disk, hpet};
 use crate::tty::Tty;
-use crate::{fs, process};
+use crate::{fs, init, process, syscall};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
@@ -34,8 +34,9 @@ commands:
                 sleep [MS], float, bad-calls, fault or exit;
                 cat with no paths copies what's typed, until ^D;
                 on the ext4 disk: cat PATH.., ls PATH, stat PATH,
-                write PATH TEXT, append PATH TEXT;
-                spawn /bin/probe MODE runs it from the disk";
+                write PATH TEXT, append PATH TEXT
+  run /PATH [ARGS]
+                run the program at PATH on the ext4 disk";
 
 pub struct Shell {
     tty: Arc<Tty>,
@@ -92,19 +93,28 @@ impl Shell {
         }
     }
 
-    /// Run the program in the ramdisk with `args`, on the terminal, and wait
-    /// for it: its exit status, if that isn't 0.
+    /// Run the program on the disk at the path that starts `args`, or else
+    /// the one in the ramdisk, with the rest of `args`, on the terminal; and
+    /// wait for it: its exit status, if that isn't 0.
     fn run_program(&mut self, args: &str) -> String {
-        let Some(elf) = crate::ramdisk() else {
-            return String::from("run: no program in the ramdisk");
+        let mut argv: Vec<&str> = args.split_whitespace().collect();
+        let files = vec![Some(Arc::new(fs::Handle::tty(self.tty.clone()))); 3];
+        let env = &init::ENVIRONMENT;
+        let started = match argv.first() {
+            Some(path) if path.starts_with('/') => process::spawn_program(path, &argv, env, files)
+                .map_err(|errno| format!("run: {path}: {}", syscall::strerror(errno))),
+            _ => {
+                let Some(elf) = crate::ramdisk() else {
+                    return String::from("run: no program in the ramdisk");
+                };
+                argv.insert(0, "probe");
+                process::spawn_with(elf, &argv, env, files).map_err(|error| format!("run: {error}"))
+            }
         };
-        let mut argv = vec!["probe"];
-        argv.extend(args.split_whitespace());
-        let console = Arc::new(fs::Handle::tty(self.tty.clone()));
         let settings = self.tty.termios();
-        let status = match process::spawn_with(elf, &argv, vec![Some(console); 3]) {
+        let status = match started {
             Ok(process) => process.wait(),
-            Err(error) => return format!("run: {error}"),
+            Err(message) => return message,
         };
         // As the program found it, whatever it changed.
         self.tty.set_termios(settings, false);
@@ -227,10 +237,20 @@ fn run_starts_the_program_in_the_ramdisk_on_the_terminal() {
     let (mut shell, screen) = shell();
     assert_eq!(shell.execute("run hello"), "");
     assert_eq!(shell.execute("run fault"), "[exit status 139]");
-    // Which runs itself again, from the ext4 disk tools/boot-test attaches.
+    // Which runs itself again, from the ext4 disk tools/boot-test attaches;
+    // or is run from there, with an environment, as a terminal's programs
+    // are given.
     assert_eq!(shell.execute("run spawn /bin/probe hello"), "");
+    assert_eq!(shell.execute("run /bin/probe env a"), "");
     let screen = String::from_utf8(screen.lock().clone()).unwrap();
-    assert_eq!(screen, "hello from user space\nhello from user space\nexit status: 0\n");
+    assert_eq!(
+        screen,
+        "hello from user space\nhello from user space\nexit status: 0\n\
+         [\"env\", \"a\"]\nHOME=/\nTERM=linux\n"
+    );
+    // What isn't there, or isn't a program.
+    assert_eq!(shell.execute("run /missing"), "run: /missing: No such file or directory");
+    assert_eq!(shell.execute("run /hello.txt"), "run: /hello.txt: Permission denied");
 }
 
 #[test_case]

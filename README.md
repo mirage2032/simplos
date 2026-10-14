@@ -2,9 +2,10 @@
 
 A small x86_64 operating system written in Rust, from the boot sector up. It
 brings up long mode, a GDT and IDT, paging and a heap, a PS/2 keyboard, the
-HPET, and drops into a small command line (type `help`) on a terminal drawn
-into a linear framebuffer, from which `run` starts an unmodified Linux x86-64
-program in user mode. It boots under both BIOS and UEFI firmware, on real hardware or an
+HPET, and draws a terminal into a linear framebuffer, on which it runs the
+first program on its disk, as Linux would, or else a small command line of its
+own (type `help`), from which `run` starts unmodified Linux x86-64 programs in
+user mode. It boots under both BIOS and UEFI firmware, on real hardware or an
 emulator — including [in a browser tab](https://lazyscript.com/projects/simplos), where QEMU itself
 is compiled to WebAssembly.
 
@@ -151,22 +152,50 @@ and edited first, with Backspace, ^U, ^W, and ^D for the end of file, and
 handed over on Enter; in raw mode each key is ready as it's pressed. A
 program reads and changes the settings, laid out as Linux's `termios`, with
 `ioctl` (`TCGETS`, `TCSETS` and the rest), and asks the size with
-`TIOCGWINSZ`. The screen (`terminal.rs`) keeps a grid of characters and a
-cursor, scrolls, and draws only the rows that changed.
+`TIOCGWINSZ`.
+
+The screen (`terminal.rs`) keeps a grid of characters, each with its colours
+and attributes, and a cursor; it draws only the rows that changed, and
+scrolls the whole screen by moving it. It understands the escape sequences
+the Linux console does, as its `linux` terminfo entry lists them, and
+programs are given `TERM=linux`: moving the cursor, erasing, inserting and
+deleting characters and lines, scrolling a region, the 16 colours and 256 and
+any, bold, underlined and reversed, saving the cursor, hiding it, and saying
+where it is, which comes back as if typed; and the alternate screen, which
+full-screen programs ask for whatever the entry says. The keys send what the
+console's do. In the shell, `run colors` shows the colours.
 
 `poll` and `ppoll` wait for pipes and terminals, as long as they're asked
 to, and `O_NONBLOCK` (from `open`, `pipe2`, `fcntl` or `FIONBIO`) makes what
 would wait fail with `EAGAIN` instead. In the shell, `run cat` copies what's
 typed until ^D. For now:
 
-- of the escape sequences, only moving the cursor and erasing the screen and
-  lines; the rest of a VT100's are read and ignored;
+- of the escape sequences, no line-drawing characters, tab stops but every
+  eighth column, insert mode or application cursor keys, none of which the
+  `linux` entry asks for; what isn't known is read and ignored;
 - no signals, so ^C, ^\ and ^Z throw away the line typed so far and send
   nothing, and no process groups: a program asking which is in the
   foreground is told it's itself;
 - in raw mode, `VTIME` is ignored: a read waits for `VMIN` bytes however
   long they take;
 - the font is ASCII: anything else shows as `?`.
+
+## The first program
+
+Once it's up, the kernel runs the first of `/sbin/init`, `/etc/init`,
+`/bin/init` and `/bin/sh` that's on the disk, on the console, as Linux
+does, with Linux's environment for it: `HOME=/` and `TERM=linux`. One that's
+there but can't be run is said so, and passed over. Which program, and its
+arguments, can be chosen as Linux's `init=` does, through QEMU's fw_cfg,
+`none` meaning none:
+
+```sh
+cargo run -- -fw_cfg name=opt/simplos/init,string="/bin/probe colors"
+```
+
+When there's none, or once it ends, which on Linux would stop everything,
+the kernel's own shell runs instead, and its `run /PATH ARGS` runs a program
+from the disk.
 
 ## Tests
 
