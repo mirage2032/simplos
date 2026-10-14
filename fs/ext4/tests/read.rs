@@ -92,11 +92,10 @@ fn reads_from_anywhere_in_a_file() {
     let root = dir.join("tree");
     make_tree(&root);
     let fs = Ext4::mount(Box::new(image(&dir, &root, &["-t", "ext4"], "64M"))).unwrap();
-    let mut file = fs.open("big.bin").unwrap();
+    let file = fs.open("big.bin").unwrap();
     // Across the end of one 4 KiB block into the next.
     let mut buf = [0; 100];
-    file.seek(8190).unwrap();
-    assert_eq!(file.read(&mut buf).unwrap(), 100);
+    assert_eq!(file.read_at(8190, &mut buf).unwrap(), 100);
     assert_eq!(buf[..], big()[8190..8290]);
 }
 

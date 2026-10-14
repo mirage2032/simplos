@@ -95,6 +95,18 @@ the next boot replays the journal, as Linux would. The work is done by
 (`thread::SleepLock`), since a call can wait on the disk for a long time.
 The disk is trusted: lwext4 is C, parsing it in ring 0, and isn't fuzzed yet.
 
+Programs use it through Linux's system calls, so Rust's `std::fs` (or C's
+stdio) works as it does on Linux: `open`, `openat`, `close`, `read`, `write`,
+`pread64`, `pwrite64`, `lseek`, `stat`, `lstat`, `fstat`, `newfstatat`,
+`getdents64`, `fcntl` and `fsync`. In the shell, `run cat /hello.txt` has the
+user program read it, and `run` lists its other modes. For now:
+
+- every path starts at the root: there's no `chdir` yet, and no `mkdir`,
+  `unlink` or `rename` for programs either;
+- no symbolic link is followed, so `stat` and `lstat` are the same;
+- standard input is always at its end, and close-on-exec means nothing until
+  there's an `execve`.
+
 ## Tests
 
 ```sh
@@ -109,7 +121,8 @@ itself down back into a pass or a fail. The guest's side of that is QEMU's
 `isa-debug-exit` device — writing to its port makes QEMU exit with a status
 derived from the value written. Every test also gets two blank scratch disks,
 1 MiB on IDE and 2 MiB on AHCI, which `tests/disk.rs` writes to, and a 16 MiB
-ext4 disk made by e2fsprogs' `mke2fs`, which `tests/ext4.rs` writes to. After a
+ext4 disk made by e2fsprogs' `mke2fs`, which `tests/ext4.rs` writes to, and
+`tests/files.rs` has the user program read and write through system calls. After a
 run that passes, e2fsck must find nothing wrong with it, and it must have been
 unmounted, so the tests need e2fsprogs installed.
 
@@ -189,9 +202,11 @@ opened for reading, quietly mount read-only what it can't write, and crash
 unmounting after a failed mount.
 
 What it still can't do: rename onto a name that's there (refused, where Linux
-replaces it), remove a file over 16 MiB in one transaction, set timestamps,
-or seek past the end of a file. Every change is written through to the
-device before the call returns, which is simple and slow.
+replaces it), remove a file over 16 MiB in one transaction, remove a file
+that's open (refused, where Linux removes the name and keeps the file until
+it's closed), set timestamps, or leave a hole in a file (writing past the end
+fills the gap with zeros). Every change is on the device before the call
+returns, in the journal if there is one, which is simple and slow.
 
 Building and running `fs/ext4`'s tests needs e2fsprogs (`mke2fs`, `e2fsck`,
 `debugfs`) and `gzip`. Every test that writes ends with `e2fsck -fn` on the

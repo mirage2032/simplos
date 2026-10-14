@@ -4,7 +4,7 @@
 // Each test file uses its own share of these.
 #![allow(dead_code)]
 
-use ext4::{BlockDevice, DirEntry, Error, Ext4, Kind};
+use ext4::{BlockDevice, DirEntry, Error, Ext4, File, Kind};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -151,16 +151,25 @@ pub fn debugfs_ls(image: &Path, path: &str) -> Vec<String> {
 }
 
 pub fn read_all(fs: &Ext4, path: &str) -> Vec<u8> {
-    let mut file = fs.open(path).unwrap();
-    let mut contents = vec![0; file.size() as usize];
+    let file = fs.open(path).unwrap();
+    let mut contents = vec![0; file.size().unwrap() as usize];
     let mut done = 0;
     while done < contents.len() {
-        let read = file.read(&mut contents[done..]).unwrap();
+        let read = file.read_at(done as u64, &mut contents[done..]).unwrap();
         assert_ne!(read, 0, "{path} ended early, at {done}");
         done += read;
     }
-    assert_eq!(file.read(&mut [0; 16]).unwrap(), 0, "{path} goes on past its size");
+    assert_eq!(file.read_at(done as u64, &mut [0; 16]).unwrap(), 0, "{path} goes on past its size");
     contents
+}
+
+/// Write all of `buf` into `file` from `offset` on.
+pub fn write_all(file: &File, mut offset: u64, mut buf: &[u8]) {
+    while !buf.is_empty() {
+        let written = file.write_at(offset, buf).unwrap();
+        offset += written as u64;
+        buf = &buf[written..];
+    }
 }
 
 pub fn names(mut entries: Vec<DirEntry>) -> Vec<(String, Kind)> {

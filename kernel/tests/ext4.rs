@@ -37,20 +37,21 @@ fn panic(info: &PanicInfo) -> ! {
 }
 
 fn read_all(fs: &Ext4, path: &str) -> Vec<u8> {
-    let mut file = fs.open(path).unwrap();
-    let mut contents = vec![0; file.size() as usize];
+    let file = fs.open(path).unwrap();
+    let mut contents = vec![0; file.size().unwrap() as usize];
     let mut done = 0;
     while done < contents.len() {
-        let read = file.read(&mut contents[done..]).unwrap();
+        let read = file.read_at(done as u64, &mut contents[done..]).unwrap();
         assert_ne!(read, 0, "{path} ended early, at {done}");
         done += read;
     }
     contents
 }
 
-fn write_all(file: &mut File, mut buf: &[u8]) {
+fn write_all(file: &File, mut offset: u64, mut buf: &[u8]) {
     while !buf.is_empty() {
-        let written = file.write(buf).unwrap();
+        let written = file.write_at(offset, buf).unwrap();
+        offset += written as u64;
         buf = &buf[written..];
     }
 }
@@ -82,13 +83,10 @@ fn reads_what_linux_wrote() {
 #[test_case]
 fn writes_what_reads_back_after_mounting_again() {
     {
-        let mut root = ROOT.lock();
-        let fs = root.as_mut().expect("the ext4 disk, mounted");
-        write_all(&mut fs.create("big.bin").unwrap(), &pattern());
-        let mut file = fs.open_writable("big.bin").unwrap();
-        file.seek(4000).unwrap();
-        write_all(&mut file, &[0xaa; 200]);
-        drop(file);
+        let root = ROOT.lock();
+        let fs = root.as_ref().expect("the ext4 disk, mounted");
+        write_all(&fs.create("big.bin").unwrap(), 0, &pattern());
+        write_all(&fs.open_writable("big.bin").unwrap(), 4000, &[0xaa; 200]);
         fs.create_dir("made").unwrap();
         fs.rename("hello.txt", "made/hello.txt").unwrap();
         fs.remove_file("dir/nested/deep.txt").unwrap();
@@ -120,9 +118,9 @@ fn threads_take_turns_with_it() {
             for round in 0..5 {
                 let path = format!("thread-{thread}");
                 let contents = format!("thread {thread}, round {round}\n").repeat(100);
-                let mut root = ROOT.lock();
-                let fs = root.as_mut().expect("the ext4 disk, mounted");
-                write_all(&mut fs.create(&path).unwrap(), contents.as_bytes());
+                let root = ROOT.lock();
+                let fs = root.as_ref().expect("the ext4 disk, mounted");
+                write_all(&fs.create(&path).unwrap(), 0, contents.as_bytes());
                 assert_eq!(read_all(fs, &path), contents.as_bytes());
                 drop(root);
                 yield_now();
