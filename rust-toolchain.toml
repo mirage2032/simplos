@@ -8,7 +8,7 @@
 # through it to flatten the BIOS stages into flat binaries.
 #
 # `x86_64-unknown-linux-musl` builds `user/probe`, the user program the kernel
-# runs: a static Linux binary, linked by the host's `cc`.
+# runs: a static Linux binary, linked by the toolchain's own `rust-lld`.
 #
 # Note the off-by-one: nightly channels are named for their *publish* date, so
 # `nightly-2026-09-26` is the toolchain that reports `(5ceaf6608 2026-09-25)`.

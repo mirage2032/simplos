@@ -112,7 +112,7 @@ the right firmware and the right framebuffer mode.
 
 There is no cargo workspace: `kernel` builds for `x86_64-unknown-none` with
 `build-std`, the host tools build for the host, `user/probe` builds for
-`x86_64-unknown-linux-musl` (linked by the host's `cc`), and the settings for
+`x86_64-unknown-linux-musl` (linked by the toolchain's `rust-lld`), and the settings for
 those are mutually exclusive. Each crate has its own `Cargo.toml`, `Cargo.lock`,
 `.cargo/config.toml` and target directory — so a `[patch]` added to one has to
 be added to the others that need it.
