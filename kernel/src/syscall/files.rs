@@ -1,9 +1,9 @@
 //! System calls on files: file descriptors, paths, and what's behind them,
 //! the ext4 file system or the console.
 
-use super::{EBADF, EFAULT, EINVAL};
-use crate::fs::{self, Handle};
-use crate::pipe;
+use super::{EBADF, EFAULT, EINVAL, ENOTTY};
+use crate::fs::{self, Device, Handle};
+use crate::pipe::{self, WriteError};
 use crate::process::{Fd, Process};
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -13,6 +13,8 @@ use core::sync::atomic::Ordering::Relaxed;
 use ext4::{Kind, Metadata};
 
 const ENOENT: i64 = 2;
+const ENXIO: i64 = 6;
+const EAGAIN: i64 = 11;
 const EEXIST: i64 = 17;
 const ENOTDIR: i64 = 20;
 const EISDIR: i64 = 21;
@@ -30,6 +32,7 @@ const O_CREAT: u64 = 0o100;
 const O_EXCL: u64 = 0o200;
 const O_TRUNC: u64 = 0o1000;
 const O_APPEND: u64 = 0o2000;
+const O_NONBLOCK: u64 = 0o4000;
 const O_DIRECTORY: u64 = 0o200000;
 const O_CLOEXEC: u64 = 0o2000000;
 
@@ -52,6 +55,13 @@ pub(super) type Result<T> = core::result::Result<T, i64>;
 /// What a system call returns: the value, or minus the errno.
 pub(super) fn ret(result: Result<i64>) -> i64 {
     result.unwrap_or_else(|errno| -errno)
+}
+
+/// Set `handle`'s O_NONBLOCK as `flags` have it, if it has one.
+fn set_nonblocking(handle: &Handle, flags: u64) {
+    if let Some(nonblocking) = handle.nonblocking() {
+        nonblocking.store(flags & O_NONBLOCK != 0, Relaxed);
+    }
 }
 
 fn handle(process: &Process, fd: u64) -> Result<Arc<Handle>> {
@@ -142,7 +152,13 @@ pub fn open(process: &Process, dirfd: u64, path: u64, flags: u64, mode: u64) -> 
         let path = lookup(process, dirfd, &path_at(process, path)?)?;
         let cloexec = flags & O_CLOEXEC != 0;
         if let Some(device) = fs::device(&path) {
-            return install(process, device, cloexec);
+            let handle = match device {
+                Device::Null => Handle::Null,
+                Device::Zero => Handle::Zero,
+                Device::Tty => Handle::tty(process.tty.clone().ok_or(ENXIO)?),
+            };
+            set_nonblocking(&handle, flags);
+            return install(process, handle, cloexec);
         }
         let tree = fs::lock();
         let handle = match tree.metadata(&path) {
@@ -241,20 +257,22 @@ fn at(offset: u64) -> Result<u64> {
 fn read_at(process: &Process, fd: u64, buf: u64, count: u64, at: Option<u64>) -> Result<i64> {
     let count = (count as usize).min(MOST);
     match &*handle(process, fd)? {
-        Handle::Console | Handle::Pipe(_) if at.is_some() => Err(ESPIPE),
-        // shortcut: programs get no input yet: their standard input is at
-        // its end.
-        Handle::Console => Ok(0),
+        Handle::Tty { .. } | Handle::Pipe { .. } if at.is_some() => Err(ESPIPE),
+        Handle::Tty { tty, nonblocking } => {
+            let data = tty.read_or_wait(count, !nonblocking.load(Relaxed)).ok_or(EAGAIN)?;
+            process.memory.lock().space.write(buf, &data).ok_or(EFAULT)?;
+            Ok(data.len() as i64)
+        }
         Handle::Null => Ok(0),
         Handle::Zero => {
             process.memory.lock().space.write(buf, &vec![0; count]).ok_or(EFAULT)?;
             Ok(count as i64)
         }
-        Handle::Pipe(end) if end.write => Err(EBADF),
+        Handle::Pipe { end, .. } if end.write => Err(EBADF),
         // Not even for nothing: with no data, it would wait.
-        Handle::Pipe(_) if count == 0 => Ok(0),
-        Handle::Pipe(end) => {
-            let data = end.read(count);
+        Handle::Pipe { .. } if count == 0 => Ok(0),
+        Handle::Pipe { end, nonblocking } => {
+            let data = end.read(count, !nonblocking.load(Relaxed)).ok_or(EAGAIN)?;
             process.memory.lock().space.write(buf, &data).ok_or(EFAULT)?;
             Ok(data.len() as i64)
         }
@@ -280,16 +298,20 @@ fn write_at(process: &Process, fd: u64, buf: u64, count: u64, at: Option<u64>) -
     let mut data = vec![0; (count as usize).min(MOST)];
     process.memory.lock().space.read(buf, &mut data).ok_or(EFAULT)?;
     match &*handle {
-        Handle::Console | Handle::Pipe(_) if at.is_some() => Err(ESPIPE),
-        Handle::Console => {
-            (process.output.lock())(&data);
+        Handle::Tty { .. } | Handle::Pipe { .. } if at.is_some() => Err(ESPIPE),
+        Handle::Tty { tty, .. } => {
+            tty.write(&data);
             Ok(data.len() as i64)
         }
         Handle::Null | Handle::Zero => Ok(data.len() as i64),
-        Handle::Pipe(end) if !end.write => Err(EBADF),
+        Handle::Pipe { end, .. } if !end.write => Err(EBADF),
         // shortcut: no SIGPIPE, as there are no signals: just the error,
         // which is what a Rust program, ignoring SIGPIPE, gets anyway.
-        Handle::Pipe(end) => end.write(&data).map(|written| written as i64).ok_or(EPIPE),
+        Handle::Pipe { end, nonblocking } => match end.write(&data, !nonblocking.load(Relaxed)) {
+            Ok(written) => Ok(written as i64),
+            Err(WriteError::Broken) => Err(EPIPE),
+            Err(WriteError::Full) => Err(EAGAIN),
+        },
         Handle::Dir { .. } | Handle::File { write: false, .. } => Err(EBADF),
         Handle::File { file, append, offset, .. } => {
             let _tree = fs::lock();
@@ -316,7 +338,7 @@ pub fn lseek(process: &Process, fd: u64, offset: u64, whence: u64) -> i64 {
     ret((|| {
         let offset = offset as i64;
         match &*handle(process, fd)? {
-            Handle::Console | Handle::Pipe(_) => Err(ESPIPE),
+            Handle::Tty { .. } | Handle::Pipe { .. } => Err(ESPIPE),
             Handle::Null | Handle::Zero => Ok(0),
             Handle::File { file, offset: place, .. } => {
                 let _tree = fs::lock();
@@ -453,7 +475,7 @@ pub fn getdents64(process: &Process, fd: u64, buf: u64, count: u64) -> i64 {
 
 /// Copies of descriptors, and their flags.
 ///
-/// shortcut: the flags `open` set can't be changed.
+/// shortcut: of the flags `open` set, only O_NONBLOCK can be changed.
 pub fn fcntl(process: &Process, fd: u64, command: u64, arg: u64) -> i64 {
     const F_DUPFD: u64 = 0;
     const F_GETFD: u64 = 1;
@@ -476,10 +498,16 @@ pub fn fcntl(process: &Process, fd: u64, command: u64, arg: u64) -> i64 {
                 }
                 Ok(fd.cloexec as i64)
             }
-            F_SETFL => Ok(0),
+            F_SETFL => {
+                set_nonblocking(&handle, arg);
+                Ok(0)
+            }
             F_GETFL => Ok(match &*handle {
-                Handle::Console | Handle::Null | Handle::Zero => 2,
-                Handle::Pipe(end) => end.write as i64,
+                Handle::Tty { nonblocking, .. } => 2 | nonblocking_flag(nonblocking),
+                Handle::Null | Handle::Zero => 2,
+                Handle::Pipe { end, nonblocking } => {
+                    end.write as i64 | nonblocking_flag(nonblocking)
+                }
                 Handle::Dir { .. } => (O_RDONLY | O_DIRECTORY) as i64,
                 Handle::File { read, write, append, .. } => {
                     let access = match (read, write) {
@@ -493,6 +521,10 @@ pub fn fcntl(process: &Process, fd: u64, command: u64, arg: u64) -> i64 {
             _ => Err(EINVAL),
         }
     })())
+}
+
+fn nonblocking_flag(nonblocking: &core::sync::atomic::AtomicBool) -> i64 {
+    if nonblocking.load(Relaxed) { O_NONBLOCK as i64 } else { 0 }
 }
 
 pub fn mkdirat(process: &Process, dirfd: u64, path: u64, mode: u64) -> i64 {
@@ -587,17 +619,18 @@ pub fn umask(process: &Process, mask: u64) -> i64 {
 
 /// `pipe` and `pipe2`: a new pipe, whose reading and writing descriptors go
 /// to `fds` as two ints.
-///
-/// shortcut: no O_NONBLOCK, which nothing has needed yet.
 pub fn pipe2(process: &Process, fds: u64, flags: u64) -> i64 {
     ret((|| {
-        if flags & !O_CLOEXEC != 0 {
+        if flags & !(O_CLOEXEC | O_NONBLOCK) != 0 {
             return Err(EINVAL);
         }
         let cloexec = flags & O_CLOEXEC != 0;
         let (read, write) = pipe::new();
-        let read = install(process, Handle::Pipe(read), cloexec)?;
-        let installed = install(process, Handle::Pipe(write), cloexec).and_then(|write| {
+        let (read, write) = (Handle::pipe(read), Handle::pipe(write));
+        set_nonblocking(&read, flags);
+        set_nonblocking(&write, flags);
+        let read = install(process, read, cloexec)?;
+        let installed = install(process, write, cloexec).and_then(|write| {
             let mut ends = [0u8; 8];
             ends[..4].copy_from_slice(&(read as i32).to_le_bytes());
             ends[4..].copy_from_slice(&(write as i32).to_le_bytes());
@@ -654,7 +687,75 @@ pub fn fsync(process: &Process, fd: u64) -> i64 {
     ret(handle(process, fd).map(|_| 0))
 }
 
-/// Whether `fd` is open, for `poll`.
-pub fn is_open(process: &Process, fd: i32) -> bool {
-    handle(process, fd as u64).is_ok()
+/// What `fd` refers to, for `poll`: `None` if it isn't open.
+pub fn open_handle(process: &Process, fd: i32) -> Option<Arc<Handle>> {
+    handle(process, fd as u64).ok()
+}
+
+/// The terminal calls: its settings, its size, and what's waiting in it; and
+/// for anything, FIONBIO, which sets O_NONBLOCK.
+///
+/// shortcut: no process groups yet, so a program asking which is in the
+/// foreground is told it's its own, and telling it which changes nothing.
+pub fn ioctl(process: &Process, fd: u64, request: u64, arg: u64) -> i64 {
+    use crate::tty::Termios;
+    const TCGETS: u64 = 0x5401;
+    const TCSETS: u64 = 0x5402;
+    const TCSETSW: u64 = 0x5403;
+    const TCSETSF: u64 = 0x5404;
+    const TCFLSH: u64 = 0x540B;
+    const TIOCGPGRP: u64 = 0x540F;
+    const TIOCSPGRP: u64 = 0x5410;
+    const TIOCGWINSZ: u64 = 0x5413;
+    const TIOCSWINSZ: u64 = 0x5414;
+    const FIONREAD: u64 = 0x541B;
+    const FIONBIO: u64 = 0x5421;
+    ret((|| {
+        let handle = handle(process, fd)?;
+        let mut memory = process.memory.lock();
+        if request == FIONBIO {
+            let mut on = [0; 4];
+            memory.space.read(arg, &mut on).ok_or(EFAULT)?;
+            let on = i32::from_le_bytes(on) != 0;
+            set_nonblocking(&handle, if on { O_NONBLOCK } else { 0 });
+            return Ok(0);
+        }
+        let Handle::Tty { tty, .. } = &*handle else { return Err(ENOTTY) };
+        let mut put = |bytes: &[u8]| memory.space.write(arg, bytes).ok_or(EFAULT).map(|()| 0);
+        match request {
+            TCGETS => put(&tty.termios().to_bytes()),
+            TIOCGWINSZ => {
+                let (rows, cols) = tty.size();
+                let mut winsize = [0; 8];
+                winsize[..2].copy_from_slice(&rows.to_le_bytes());
+                winsize[2..4].copy_from_slice(&cols.to_le_bytes());
+                put(&winsize)
+            }
+            TIOCGPGRP => put(&(process.id as i32).to_le_bytes()),
+            FIONREAD => put(&(tty.available() as i32).to_le_bytes()),
+            TCSETS | TCSETSW | TCSETSF => {
+                // Output is written as it comes, so there's none to wait for.
+                let mut termios = [0; Termios::SIZE];
+                memory.space.read(arg, &mut termios).ok_or(EFAULT)?;
+                tty.set_termios(Termios::from_bytes(&termios), request == TCSETSF);
+                Ok(0)
+            }
+            TIOCSWINSZ => {
+                let mut winsize = [0u8; 8];
+                memory.space.read(arg, &mut winsize).ok_or(EFAULT)?;
+                let half = |at: usize| u16::from_le_bytes([winsize[at], winsize[at + 1]]);
+                tty.set_size(half(0), half(2));
+                Ok(0)
+            }
+            TIOCSPGRP => Ok(0),
+            // Input, or input and output, of which there's none waiting.
+            TCFLSH if arg == 0 || arg == 2 => {
+                tty.flush_input();
+                Ok(0)
+            }
+            TCFLSH if arg == 1 => Ok(0),
+            TCFLSH => Err(EINVAL),
+            _ => Err(ENOTTY),
+        }
+    })())
 }

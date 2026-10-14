@@ -17,6 +17,7 @@ use crate::fs;
 use crate::io::interrupts::gdt;
 use crate::memory::AddressSpace;
 use crate::thread::{self, WaitQueue};
+use crate::tty::Tty;
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -70,9 +71,11 @@ pub struct Process {
     /// to `exit` shifted up a byte, or the signal that ended it.
     status: AtomicI32,
     exited: WaitQueue,
-    /// Where it writes to its standard output and error, shared with the
-    /// programs it starts.
-    pub output: Arc<Mutex<Output>>,
+    /// Its terminal, which /dev/tty opens, if it has one.
+    ///
+    /// shortcut: no sessions: a program the kernel starts has the first
+    /// terminal among its descriptors, and its copies have its.
+    pub tty: Option<Arc<Tty>>,
     /// Its file descriptors, by number; `None` for one that's closed. Taken
     /// only with interrupts on, by the program's own system calls.
     pub files: Mutex<Vec<Option<Fd>>>,
@@ -101,9 +104,6 @@ pub struct Fd {
     pub handle: Arc<fs::Handle>,
     pub cloexec: bool,
 }
-
-/// What a program's standard output and error are written to.
-pub type Output = Box<dyn FnMut(&[u8]) + Send>;
 
 pub struct Memory {
     pub space: AddressSpace,
@@ -142,13 +142,15 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Load `elf` into a new address space and start it on a thread of its own,
 /// with `args` as its arguments (the first being its name, by convention).
-/// Whatever it writes to its standard output or error goes to `output`.
+/// Its standard input, output and error are a terminal no one types on,
+/// whose output goes to `output` as it's written (`Tty::capture`).
 pub fn spawn(
     elf: &[u8],
     args: &[&str],
     output: impl FnMut(&[u8]) + Send + 'static,
 ) -> Result<Arc<Process>, &'static str> {
-    spawn_with(elf, args, output, vec![Some(Arc::new(fs::Handle::Console)); 3])
+    let tty = Arc::new(fs::Handle::tty(Arc::new(Tty::capture(Box::new(output)))));
+    spawn_with(elf, args, vec![Some(tty); 3])
 }
 
 /// `spawn`, with `files` as the program's descriptors to start with, by
@@ -156,19 +158,22 @@ pub fn spawn(
 pub fn spawn_with(
     elf: &[u8],
     args: &[&str],
-    output: impl FnMut(&[u8]) + Send + 'static,
     files: Vec<Option<Arc<fs::Handle>>>,
 ) -> Result<Arc<Process>, &'static str> {
     let args: Vec<&[u8]> = args.iter().map(|arg| arg.as_bytes()).collect();
     let (memory, start) = program(elf, &args, &[])?;
     let pml4 = memory.space.pml4();
+    let tty = files.iter().flatten().find_map(|handle| match &**handle {
+        fs::Handle::Tty { tty, .. } => Some(tty.clone()),
+        _ => None,
+    });
     let files = files.into_iter().map(|file| file.map(|handle| Fd { handle, cloexec: false }));
     let process = Arc::new(Process {
         id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
         memory: Mutex::new(memory),
         status: AtomicI32::new(RUNNING),
         exited: WaitQueue::new(),
-        output: Arc::new(Mutex::new(Box::new(output))),
+        tty,
         files: Mutex::new(files.collect()),
         cwd: Mutex::new(String::new()),
         umask: AtomicU32::new(0o022),
@@ -212,7 +217,7 @@ pub fn fork(parent: &Arc<Process>, registers: Registers) -> Option<u64> {
         memory: Mutex::new(memory),
         status: AtomicI32::new(RUNNING),
         exited: WaitQueue::new(),
-        output: parent.output.clone(),
+        tty: parent.tty.clone(),
         files: Mutex::new(parent.files.lock().clone()),
         cwd: Mutex::new(parent.cwd.lock().clone()),
         umask: AtomicU32::new(parent.umask.load(Ordering::Relaxed)),

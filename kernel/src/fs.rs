@@ -8,10 +8,12 @@
 use crate::io::disk;
 use crate::serial_println;
 use crate::thread::{SleepLock, SleepLockGuard};
+use crate::tty::Tty;
 use alloc::boxed::Box;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, AtomicUsize};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use ext4::{BlockDevice, DirEntry, Error, Ext4, Kind, Metadata};
 
 /// The mounted file system, if a disk had one. Calls into it can wait on the
@@ -59,14 +61,21 @@ pub fn unmount() {
 /// What a file descriptor refers to. Copies of a descriptor share one, and
 /// with it the place they're at in a file.
 pub enum Handle {
-    /// Standard input, output and error, and /dev/tty: the program's
-    /// `output`, and no input.
-    Console,
+    /// A terminal: standard input, output and error, and /dev/tty.
+    Tty {
+        tty: Arc<Tty>,
+        /// O_NONBLOCK: a read that would wait fails instead.
+        nonblocking: AtomicBool,
+    },
     /// /dev/null: nothing to read, and what's written goes nowhere.
     Null,
     /// /dev/zero: as many zeros as are read, and what's written goes nowhere.
     Zero,
-    Pipe(crate::pipe::PipeEnd),
+    Pipe {
+        end: crate::pipe::PipeEnd,
+        /// O_NONBLOCK: a read or write that would wait fails instead.
+        nonblocking: AtomicBool,
+    },
     File {
         file: ext4::File,
         read: bool,
@@ -87,6 +96,24 @@ pub enum Handle {
     },
 }
 
+impl Handle {
+    pub fn tty(tty: Arc<Tty>) -> Handle {
+        Handle::Tty { tty, nonblocking: AtomicBool::new(false) }
+    }
+
+    pub fn pipe(end: crate::pipe::PipeEnd) -> Handle {
+        Handle::Pipe { end, nonblocking: AtomicBool::new(false) }
+    }
+
+    /// Its O_NONBLOCK, for what can make a program wait: none for the rest.
+    pub fn nonblocking(&self) -> Option<&AtomicBool> {
+        match self {
+            Handle::Tty { nonblocking, .. } | Handle::Pipe { nonblocking, .. } => Some(nonblocking),
+            _ => None,
+        }
+    }
+}
+
 /// What's in /dev: each device's name and inode number. The numbers are
 /// ones ext4 keeps for itself and never shows (its bad-blocks list, quotas
 /// and boot loader), so no file on the disk has them.
@@ -96,29 +123,50 @@ const DEVICES: [(&str, u32); 3] = [("null", 3), ("tty", 4), ("zero", 5)];
 /// /dev's own.
 const DEV_INODE: u32 = 1;
 
+#[derive(Clone, Copy)]
+pub enum Device {
+    Null,
+    Zero,
+    /// The terminal of whoever opens it.
+    Tty,
+}
+
 /// The device at `path`, a path from the root, if it's one.
-pub fn device(path: &str) -> Option<Handle> {
+pub fn device(path: &str) -> Option<Device> {
     match on(path) {
-        On::Devices("null") => Some(Handle::Null),
-        On::Devices("zero") => Some(Handle::Zero),
-        On::Devices("tty") => Some(Handle::Console),
+        On::Devices("null") => Some(Device::Null),
+        On::Devices("zero") => Some(Device::Zero),
+        On::Devices("tty") => Some(Device::Tty),
         _ => None,
     }
 }
 
-/// What a handle that isn't a file on the disk is, as `stat` tells it. Its
-/// type goes in `permissions`, as ext4's `Kind` has nothing for it.
-pub fn special(handle: &Handle) -> Option<Metadata> {
-    let (inode, mode) = match handle {
-        // Character devices, as a terminal is.
-        Handle::Console => (4, 0o020620),
-        Handle::Null => (3, 0o020666),
-        Handle::Zero => (5, 0o020666),
-        // A FIFO.
-        Handle::Pipe(_) => (0, 0o010600),
-        Handle::File { .. } | Handle::Dir { .. } => return None,
+/// What a device is, as `stat` tells it.
+fn device_metadata(device: Device) -> Metadata {
+    let (inode, mode) = match device {
+        Device::Null => (3, 0o020666),
+        Device::Zero => (5, 0o020666),
+        Device::Tty => (4, 0o020620),
     };
-    Some(Metadata { kind: Kind::Other, links: 1, ..directory(inode, mode) })
+    special_metadata(inode, mode)
+}
+
+/// What a handle that isn't a file on the disk is, as `stat` tells it.
+pub fn special(handle: &Handle) -> Option<Metadata> {
+    match handle {
+        Handle::Tty { .. } => Some(device_metadata(Device::Tty)),
+        Handle::Null => Some(device_metadata(Device::Null)),
+        Handle::Zero => Some(device_metadata(Device::Zero)),
+        // A FIFO.
+        Handle::Pipe { .. } => Some(special_metadata(0, 0o010600)),
+        Handle::File { .. } | Handle::Dir { .. } => None,
+    }
+}
+
+/// Devices and pipes: their type goes in `permissions`, as ext4's `Kind`
+/// has nothing for them.
+fn special_metadata(inode: u32, mode: u32) -> Metadata {
+    Metadata { kind: Kind::Other, links: 1, ..directory(inode, mode) }
 }
 
 /// A directory that isn't on the disk.
@@ -168,9 +216,7 @@ impl Tree<'_> {
     pub fn metadata(&self, path: &str) -> Result<Metadata, Error> {
         match on(path) {
             On::Devices("") => Ok(directory(DEV_INODE, 0o755)),
-            On::Devices(_) => {
-                device(path).and_then(|device| special(&device)).ok_or(Error::NotFound)
-            }
+            On::Devices(_) => device(path).map(device_metadata).ok_or(Error::NotFound),
             On::Disk => match self.disk.as_ref() {
                 Some(disk) => disk.metadata(path),
                 // The empty root, with ext4's root's inode number.

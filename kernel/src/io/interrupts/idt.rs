@@ -73,12 +73,16 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
     // while, and the PIC sends no more ticks until the last one is acknowledged.
     crate::thread::timer_tick();
 }
+/// Keys go to `CONSOLE` as what a terminal sends for them: Enter as `\r`,
+/// Backspace as DEL, Ctrl and a letter as its control character, and the
+/// arrows and the like as VT100 escape sequences.
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
     use crate::io::console::{CONSOLE, CONSOLE_READERS};
-    use pc_keyboard::{DecodedKey, HandleControl, Keyboard, ScancodeSet1, layouts};
+    use pc_keyboard::{DecodedKey, HandleControl, KeyCode, Keyboard, ScancodeSet1, layouts};
 
     static KEYBOARD: Lazy<Mutex<Keyboard<layouts::Us104Key, ScancodeSet1>>> = Lazy::new(|| {
-        Mutex::new(Keyboard::new(ScancodeSet1::new(), layouts::Us104Key, HandleControl::Ignore))
+        let control = HandleControl::MapLettersToUnicode;
+        Mutex::new(Keyboard::new(ScancodeSet1::new(), layouts::Us104Key, control))
     });
 
     if let Some(controller) = PS2_CONTROLLER.lock().as_mut()
@@ -88,11 +92,28 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
         let mut keyboard = KEYBOARD.lock();
         if let Ok(scancode) = controller.controller_mut().read_data()
             && let Ok(Some(key_event)) = keyboard.add_byte(scancode)
-            // Raw keys (arrows, shift and friends) are dropped: nothing uses them yet.
-            && let Some(DecodedKey::Unicode(c)) = keyboard.process_keyevent(key_event)
+            && let Some(key) = keyboard.process_keyevent(key_event)
         {
-            CONSOLE.push(format_args!("{c}"));
-            CONSOLE_READERS.wake_all();
+            let mut utf8 = [0; 4];
+            let sent = match key {
+                DecodedKey::Unicode('\n') => "\r",
+                DecodedKey::Unicode('\u{8}') => "\u{7f}",
+                // The Delete key.
+                DecodedKey::Unicode('\u{7f}') => "\x1b[3~",
+                DecodedKey::Unicode(c) => c.encode_utf8(&mut utf8),
+                DecodedKey::RawKey(KeyCode::ArrowUp) => "\x1b[A",
+                DecodedKey::RawKey(KeyCode::ArrowDown) => "\x1b[B",
+                DecodedKey::RawKey(KeyCode::ArrowRight) => "\x1b[C",
+                DecodedKey::RawKey(KeyCode::ArrowLeft) => "\x1b[D",
+                DecodedKey::RawKey(KeyCode::Home) => "\x1b[H",
+                DecodedKey::RawKey(KeyCode::End) => "\x1b[F",
+                // Shift and the like, which only change other keys.
+                DecodedKey::RawKey(_) => "",
+            };
+            if !sent.is_empty() {
+                CONSOLE.push(format_args!("{sent}"));
+                CONSOLE_READERS.wake_all();
+            }
         }
     }
     pic::notify_end_of_interrupt(&InterruptIndex::Keyboard);

@@ -1,9 +1,11 @@
-//! The command line the kernel boots into: line editing, the commands, and the
-//! lines that are on screen. Drawing them is `main.rs`'s job.
+//! The command line the kernel boots into. It reads lines from a terminal,
+//! the console's, whose line discipline has done the editing, and writes
+//! what the commands say back to it.
 
 use crate::io::interrupts::idt::TIMER_COUNTER;
 use crate::io::interrupts::pit::TIMER_HZ;
 use crate::io::{disk, hpet};
+use crate::tty::Tty;
 use crate::{fs, process};
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -11,7 +13,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
-use spin::{Lazy, Mutex};
+use spin::Lazy;
 
 pub const PROMPT: &str = "> ";
 
@@ -30,77 +32,50 @@ commands:
   info          all of the above
   run [MODE]    run the user program in the ramdisk: hello,
                 sleep [MS], float, bad-calls, fault or exit;
+                cat with no paths copies what's typed, until ^D;
                 on the ext4 disk: cat PATH.., ls PATH, stat PATH,
-                write PATH TEXT, append PATH TEXT";
-
-/// What a key changed, so the caller repaints no more than it has to. Ordered
-/// by how much, so several keys combine with `max`.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-pub enum Redraw {
-    None,
-    /// Only the input line.
-    Line,
-    /// Everything: history changed or scrolled.
-    All,
-}
+                write PATH TEXT, append PATH TEXT;
+                spawn /bin/probe MODE runs it from the disk";
 
 pub struct Shell {
-    /// What is being typed.
-    pub line: String,
-    /// Lines above the input line, oldest first, prompt lines included.
-    pub history: Vec<String>,
-    /// Text rows on screen; history keeps one fewer, the last is the input line.
-    rows: usize,
-    /// Text columns on screen, which caps the input line.
-    cols: usize,
+    tty: Arc<Tty>,
 }
 
 impl Shell {
-    pub fn new(rows: usize, cols: usize) -> Shell {
-        let mut shell = Shell { line: String::new(), history: Vec::new(), rows, cols };
-        shell.print("simplos shell. Type 'help' for commands.");
-        shell
+    pub fn new(tty: Arc<Tty>) -> Shell {
+        Shell { tty }
     }
 
-    /// Feed one typed character. Enter runs the line, backspace deletes.
-    pub fn key(&mut self, c: char) -> Redraw {
-        match c {
-            '\n' => {
-                let line = core::mem::take(&mut self.line);
-                self.history.push(format!("{PROMPT}{line}"));
-                let output = self.run(&line);
-                self.print(&output);
-                Redraw::All
+    /// Prompt, read a line and run it, forever.
+    pub fn run(&mut self) -> ! {
+        self.tty.write(b"simplos shell. Type 'help' for commands.\n");
+        loop {
+            self.tty.write(PROMPT.as_bytes());
+            let line = self.tty.read(4096);
+            // ^D at the prompt: there's nothing to end, so just a new line.
+            if line.is_empty() {
+                self.tty.write(b"\n");
+                continue;
             }
-            '\u{8}' => match self.line.pop() {
-                Some(_) => Redraw::Line,
-                None => Redraw::None,
-            },
-            c if !c.is_control() && PROMPT.len() + self.line.len() + 1 < self.cols => {
-                self.line.push(c);
-                Redraw::Line
+            let output = self.execute(&String::from_utf8_lossy(&line));
+            self.tty.write(output.as_bytes());
+            if !output.is_empty() && !output.ends_with('\n') {
+                self.tty.write(b"\n");
             }
-            _ => Redraw::None,
         }
     }
 
-    /// Append output, one history entry per line, dropping what scrolls off.
-    fn print(&mut self, text: &str) {
-        self.history.extend(text.lines().map(String::from));
-        let keep = self.rows.saturating_sub(1);
-        if self.history.len() > keep {
-            self.history.drain(..self.history.len() - keep);
-        }
-    }
-
-    fn run(&mut self, line: &str) -> String {
+    /// Run one line: what it says. A program it runs writes to the terminal
+    /// itself, as it goes.
+    pub fn execute(&mut self, line: &str) -> String {
         let line = line.trim();
         let (cmd, args) = line.split_once(' ').unwrap_or((line, ""));
         match cmd {
             "" => String::new(),
             "help" => HELP.to_string(),
             "clear" => {
-                self.history.clear();
+                // The whole screen, and the cursor to the top.
+                self.tty.write(b"\x1b[2J\x1b[H");
                 String::new()
             }
             "echo" => args.trim().to_string(),
@@ -111,9 +86,31 @@ impl Shell {
             "disks" => disks(),
             "ls" => ls(args.trim()),
             "cat" => cat(args.trim()),
-            "run" => run(args),
+            "run" => self.run_program(args),
             "info" => format!("{}\n{}\n{}\n{}\n{}", boot(), cpu(), time(), uptime(), disks()),
             _ => format!("unknown command: {cmd} (try help)"),
+        }
+    }
+
+    /// Run the program in the ramdisk with `args`, on the terminal, and wait
+    /// for it: its exit status, if that isn't 0.
+    fn run_program(&mut self, args: &str) -> String {
+        let Some(elf) = crate::ramdisk() else {
+            return String::from("run: no program in the ramdisk");
+        };
+        let mut argv = vec!["probe"];
+        argv.extend(args.split_whitespace());
+        let console = Arc::new(fs::Handle::tty(self.tty.clone()));
+        let settings = self.tty.termios();
+        let status = match process::spawn_with(elf, &argv, vec![Some(console); 3]) {
+            Ok(process) => process.wait(),
+            Err(error) => return format!("run: {error}"),
+        };
+        // As the program found it, whatever it changed.
+        self.tty.set_termios(settings, false);
+        match status {
+            0 => String::new(),
+            status => format!("[exit status {status}]"),
         }
     }
 }
@@ -152,26 +149,6 @@ fn uptime() -> String {
         Some(ms) => format!("{timer}\nHPET: {}.{:03}s", ms / 1000, ms % 1000),
         None => format!("{timer}\nHPET: unavailable"),
     }
-}
-
-/// Run the program in the ramdisk with `args` and wait for it: what it wrote,
-/// and its exit status if that isn't 0.
-fn run(args: &str) -> String {
-    let Some(elf) = crate::ramdisk() else { return String::from("run: no program in the ramdisk") };
-    let output = Arc::new(Mutex::new(Vec::new()));
-    let sink = output.clone();
-    let mut argv = vec!["probe"];
-    argv.extend(args.split_whitespace());
-    let status = match process::spawn(elf, &argv, move |bytes| sink.lock().extend_from_slice(bytes))
-    {
-        Ok(process) => process.wait(),
-        Err(error) => return format!("run: {error}"),
-    };
-    let mut text = String::from_utf8_lossy(&output.lock()).into_owned();
-    if status != 0 {
-        text += &format!("[exit status {status}]");
-    }
-    text
 }
 
 fn disks() -> String {
@@ -227,88 +204,44 @@ fn cat(path: &str) -> String {
 }
 
 #[cfg(test)]
-fn typed(shell: &mut Shell, text: &str) {
-    text.chars().for_each(|c| {
-        shell.key(c);
-    });
+fn shell() -> (Shell, Arc<spin::Mutex<Vec<u8>>>) {
+    let screen = Arc::new(spin::Mutex::new(Vec::new()));
+    let sink = screen.clone();
+    let tty =
+        Tty::capture(alloc::boxed::Box::new(move |bytes| sink.lock().extend_from_slice(bytes)));
+    (Shell::new(Arc::new(tty)), screen)
 }
 
 #[test_case]
 fn echo_prints_its_argument() {
-    let mut shell = Shell::new(10, 80);
-    typed(&mut shell, "echo hi\n");
-    assert_eq!(shell.history[shell.history.len() - 2..], ["> echo hi", "hi"]);
-    assert!(shell.line.is_empty());
-}
-
-#[test_case]
-fn backspace_deletes_and_stops_at_empty() {
-    let mut shell = Shell::new(10, 80);
-    typed(&mut shell, "abc\u{8}");
-    assert_eq!(shell.line, "ab");
-    assert_eq!(shell.key('\u{8}'), Redraw::Line);
-    assert_eq!(shell.key('\u{8}'), Redraw::Line);
-    assert_eq!(shell.key('\u{8}'), Redraw::None);
-    assert!(shell.line.is_empty());
+    assert_eq!(shell().0.execute("echo  hi \n"), "hi");
 }
 
 #[test_case]
 fn unknown_command_says_so() {
-    let mut shell = Shell::new(10, 80);
-    typed(&mut shell, "frob\n");
-    assert_eq!(shell.history.last().unwrap(), "unknown command: frob (try help)");
+    assert_eq!(shell().0.execute("frob"), "unknown command: frob (try help)");
 }
 
 #[test_case]
-fn clear_empties_and_history_scrolls() {
-    let mut shell = Shell::new(4, 80);
-    typed(&mut shell, "help\n");
-    assert_eq!(shell.history.len(), 3, "history keeps rows - 1 lines");
-    typed(&mut shell, "clear\n");
-    assert!(shell.history.is_empty());
-}
-
-#[test_case]
-fn input_stops_at_screen_width() {
-    let mut shell = Shell::new(4, 6);
-    typed(&mut shell, "abcdef");
-    assert_eq!(shell.line, "abc", "prompt + line + cursor fit in 6 columns");
-}
-
-#[test_case]
-fn run_starts_the_program_in_the_ramdisk() {
-    let mut shell = Shell::new(10, 80);
-    typed(&mut shell, "run hello\n");
-    assert_eq!(shell.history.last().unwrap(), "hello from user space");
-    typed(&mut shell, "run fault\n");
-    assert_eq!(shell.history.last().unwrap(), "[exit status 139]");
+fn run_starts_the_program_in_the_ramdisk_on_the_terminal() {
+    let (mut shell, screen) = shell();
+    assert_eq!(shell.execute("run hello"), "");
+    assert_eq!(shell.execute("run fault"), "[exit status 139]");
     // Which runs itself again, from the ext4 disk tools/boot-test attaches.
-    typed(&mut shell, "run spawn /bin/probe hello\n");
-    assert_eq!(
-        shell.history[shell.history.len() - 2..],
-        ["hello from user space", "exit status: 0"]
-    );
+    assert_eq!(shell.execute("run spawn /bin/probe hello"), "");
+    let screen = String::from_utf8(screen.lock().clone()).unwrap();
+    assert_eq!(screen, "hello from user space\nhello from user space\nexit status: 0\n");
 }
 
 #[test_case]
 fn ls_and_cat_show_the_ext4_disk() {
     // The disk tools/boot-test attaches: hello.txt and dir/nested/deep.txt.
-    let mut shell = Shell::new(10, 80);
-    typed(&mut shell, "ls\n");
-    assert_eq!(
-        shell.history[shell.history.len() - 5..],
-        ["bin/", "dev/", "dir/", "hello.txt", "lost+found/"]
-    );
-    typed(&mut shell, "ls /dev\n");
-    assert_eq!(shell.history[shell.history.len() - 3..], ["null", "tty", "zero"]);
-    typed(&mut shell, "cat /dev/null\n");
-    assert_eq!(shell.history.last().unwrap(), "cat: /dev/null: Unsupported");
-    typed(&mut shell, "ls dir/nested\n");
-    assert_eq!(shell.history.last().unwrap(), "deep.txt");
-    typed(&mut shell, "cat hello.txt\n");
-    assert_eq!(shell.history.last().unwrap(), "hello from ext4");
-    typed(&mut shell, "cat dir\n");
-    assert_eq!(shell.history.last().unwrap(), "cat: dir: IsADirectory");
-    typed(&mut shell, "ls missing\n");
-    assert_eq!(shell.history.last().unwrap(), "ls: missing: NotFound");
+    let mut shell = shell().0;
+    assert_eq!(shell.execute("ls"), "bin/\ndev/\ndir/\nhello.txt\nlost+found/");
+    assert_eq!(shell.execute("ls /dev"), "null\ntty\nzero");
+    assert_eq!(shell.execute("cat /dev/null"), "cat: /dev/null: Unsupported");
+    assert_eq!(shell.execute("ls dir/nested"), "deep.txt");
+    assert_eq!(shell.execute("cat hello.txt"), "hello from ext4\n");
+    assert_eq!(shell.execute("cat dir"), "cat: dir: IsADirectory");
+    assert_eq!(shell.execute("ls missing"), "ls: missing: NotFound");
 }

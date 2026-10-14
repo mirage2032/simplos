@@ -25,7 +25,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use spin::{Lazy, Mutex, MutexGuard};
 use x86_64::instructions::interrupts;
 
@@ -132,11 +132,16 @@ pub fn yield_now() {
     reap();
 }
 
-/// Sleep for at least `ms` milliseconds, letting other threads run meanwhile.
-pub fn sleep(ms: u64) {
+/// The tick by which at least `ms` milliseconds will have passed.
+pub fn ticks_after(ms: u64) -> u64 {
     // Rounded up to whole ticks, and one more: the current tick is partly over.
     // Saturating: a program can ask for practically forever.
-    let wake = ms.saturating_mul(TIMER_HZ as u64).div_ceil(1000).saturating_add(ticks() + 1);
+    ms.saturating_mul(TIMER_HZ as u64).div_ceil(1000).saturating_add(ticks() + 1)
+}
+
+/// Sleep for at least `ms` milliseconds, letting other threads run meanwhile.
+pub fn sleep(ms: u64) {
+    let wake = ticks_after(ms);
     interrupts::without_interrupts(|| {
         while ticks() < wake {
             block(|scheduler, me| scheduler.sleeping.push((wake, me)));
@@ -145,19 +150,51 @@ pub fn sleep(ms: u64) {
     reap();
 }
 
-/// The timer interrupt's part: wake the sleepers whose tick has come, then
-/// preempt whichever thread was interrupted.
+/// The timer interrupt's part: wake the sleepers whose tick has come, and
+/// the pollers if the first of their deadlines has, then preempt whichever
+/// thread was interrupted.
 pub fn timer_tick() {
     let now = ticks();
     let mut scheduler = SCHEDULER.lock();
     let due: Vec<_> = scheduler.sleeping.extract_if(.., |(wake, _)| *wake <= now).collect();
     scheduler.ready.extend(due.into_iter().map(|(_, thread)| thread));
     drop(scheduler);
+    if POLL_DEADLINE.load(Ordering::Relaxed) <= now {
+        POLL_DEADLINE.store(u64::MAX, Ordering::Relaxed);
+        POLLERS.wake_all();
+    }
     yield_now();
 }
 
-fn ticks() -> u64 {
+pub fn ticks() -> u64 {
     TIMER_COUNTER.load(Ordering::Relaxed) as u64
+}
+
+/// Threads in `poll_until`: woken whenever anything they could be waiting
+/// for changes, and by the timer once the first of their deadlines comes.
+static POLLERS: WaitQueue = WaitQueue::new();
+/// The first tick a poller waits until; `u64::MAX` for none.
+static POLL_DEADLINE: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Tell pollers something changed: whatever a `poll` can wait on calls it,
+/// as data comes or goes or an end closes.
+pub fn wake_pollers() {
+    POLLERS.wake_all();
+}
+
+/// Block until `ready` returns true, or the tick `deadline` comes, checking
+/// again whenever `wake_pollers` is called. `ready` runs with interrupts
+/// off, as `WaitQueue::wait_until`'s check does.
+pub fn poll_until(deadline: Option<u64>, mut ready: impl FnMut() -> bool) {
+    POLLERS.wait_until(|| {
+        if ready() || deadline.is_some_and(|deadline| ticks() >= deadline) {
+            return true;
+        }
+        if let Some(deadline) = deadline {
+            POLL_DEADLINE.fetch_min(deadline, Ordering::Relaxed);
+        }
+        false
+    });
 }
 
 /// Threads waiting for something that another thread or an interrupt handler

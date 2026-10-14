@@ -10,6 +10,7 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -18,6 +19,7 @@ use bootloader_api::{BootInfo, entry_point};
 use core::panic::PanicInfo;
 use simplos::fs::{self, Handle, ROOT};
 use simplos::process;
+use simplos::tty::Tty;
 use spin::Mutex;
 
 entry_point!(main, config = &simplos::BOOTLOADER_CONFIG);
@@ -36,32 +38,34 @@ fn panic(info: &PanicInfo) -> ! {
 
 /// Run probe with `args`: its exit status, and everything it wrote.
 fn run_bytes(args: &[&str]) -> (i32, Vec<u8>) {
-    run_with(args, console())
+    let output = Arc::new(Mutex::new(Vec::new()));
+    run_with(args, console(&output), &output)
 }
 
-/// Standard input, output and error on the console.
-fn console() -> Vec<Option<Arc<Handle>>> {
-    vec![Some(Arc::new(Handle::Console)); 3]
+/// Standard input, output and error on a terminal no one types on, whose
+/// output goes to `output`.
+fn console(output: &Arc<Mutex<Vec<u8>>>) -> Vec<Option<Arc<Handle>>> {
+    let sink = output.clone();
+    let tty = Tty::capture(Box::new(move |bytes| sink.lock().extend_from_slice(bytes)));
+    vec![Some(Arc::new(Handle::tty(Arc::new(tty)))); 3]
 }
 
-/// Start probe with `args` and `files` as its descriptors, and what it
-/// writes to the console goes to `output`.
-fn start(
-    args: &[&str],
-    files: Vec<Option<Arc<Handle>>>,
-    output: Arc<Mutex<Vec<u8>>>,
-) -> Arc<process::Process> {
+/// Start probe with `args` and `files` as its descriptors.
+fn start(args: &[&str], files: Vec<Option<Arc<Handle>>>) -> Arc<process::Process> {
     let mut argv = vec!["probe"];
     argv.extend(args);
     let elf = simplos::ramdisk().expect("tools/boot-test attaches user/probe");
-    process::spawn_with(elf, &argv, move |bytes| output.lock().extend_from_slice(bytes), files)
-        .expect("probe loads")
+    process::spawn_with(elf, &argv, files).expect("probe loads")
 }
 
-/// `run_bytes`, with `files` as its descriptors.
-fn run_with(args: &[&str], files: Vec<Option<Arc<Handle>>>) -> (i32, Vec<u8>) {
-    let output = Arc::new(Mutex::new(Vec::new()));
-    let status = start(args, files, output.clone()).wait();
+/// Run probe with `args` and `files` as its descriptors: its exit status,
+/// and what's in `output` once it's done.
+fn run_with(
+    args: &[&str],
+    files: Vec<Option<Arc<Handle>>>,
+    output: &Arc<Mutex<Vec<u8>>>,
+) -> (i32, Vec<u8>) {
+    let status = start(args, files).wait();
     let output = output.lock().clone();
     (status, output)
 }
@@ -69,7 +73,7 @@ fn run_with(args: &[&str], files: Vec<Option<Arc<Handle>>>) -> (i32, Vec<u8>) {
 /// A pipe's two ends, ready for a program's descriptors.
 fn pipe() -> (Option<Arc<Handle>>, Option<Arc<Handle>>) {
     let (read, write) = simplos::pipe::new();
-    (Some(Arc::new(Handle::Pipe(read))), Some(Arc::new(Handle::Pipe(write))))
+    (Some(Arc::new(Handle::pipe(read))), Some(Arc::new(Handle::pipe(write))))
 }
 
 /// How long /big.bin is: 3 MiB and some.
@@ -302,13 +306,13 @@ fn two_programs_talk_through_a_pipe() {
     // More than a pipe holds, so each waits for the other in turn.
     big_file();
     let (read, write) = pipe();
-    let mut reader_files = console();
-    reader_files[0] = read;
-    let mut writer_files = console();
-    writer_files[1] = write;
     let output = Arc::new(Mutex::new(Vec::with_capacity(BIG)));
-    let reader = start(&["cat"], reader_files, output.clone());
-    let writer = start(&["cat", "/big.bin"], writer_files, Arc::new(Mutex::new(Vec::new())));
+    let mut reader_files = console(&output);
+    reader_files[0] = read;
+    let mut writer_files = console(&Arc::new(Mutex::new(Vec::new())));
+    writer_files[1] = write;
+    let reader = start(&["cat"], reader_files);
+    let writer = start(&["cat", "/big.bin"], writer_files);
     assert_eq!(writer.wait(), 0);
     // Which closed the writing end as it ended: the reader sees the end.
     assert_eq!(reader.wait(), 0);
@@ -320,12 +324,13 @@ fn two_programs_talk_through_a_pipe() {
 #[test_case]
 fn a_program_writing_to_no_one_is_told() {
     let (read, write) = pipe();
-    let mut reader_files = console();
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let mut reader_files = console(&output);
     reader_files[0] = read;
-    assert_eq!(run_with(&["exit"], reader_files).0, 0);
-    let mut writer_files = console();
+    assert_eq!(run_with(&["exit"], reader_files, &output).0, 0);
+    let mut writer_files = console(&output);
     writer_files[1] = write;
-    let (status, output) = run_with(&["cat", "/hello.txt"], writer_files);
+    let (status, output) = run_with(&["cat", "/hello.txt"], writer_files, &output);
     assert_eq!(
         (status, String::from_utf8(output).unwrap()),
         failed("/hello.txt", "Broken pipe (os error 32)")
@@ -353,7 +358,8 @@ fn a_program_finds_the_devices_it_expects() {
 #[test_case]
 fn bad_pipe_calls_are_refused() {
     // EBADF for a descriptor that isn't open and one past the most there can
-    // be, EFAULT for ends to go in the kernel's half, EINVAL for O_NONBLOCK.
+    // be, EFAULT for ends to go in the kernel's half, EINVAL for a flag
+    // pipe2 doesn't take.
     assert_eq!(run(&["bad-pipes"]), ok("-9 -9 -14 -22\n"));
 }
 
