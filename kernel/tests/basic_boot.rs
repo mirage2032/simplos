@@ -49,10 +49,16 @@ fn framebuffer_is_not_empty() {
 }
 
 #[test_case]
-fn boot_mode_was_detected() {
-    // Whichever firmware ran, the memory map should have told us which it was —
-    // `Unknown` means the detection no longer recognises either.
+fn boot_mode_is_the_firmware_that_ran() {
+    // tools/boot-test boots every test under both firmwares and says which one
+    // this is, so detection is checked against the truth, and a run meant for
+    // one firmware can't quietly have tested the other.
+    let mut name = [0u8; 8];
+    let len = simplos::io::fwcfg::read_file("opt/simplos/firmware", &mut name)
+        .expect("tools/boot-test passes opt/simplos/firmware");
+    let expected = core::str::from_utf8(&name[..len]).unwrap().trim_end_matches('\0');
     assert_ne!(simplos::boot_mode(), BootMode::Unknown);
+    assert_eq!(simplos::boot_mode().as_str(), expected);
 }
 
 #[test_case]

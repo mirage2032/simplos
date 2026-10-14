@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Boots the built images and checks the kernel actually came up.
 #
-# The integration tests in kernel/tests/ run test kernels through the BIOS path
-# only. This runs the real thing, both ways, and is the check that would have
+# The integration tests in kernel/tests/ boot test kernels, not the one that
+# ships. This boots the real images, both ways, and is the check that would have
 # caught most of what has broken this project: a bootloader stage that no longer
 # loads, a firmware path nobody exercised, a framebuffer mode silently falling
 # back. The kernel's boot banner is the evidence — it names the firmware and the

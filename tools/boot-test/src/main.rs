@@ -3,9 +3,9 @@
 //! The tests are bare-metal ELF binaries: no `main`, no libtest, and no way to
 //! report a result except to the machine they are running on. So cargo cannot
 //! run them directly, and this stands in as its `runner` (wired up in
-//! `kernel/.cargo/config.toml`). It wraps the ELF in a bootable disk image,
-//! starts QEMU, and turns how the guest shut itself down back into an exit code
-//! cargo understands.
+//! `kernel/.cargo/config.toml`). It wraps the ELF in a BIOS and a UEFI disk
+//! image, boots each under QEMU, and turns how the guest shut itself down back
+//! into an exit code cargo understands: a pass only if both runs passed.
 //!
 //! The guest's half of that conversation is `isa-debug-exit`: a device whose
 //! only function is that writing to its port makes QEMU exit with a status
@@ -27,6 +27,27 @@ const TIMEOUT: Duration = Duration::from_secs(180);
 const GUEST_SUCCESS: i32 = (0x10 << 1) | 1;
 const GUEST_FAILED: i32 = (0x11 << 1) | 1;
 
+/// The two ways the kernel can be started. They share nothing before the
+/// kernel's entry point (a real-mode stage chain on one side, a UEFI
+/// application on the other) and hand over different memory maps and
+/// framebuffers, so a test that passes under one says nothing about the other.
+#[derive(Clone, Copy)]
+enum Firmware {
+    Bios,
+    Uefi,
+}
+
+impl Firmware {
+    /// Spelled as `simplos::BootMode::as_str` spells it, because the guest
+    /// compares the two (see `tests/basic_boot.rs`).
+    fn name(self) -> &'static str {
+        match self {
+            Firmware::Bios => "BIOS",
+            Firmware::Uefi => "UEFI",
+        }
+    }
+}
+
 fn main() -> ExitCode {
     // Cargo passes the test binary first; with a libtest-style harness it may
     // append its own flags, which mean nothing to a kernel and are dropped.
@@ -35,21 +56,30 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     };
 
-    match run(&kernel) {
-        Ok(code) => code,
-        Err(error) => {
-            eprintln!("boot-test: {}: {error}", kernel.display());
-            ExitCode::FAILURE
-        }
+    // Both, even when the first fails: which firmware a failure shows up
+    // under is half of the diagnosis.
+    let mut passed = true;
+    for firmware in [Firmware::Bios, Firmware::Uefi] {
+        println!("boot-test: {} under {}", kernel.display(), firmware.name());
+        passed &= run(&kernel, firmware).unwrap_or_else(|error| {
+            eprintln!("boot-test: {} ({}): {error}", kernel.display(), firmware.name());
+            false
+        });
     }
+    if passed { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }
 
-fn run(kernel: &Path) -> Result<ExitCode, Box<dyn Error>> {
+/// One boot of `kernel` under `firmware`: whether the guest reported a pass.
+fn run(kernel: &Path, firmware: Firmware) -> Result<bool, Box<dyn Error>> {
+    let name = firmware.name();
     // Beside the ELF, inside cargo's target directory: writable, cleaned up by
     // `cargo clean`, and left in place afterwards so a failing test can be
     // booted by hand with the exact image that failed.
-    let image = kernel.with_extension("img");
-    bootloader::BiosBoot::new(kernel).create_disk_image(&image)?;
+    let image = kernel.with_extension(format!("{}.img", name.to_lowercase()));
+    match firmware {
+        Firmware::Bios => bootloader::BiosBoot::new(kernel).create_disk_image(&image)?,
+        Firmware::Uefi => bootloader::UefiBoot::new(kernel).create_disk_image(&image)?,
+    }
     // Blank scratch disks for tests/disk.rs to write to, one per controller
     // kind, sized differently so the test can tell which is which. Recreated
     // each run, so nothing a test wrote survives into the next.
@@ -60,6 +90,11 @@ fn run(kernel: &Path) -> Result<ExitCode, Box<dyn Error>> {
     }
 
     let mut qemu = Command::new("qemu-system-x86_64");
+    if let Firmware::Uefi = firmware {
+        // QEMU's default firmware is SeaBIOS; UEFI is OVMF, from the same
+        // crate `fullkernel`'s runner uses, so nothing has to be installed.
+        qemu.arg("-bios").arg(ovmf_prebuilt::ovmf_pure_efi());
+    }
     qemu.arg("-drive")
         .arg(format!("format=raw,file={}", image.display()))
         .arg("-drive")
@@ -70,6 +105,10 @@ fn run(kernel: &Path) -> Result<ExitCode, Box<dyn Error>> {
         // How the guest reports its result. Without it a finished test would
         // just sit in `hlt_loop` until the timeout.
         .args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"])
+        // Which firmware this run is, so the guest can check it booted the
+        // one we meant rather than quietly testing the same path twice.
+        .arg("-fw_cfg")
+        .arg(format!("name=opt/simplos/firmware,string={name}"))
         // Test output is `serial_println!`, and cargo shows it for a test that
         // fails.
         .args(["-serial", "stdio"])
@@ -96,33 +135,33 @@ fn run(kernel: &Path) -> Result<ExitCode, Box<dyn Error>> {
             child.kill()?;
             child.wait()?;
             eprintln!(
-                "boot-test: {} did not finish within {}s",
+                "boot-test: {} ({name}) did not finish within {}s",
                 kernel.display(),
                 TIMEOUT.as_secs()
             );
-            return Ok(ExitCode::FAILURE);
+            return Ok(false);
         }
         std::thread::sleep(Duration::from_millis(50));
     };
 
     Ok(match status.code() {
-        Some(GUEST_SUCCESS) => ExitCode::SUCCESS,
+        Some(GUEST_SUCCESS) => true,
         Some(GUEST_FAILED) => {
-            eprintln!("boot-test: {} reported a failure", kernel.display());
-            ExitCode::FAILURE
+            eprintln!("boot-test: {} ({name}) reported a failure", kernel.display());
+            false
         }
         // Anything else is the guest dying on its own terms — a triple fault, a
         // QEMU error, or a kill signal — none of which is a pass.
         other => {
             eprintln!(
-                "boot-test: {} exited unexpectedly ({})",
+                "boot-test: {} ({name}) exited unexpectedly ({})",
                 kernel.display(),
                 match other {
                     Some(code) => format!("status {code}"),
                     None => "killed by a signal".to_owned(),
                 }
             );
-            ExitCode::FAILURE
+            false
         }
     })
 }
