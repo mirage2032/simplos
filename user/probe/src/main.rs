@@ -399,6 +399,9 @@ fn main() {
             kill(me, SIGUSR1);
             let mut pending = 0u64;
             syscall(127, &raw mut pending as usize, 8, 0);
+            // Pending but blocked, it doesn't end a sleep.
+            let nap = [0i64, 20_000_000];
+            let slept = syscall(35, nap.as_ptr() as usize, 0, 0);
             let blocked = CAUGHT.load(Ordering::SeqCst);
             sigprocmask(SIG_UNBLOCK, bit(SIGUSR1));
             let unblocked = CAUGHT.load(Ordering::SeqCst);
@@ -413,8 +416,8 @@ fn main() {
             let kill_blocked = sigprocmask(SIG_BLOCK, 0) & bit(SIGKILL) != 0;
             let refused = (kill(me, 65), kill(999_999, SIGUSR1), kill(me, 0));
             println!(
-                "{set} {sent} {first:?} {from} {code}; {} {blocked} {unblocked}; {tkill} {reset} \
-                 {ignored}; {catch_kill} {kill_blocked} {refused:?}",
+                "{set} {sent} {first:?} {from} {code}; {} {slept} {blocked} {unblocked}; {tkill} \
+                 {reset} {ignored}; {catch_kill} {kill_blocked} {refused:?}",
                 pending == bit(SIGUSR1)
             );
         }

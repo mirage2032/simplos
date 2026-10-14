@@ -52,13 +52,14 @@ fn ok(text: &str) -> (i32, String) {
 #[test_case]
 fn a_program_handles_blocks_and_ignores_signals() {
     // A handler, run before kill returns, told the sender and SI_USER; a
-    // blocked signal pending, then taken as it's unblocked; tkill's SI_TKILL,
+    // blocked signal pending, not ending a sleep, then taken as it's
+    // unblocked; tkill's SI_TKILL,
     // and SA_RESETHAND's handler gone after once; an ignored one dropped;
     // SIGKILL neither caught nor blocked; and EINVAL, ESRCH, and 0 for
     // signal 0.
     assert_eq!(
         run(&["signals"]),
-        ok("0 0 (1, 10) true 0; true 1 2; -6 0 3; -22 false (-22, -3, 0)\n")
+        ok("0 0 (1, 10) true 0; true 0 1 2; -6 0 3; -22 false (-22, -3, 0)\n")
     );
 }
 
