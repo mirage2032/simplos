@@ -167,3 +167,10 @@ enforcing it would mean giving up the automatic version bump, or giving the job
 a personal access token or deploy key held as a secret and added as a bypass
 actor. Until then the pull request flow is a convention — CI still runs on every
 one, and promote refuses to release if master has commits develop doesn't.
+
+## License
+
+GPL-2.0-only, the same as Linux, so that Linux code can be ported in where it
+saves real work (filesystem drivers, for one). See [LICENSE](LICENSE). The
+crates vendored under `vendor/` keep their own licenses (MIT, or MIT/Apache-2.0),
+which permit this.

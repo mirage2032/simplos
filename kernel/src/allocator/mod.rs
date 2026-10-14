@@ -8,7 +8,8 @@ use x86_64::{
 
 pub mod fixed_size_block;
 
-pub const HEAP_START: usize = 0x_4444_4444_0000;
+/// Upper half, with a PML4 entry to itself; see the layout in `lib.rs`.
+pub const HEAP_START: usize = 0xFFFF_C000_0000_0000;
 pub const HEAP_SIZE: usize = 1024 * 1024 * 20; // 20 MiB
 
 #[global_allocator]

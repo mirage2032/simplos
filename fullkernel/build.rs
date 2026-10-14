@@ -8,11 +8,12 @@ fn main() {
     let kernel = PathBuf::from(std::env::var_os("CARGO_BIN_FILE_SIMPLOS_simplos").unwrap());
     //manifest dir
     let manifest_dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    // The offset is the kernel's load address, `KERNEL_BASE` in kernel/src/lib.rs.
     let gdbinit_path = manifest_dir.join("../.gdbinit");
     let gdbinit_content = format!(
         "file {}\n\
         set architecture i386:x86-64\n\
-        add-symbol-file {} -o 0x8000000000\n\
+        add-symbol-file {} -o 0xFFFFFFFF80000000\n\
         ",
         kernel.to_string_lossy(),
         kernel.to_string_lossy()
@@ -21,7 +22,7 @@ fn main() {
     let lldbinit_path = manifest_dir.join("../.lldbinit");
     let lldbinit_content = format!(
         "target create {}\n\
-        target modules load --file {} --slide 0x8000000000\n\
+        target modules load --file {} --slide 0xFFFFFFFF80000000\n\
         process handle SIGTRAP -s false\n\
         ",
         kernel.to_string_lossy(),

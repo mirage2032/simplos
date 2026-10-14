@@ -21,6 +21,19 @@ pub unsafe fn init(physical_memory_offset: VirtAddr) -> OffsetPageTable<'static>
     }
 }
 
+/// Where all of physical memory is mapped: the start of the upper half.
+pub const PHYS_MAP_BASE: u64 = 0xFFFF_8000_0000_0000;
+
+/// Unmap the lower half, which belongs to user programs. All the bootloader
+/// leaves there are identity mappings of its own GDT and of the trampoline that
+/// jumped to the kernel, both dead once the kernel's GDT is loaded.
+pub fn clear_lower_half(mapper: &mut OffsetPageTable) {
+    for entry in mapper.level_4_table_mut().iter_mut().take(256) {
+        entry.set_unused();
+    }
+    x86_64::instructions::tlb::flush_all();
+}
+
 /// Returns a mutable reference to the active level 4 table.
 ///
 /// This function is unsafe because the caller must guarantee that the

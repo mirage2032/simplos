@@ -10,6 +10,9 @@
 #![test_runner(simplos::test_runner)]
 #![reexport_test_harness_main = "test_main"]
 
+extern crate alloc;
+
+use alloc::boxed::Box;
 use bootloader_api::{BootInfo, entry_point};
 use core::panic::PanicInfo;
 use simplos::{BootMode, DISPLAY};
@@ -50,4 +53,34 @@ fn boot_mode_was_detected() {
     // Whichever firmware ran, the memory map should have told us which it was —
     // `Unknown` means the detection no longer recognises either.
     assert_ne!(simplos::boot_mode(), BootMode::Unknown);
+}
+
+#[test_case]
+fn kernel_is_in_the_upper_half() {
+    // Code, statics, the heap and the stack: everything the kernel runs on.
+    let heap = Box::new(0u8);
+    let stack = 0u8;
+    let addresses = [
+        simplos::pre_init as fn(_) as usize,
+        &raw const DISPLAY as usize,
+        &raw const *heap as usize,
+        &raw const stack as usize,
+    ];
+    for address in addresses {
+        assert!(
+            address >= simplos::memory::PHYS_MAP_BASE as usize,
+            "{address:#x} is in the lower half"
+        );
+    }
+}
+
+#[test_case]
+fn lower_half_is_unmapped() {
+    // Left to user programs. Anything the kernel still needed there would have
+    // faulted long before this test, but a stray mapping wouldn't.
+    let (pml4, _) = x86_64::registers::control::Cr3::read();
+    let pml4 = simplos::memory::phys_ptr(pml4.start_address()).unwrap();
+    // Safety: the active PML4, read through the physical-memory map.
+    let pml4 = unsafe { &*(pml4 as *const x86_64::structures::paging::PageTable) };
+    assert!(pml4.iter().take(256).all(|entry| entry.is_unused()));
 }
