@@ -4,7 +4,7 @@
 use crate::io::interrupts::idt::TIMER_COUNTER;
 use crate::io::interrupts::pit::TIMER_HZ;
 use crate::io::{disk, hpet};
-use crate::process;
+use crate::{fs, process};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
@@ -25,6 +25,8 @@ commands:
   time          RTC time (unix seconds)
   uptime        timer ticks and HPET time since boot
   disks         disks found at boot
+  ls [PATH]     list a directory on the ext4 disk
+  cat PATH      print a file on the ext4 disk
   info          all of the above
   run [MODE]    run the user program in the ramdisk: hello,
                 sleep [MS], float, bad-calls, fault or exit";
@@ -105,6 +107,8 @@ impl Shell {
             "time" => time(),
             "uptime" => uptime(),
             "disks" => disks(),
+            "ls" => ls(args.trim()),
+            "cat" => cat(args.trim()),
             "run" => run(args),
             "info" => format!("{}\n{}\n{}\n{}\n{}", boot(), cpu(), time(), uptime(), disks()),
             _ => format!("unknown command: {cmd} (try help)"),
@@ -177,6 +181,45 @@ fn disks() -> String {
     out
 }
 
+/// The entries of the directory at `path` on the ext4 disk, sorted, with a
+/// `/` after each directory's name.
+fn ls(path: &str) -> String {
+    let root = fs::ROOT.lock();
+    let Some(fs) = root.as_ref() else { return String::from("ls: no ext4 disk") };
+    let path = if path.is_empty() { "/" } else { path };
+    match fs.read_dir(path) {
+        Ok(mut entries) => {
+            entries.sort_by(|a, b| a.name.cmp(&b.name));
+            let names = entries.into_iter().map(|entry| match entry.kind {
+                ext4::Kind::Directory => entry.name + "/",
+                _ => entry.name,
+            });
+            names.collect::<Vec<_>>().join("\n")
+        }
+        Err(error) => format!("ls: {path}: {error:?}"),
+    }
+}
+
+/// The file at `path` on the ext4 disk, as text.
+fn cat(path: &str) -> String {
+    let root = fs::ROOT.lock();
+    let Some(fs) = root.as_ref() else { return String::from("cat: no ext4 disk") };
+    let mut file = match fs.open(path) {
+        Ok(file) => file,
+        Err(error) => return format!("cat: {path}: {error:?}"),
+    };
+    let mut contents = vec![0; file.size() as usize];
+    let mut done = 0;
+    while done < contents.len() {
+        match file.read(&mut contents[done..]) {
+            Ok(0) => break,
+            Ok(read) => done += read,
+            Err(error) => return format!("cat: {path}: {error:?}"),
+        }
+    }
+    String::from_utf8_lossy(&contents[..done]).into_owned()
+}
+
 #[cfg(test)]
 fn typed(shell: &mut Shell, text: &str) {
     text.chars().for_each(|c| {
@@ -233,4 +276,20 @@ fn run_starts_the_program_in_the_ramdisk() {
     assert_eq!(shell.history.last().unwrap(), "hello from user space");
     typed(&mut shell, "run fault\n");
     assert_eq!(shell.history.last().unwrap(), "[exit status 139]");
+}
+
+#[test_case]
+fn ls_and_cat_show_the_ext4_disk() {
+    // The disk tools/boot-test attaches: hello.txt and dir/nested/deep.txt.
+    let mut shell = Shell::new(10, 80);
+    typed(&mut shell, "ls\n");
+    assert_eq!(shell.history[shell.history.len() - 3..], ["dir/", "hello.txt", "lost+found/"]);
+    typed(&mut shell, "ls dir/nested\n");
+    assert_eq!(shell.history.last().unwrap(), "deep.txt");
+    typed(&mut shell, "cat hello.txt\n");
+    assert_eq!(shell.history.last().unwrap(), "hello from ext4");
+    typed(&mut shell, "cat dir\n");
+    assert_eq!(shell.history.last().unwrap(), "cat: dir: IsADirectory");
+    typed(&mut shell, "ls missing\n");
+    assert_eq!(shell.history.last().unwrap(), "ls: missing: NotFound");
 }

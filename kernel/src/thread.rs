@@ -23,7 +23,9 @@ use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::Ordering;
+use core::cell::UnsafeCell;
+use core::ops::{Deref, DerefMut};
+use core::sync::atomic::{AtomicBool, Ordering};
 use spin::{Lazy, Mutex, MutexGuard};
 use x86_64::instructions::interrupts;
 
@@ -195,6 +197,59 @@ impl WaitQueue {
 impl Default for WaitQueue {
     fn default() -> WaitQueue {
         WaitQueue::new()
+    }
+}
+
+/// A lock whose waiters sleep rather than spin: for holding across slow work,
+/// such as a disk's. Not for interrupt handlers, which can't sleep.
+pub struct SleepLock<T> {
+    locked: AtomicBool,
+    waiters: WaitQueue,
+    value: UnsafeCell<T>,
+}
+
+// Safety: `value` is only reached through a guard, which one thread at a time
+// holds.
+unsafe impl<T: Send> Sync for SleepLock<T> {}
+
+impl<T> SleepLock<T> {
+    pub const fn new(value: T) -> SleepLock<T> {
+        SleepLock {
+            locked: AtomicBool::new(false),
+            waiters: WaitQueue::new(),
+            value: UnsafeCell::new(value),
+        }
+    }
+
+    pub fn lock(&self) -> SleepLockGuard<'_, T> {
+        self.waiters.wait_until(|| !self.locked.swap(true, Ordering::Acquire));
+        SleepLockGuard { lock: self }
+    }
+}
+
+pub struct SleepLockGuard<'a, T> {
+    lock: &'a SleepLock<T>,
+}
+
+impl<T> Deref for SleepLockGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        // Safety: the lock is ours until `drop`.
+        unsafe { &*self.lock.value.get() }
+    }
+}
+
+impl<T> DerefMut for SleepLockGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        // Safety: as in `deref`.
+        unsafe { &mut *self.lock.value.get() }
+    }
+}
+
+impl<T> Drop for SleepLockGuard<'_, T> {
+    fn drop(&mut self) {
+        self.lock.locked.store(false, Ordering::Release);
+        self.lock.waiters.wake_all();
     }
 }
 

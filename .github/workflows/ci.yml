@@ -86,10 +86,23 @@ jobs:
 
       # Each of these is a kernel: built for x86_64-unknown-none, wrapped in a
       # bootable image by tools/boot-test and run under QEMU, which reports the
-      # result by the status it exits with.
+      # result by the status it exits with. Each run also gets an ext4 disk
+      # from e2fsprogs' mke2fs, and e2fsck checks it afterwards.
       - name: Test
         working-directory: kernel
         run: cargo test
+
+      # The kernel saves only the general registers of a thread that's in it,
+      # so it mustn't touch SSE ones: Rust code for this target can't, and C
+      # (lwext4) is compiled not to. Optimised, as the images are, is when a
+      # compiler would reach for them.
+      - name: No SSE in the kernel
+        working-directory: kernel
+        run: |
+          cargo build --release
+          if objdump -d target/x86_64-unknown-none/release/simplos | grep -E '%[xyz]mm'; then
+            exit 1
+          fi
 
       # The ext4 crate's tests run on the host and are judged by e2fsprogs
       # (mke2fs, e2fsck, debugfs), which the runner image has.

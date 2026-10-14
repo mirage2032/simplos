@@ -76,6 +76,25 @@ cargo run -- -device ich9-ahci,id=ahci -drive id=d,file=disk.img,format=raw,if=n
 
 NVMe isn't supported, and on many real PCs that is where the disk is.
 
+## ext4
+
+The kernel mounts the first disk holding an ext4 (or ext3, or ext2) file
+system to read and write, replaying its journal first if it wasn't unmounted
+cleanly, and the shell's `ls` and `cat` show what's on it. To try it, make one
+from a directory and attach it:
+
+```sh
+mkdir -p tree && echo hello > tree/hello.txt
+/usr/sbin/mke2fs -t ext4 -d tree disk.img 64M
+cargo run -- -drive format=raw,file=disk.img
+```
+
+Nothing unmounts it when QEMU is closed, which to the disk is a power cut:
+the next boot replays the journal, as Linux would. The work is done by
+`fs/ext4` (see below), behind a lock that sleeps whoever waits for it
+(`thread::SleepLock`), since a call can wait on the disk for a long time.
+The disk is trusted: lwext4 is C, parsing it in ring 0, and isn't fuzzed yet.
+
 ## Tests
 
 ```sh
@@ -89,7 +108,10 @@ each test binary in a bootable image, starts QEMU, and turns how the guest shut
 itself down back into a pass or a fail. The guest's side of that is QEMU's
 `isa-debug-exit` device — writing to its port makes QEMU exit with a status
 derived from the value written. Every test also gets two blank scratch disks,
-1 MiB on IDE and 2 MiB on AHCI, which `tests/disk.rs` writes to.
+1 MiB on IDE and 2 MiB on AHCI, which `tests/disk.rs` writes to, and a 16 MiB
+ext4 disk made by e2fsprogs' `mke2fs`, which `tests/ext4.rs` writes to. After a
+run that passes, e2fsck must find nothing wrong with it, and it must have been
+unmounted, so the tests need e2fsprogs installed.
 
 Each test boots twice, under BIOS and then under UEFI, and passes only if it
 passes both times. The runner tells the guest which firmware it started, and
@@ -125,7 +147,7 @@ be added to the others that need it.
 `vendor/lwext4` is upstream [lwext4](https://github.com/gkostka/lwext4) at
 commit `58bcf89` (2022-09-22): its `src/` and `include/` without the mkfs and
 MBR code, which nothing uses. It is GPL-2.0 (its extents and xattr code are
-"GPL-2.0 or later"), like simplos. It has four local fixes, each marked
+"GPL-2.0 or later"), like simplos. It has five local fixes, each marked
 `LOCAL PATCH` in the source, all found by `fs/ext4`'s tests:
 
 - **`src/ext4.c`, renaming a directory** — the block holding its `..` entry
@@ -144,10 +166,20 @@ MBR code, which nothing uses. It is GPL-2.0 (its extents and xattr code are
   sequence number carries on rather than going back to 0, which let
   transactions left from one mount pass for the next mount's, so that a crash
   replayed old blocks over new ones.
+- **`src/ext4_fs.c`, mounting to write** — it marked the file system as
+  having errors, where Linux clears its "clean" flag: after a crash, Linux
+  would warn of errors that weren't there.
 
-`fs/ext4` compiles it with the host's C compiler and a few settings in its
-`build.rs`: no debug `printf`, lwext4's own errno values, and `malloc` and
-friends from Rust's allocator. Nothing outside `fs/ext4` sees it, so it can be
+`fs/ext4` compiles it with the host's C compiler, the same way for the
+kernel as for its tests on the host: freestanding, with no C library but the
+few headers in `fs/ext4/src/include` and the few functions in
+`fs/ext4/src/libc.c`, and only ever the general registers
+(`-mgeneral-regs-only`). That last matters: the kernel saves just the general
+registers of a thread that's in it, so it must never touch SSE ones, which
+hold user programs' state. Compiled without it, an optimised kernel has a
+couple of hundred SSE instructions; CI checks it has none. Its `build.rs` also
+turns off debug `printf`, picks lwext4's own errno values, and gives it
+`malloc` and friends from Rust's allocator. Nothing outside `fs/ext4` sees it, so it can be
 replaced by Rust code without touching the rest. Its habits that differ from
 Linux's are handled there rather than patched: it would mount a file system
 whose journal needs replaying as if it were clean, make the missing
