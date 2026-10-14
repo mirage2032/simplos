@@ -11,3 +11,5 @@ publish = false
 # dependency, which is why this manifest needs none of the patch stanzas that
 # kernel/Cargo.toml and fullkernel/Cargo.toml carry.
 bootloader = { path = "../../vendor/bootloader" }
+# UEFI firmware for QEMU, the same crate and version `fullkernel` uses.
+ovmf-prebuilt = "0.1.0-alpha.1"

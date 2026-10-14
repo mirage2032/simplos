@@ -90,6 +90,10 @@ itself down back into a pass or a fail. The guest's side of that is QEMU's
 derived from the value written. Every test also gets two blank scratch disks,
 1 MiB on IDE and 2 MiB on AHCI, which `tests/disk.rs` writes to.
 
+Each test boots twice, under BIOS and then under UEFI, and passes only if it
+passes both times. The runner tells the guest which firmware it started, and
+`tests/basic_boot.rs` checks that the kernel saw the same one.
+
 `scripts/smoke-test.sh` is the coarser check, and the one that catches the most:
 it boots the real images both ways and asserts the kernel's boot banner names
 the right firmware and the right framebuffer mode.

@@ -46,6 +46,7 @@ name = "boot-test"
 version = "0.1.0"
 dependencies = [
  "bootloader",
+ "ovmf-prebuilt",
 ]
 
 [[package]]
@@ -247,6 +248,12 @@ name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
+
+[[package]]
+name = "ovmf-prebuilt"
+version = "0.1.0-alpha.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fa50141d081512ab30fd9e7e7692476866df5098b028536ad6680212e717fa8d"
 
 [[package]]
 name = "pin-project-lite"
