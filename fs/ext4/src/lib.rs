@@ -31,7 +31,7 @@ use alloc::ffi::CString;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::ffi::{c_int, c_void};
+use core::ffi::{CStr, c_char, c_int, c_void};
 use spin::Mutex;
 
 pub const SECTOR: usize = 512;
@@ -497,6 +497,14 @@ extern "C" fn simplos_ext4_write(
         Ok(()) => 0,
         Err(_) => 5,
     }
+}
+
+/// lwext4's `assert`, through `src/include/assert.h`.
+#[unsafe(no_mangle)]
+extern "C" fn simplos_ext4_assert_failed(file: *const c_char, line: c_int) {
+    // Safety: `__FILE__`, a string literal.
+    let file = unsafe { CStr::from_ptr(file) }.to_str().unwrap_or("?");
+    panic!("lwext4: assertion failed at {file}:{line}");
 }
 
 /// lwext4's functions, and `glue.c`'s around them. Its structures stay opaque.

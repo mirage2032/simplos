@@ -111,7 +111,10 @@ int ext4_fs_init(struct ext4_fs *fs, struct ext4_blockdev *bdev,
 
 	if (!fs->read_only) {
 		/* Mark system as mounted */
-		ext4_set16(&fs->sb, state, EXT4_SUPERBLOCK_STATE_ERROR_FS);
+		/* LOCAL PATCH: as Linux does, by clearing "clean", not by setting
+		 * "has errors", which a crash would leave for Linux to find. */
+		ext4_set16(&fs->sb, state, ext4_get16(&fs->sb, state) &
+			   ~EXT4_SUPERBLOCK_STATE_VALID_FS);
 		r = ext4_sb_write(fs->bdev, &fs->sb);
 		if (r != EOK)
 			return r;
@@ -128,7 +131,9 @@ int ext4_fs_fini(struct ext4_fs *fs)
 	ext4_assert(fs);
 
 	/*Set superblock state*/
-	ext4_set16(&fs->sb, state, EXT4_SUPERBLOCK_STATE_VALID_FS);
+	/* LOCAL PATCH: clean again, keeping any errors Linux had found. */
+	ext4_set16(&fs->sb, state, ext4_get16(&fs->sb, state) |
+		   EXT4_SUPERBLOCK_STATE_VALID_FS);
 
 	if (!fs->read_only)
 		return ext4_sb_write(fs->bdev, &fs->sb);

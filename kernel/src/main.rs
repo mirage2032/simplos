@@ -26,6 +26,7 @@ entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 #[unsafe(no_mangle)]
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     pre_init(boot_info);
+    simplos::fs::init();
     #[cfg(test)]
     test_main();
     start();

@@ -18,7 +18,7 @@ use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use simplos::io::hpet;
 use simplos::memory::STACKS_START;
-use simplos::thread::{WaitQueue, sleep, spawn, yield_now};
+use simplos::thread::{SleepLock, WaitQueue, sleep, spawn, yield_now};
 use spin::Mutex;
 
 entry_point!(main, config = &simplos::BOOTLOADER_CONFIG);
@@ -192,4 +192,26 @@ fn an_endless_sleep_is_only_a_long_one() {
     while !asleep.load(Ordering::Relaxed) {
         yield_now();
     }
+}
+
+#[test_case]
+fn a_sleep_lock_lets_one_thread_in_at_a_time() {
+    // Each thread reads the count, gives the CPU away while holding the lock,
+    // and writes it back one more: had two been in at once, counts would be
+    // lost.
+    let count = Arc::new(SleepLock::new(0));
+    for _ in 0..4 {
+        let count = count.clone();
+        spawn(move || {
+            for _ in 0..20 {
+                let mut held = count.lock();
+                let seen = *held;
+                yield_now();
+                *held = seen + 1;
+            }
+        })
+        .expect("memory for a stack");
+    }
+    wait_for(&count);
+    assert_eq!(*count.lock(), 80);
 }

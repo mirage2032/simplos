@@ -86,6 +86,11 @@ fn survives_a_crash_at_any_write() {
             disk[start..start + data.len()].copy_from_slice(data);
         }
 
+        // Mounted, it's marked as Linux marks it: not clean, but not as having
+        // errors either, which would outlive a crash.
+        let state = u16::from_le_bytes([disk[1024 + 0x3a], disk[1024 + 0x3b]]);
+        assert_eq!(state & 2, 0, "after {cut} writes, the file system says it has errors");
+
         // e2fsck replaying the journal and nothing more, as Linux would.
         std::fs::write(&crashed, &disk).unwrap();
         let replay = e2fsprogs("e2fsck").args(["-y", "-E", "journal_only"]).arg(&crashed).output();

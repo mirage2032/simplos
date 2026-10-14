@@ -93,6 +93,10 @@ fn run(kernel: &Path, firmware: Firmware) -> Result<bool, Box<dyn Error>> {
     for (path, size) in [(&ata_scratch, 1 << 20), (&ahci_scratch, 2 << 20)] {
         std::fs::File::create(path)?.set_len(size)?;
     }
+    // And an ext4 one, made by Linux's own mke2fs and checked afterwards by
+    // its e2fsck, for what the kernel's file system code does to it.
+    let ext4_scratch = kernel.with_extension("ext4.img");
+    make_ext4(&ext4_scratch)?;
 
     let mut qemu = Command::new("qemu-system-x86_64");
     if let Firmware::Uefi = firmware {
@@ -104,6 +108,8 @@ fn run(kernel: &Path, firmware: Firmware) -> Result<bool, Box<dyn Error>> {
         .arg(format!("format=raw,file={}", image.display()))
         .arg("-drive")
         .arg(format!("format=raw,file={},if=ide,index=1", ata_scratch.display()))
+        .arg("-drive")
+        .arg(format!("format=raw,file={},if=ide,index=2", ext4_scratch.display()))
         .args(["-device", "ich9-ahci,id=ahci", "-device", "ide-hd,drive=scratch,bus=ahci.0"])
         .arg("-drive")
         .arg(format!("format=raw,file={},if=none,id=scratch", ahci_scratch.display()))
@@ -150,7 +156,11 @@ fn run(kernel: &Path, firmware: Firmware) -> Result<bool, Box<dyn Error>> {
     };
 
     Ok(match status.code() {
-        Some(GUEST_SUCCESS) => true,
+        Some(GUEST_SUCCESS) => check_ext4(&ext4_scratch)
+            .map_err(|problems| {
+                eprintln!("boot-test: {} ({name}), its ext4 disk:\n{problems}", kernel.display())
+            })
+            .is_ok(),
         Some(GUEST_FAILED) => {
             eprintln!("boot-test: {} ({name}) reported a failure", kernel.display());
             false
@@ -169,4 +179,56 @@ fn run(kernel: &Path, firmware: Firmware) -> Result<bool, Box<dyn Error>> {
             false
         }
     })
+}
+
+/// e2fsprogs lives in /sbin, which isn't on every user's PATH.
+fn e2fsprogs(tool: &str) -> Command {
+    let sbin = Path::new("/usr/sbin").join(tool);
+    Command::new(if sbin.exists() { sbin } else { PathBuf::from(tool) })
+}
+
+/// The files the ext4 scratch disk starts with, which `tests/ext4.rs` reads.
+const EXT4_TREE: &[(&str, &str)] =
+    &[("hello.txt", "hello from ext4\n"), ("dir/nested/deep.txt", "deep\n")];
+
+/// A 16 MiB ext4 file system holding `EXT4_TREE`, as Linux makes them.
+fn make_ext4(image: &Path) -> Result<(), Box<dyn Error>> {
+    let tree = image.with_extension("tree");
+    let _ = std::fs::remove_dir_all(&tree);
+    for (path, contents) in EXT4_TREE {
+        let path = tree.join(path);
+        std::fs::create_dir_all(path.parent().expect("a file in a directory"))?;
+        std::fs::write(path, contents)?;
+    }
+    let output = e2fsprogs("mke2fs")
+        .args(["-q", "-F", "-t", "ext4", "-d"])
+        .arg(&tree)
+        .arg(image)
+        .arg("16M")
+        .output()
+        .map_err(|error| format!("couldn't run mke2fs ({error}); is e2fsprogs installed?"))?;
+    if !output.status.success() {
+        return Err(format!("mke2fs failed: {}", String::from_utf8_lossy(&output.stderr)).into());
+    }
+    Ok(())
+}
+
+/// What's wrong with the ext4 disk after a run: anything e2fsck finds,
+/// changing nothing; or, since a passing run unmounts it, its still being
+/// marked as mounted, which e2fsck doesn't count as wrong.
+fn check_ext4(image: &Path) -> Result<(), String> {
+    let output = e2fsprogs("e2fsck").arg("-fn").arg(image).output().map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stdout).into_owned());
+    }
+    // The superblock, 1 KiB in: `s_state` says clean (bit 0), and
+    // `s_feature_incompat` doesn't say the journal needs replaying (bit 2).
+    let disk = std::fs::read(image).map_err(|e| e.to_string())?;
+    let superblock = &disk[1024..2048];
+    let state = u16::from_le_bytes([superblock[0x3a], superblock[0x3b]]);
+    let incompat = u32::from_le_bytes(superblock[0x60..0x64].try_into().unwrap());
+    match state & 1 != 0 && incompat & 4 == 0 {
+        true => Ok(()),
+        false => Err(String::from("it's still mounted: unmount it before a passing exit")),
+    }
 }

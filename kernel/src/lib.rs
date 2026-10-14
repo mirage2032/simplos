@@ -8,6 +8,7 @@ extern crate alloc;
 
 pub mod allocator;
 pub mod elf;
+pub mod fs;
 pub mod io;
 pub mod memory;
 pub mod process;
@@ -189,6 +190,7 @@ bootloader_api::entry_point!(test_kernel_main, config = &BOOTLOADER_CONFIG);
 #[cfg(test)]
 fn test_kernel_main(boot_info: &'static mut BootInfo) -> ! {
     pre_init(boot_info);
+    fs::init();
     test_main();
     hlt_loop()
 }
@@ -212,6 +214,7 @@ pub fn test_runner(tests: &[&dyn Testable]) {
     for test in tests {
         test.run();
     }
+    fs::unmount();
     exit_qemu(QemuExitCode::Success);
 }
 
