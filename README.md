@@ -109,14 +109,31 @@ the right firmware and the right framebuffer mode.
 | `user/probe/` | a user program: ordinary Rust with `std`, built for Linux (static musl). Both images and every test boot carry it as the bootloader's ramdisk, and the shell's `run` runs it. |
 | `vendor/bootloader/` | [rust-osdev/bootloader](https://github.com/rust-osdev/bootloader) 0.11.17, vendored and patched. |
 | `vendor/ps2/` | the `ps2` crate, with its `x86_64` dependency bumped. |
+| `fs/ext4/` | ext4 (and ext3 and ext2) file systems: a Rust interface over the vendored lwext4, tested on the host against images made by e2fsprogs. |
+| `vendor/lwext4/` | [lwext4](https://github.com/gkostka/lwext4), the C library `fs/ext4` uses for now. |
 | `scripts/` | `build-images.sh`, `smoke-test.sh`, `boot-test.sh`. |
 
 There is no cargo workspace: `kernel` builds for `x86_64-unknown-none` with
-`build-std`, the host tools build for the host, `user/probe` builds for
+`build-std`, the host tools and `fs/ext4`'s tests build for the host, `user/probe` builds for
 `x86_64-unknown-linux-musl` (linked by the toolchain's `rust-lld`), and the settings for
 those are mutually exclusive. Each crate has its own `Cargo.toml`, `Cargo.lock`,
 `.cargo/config.toml` and target directory — so a `[patch]` added to one has to
 be added to the others that need it.
+
+### The vendored lwext4
+
+`vendor/lwext4` is upstream [lwext4](https://github.com/gkostka/lwext4) at
+commit `58bcf89` (2022-09-22), unchanged: its `src/` and `include/` without the
+mkfs and MBR code, which nothing uses. It is GPL-2.0 (its extents and xattr
+code are "GPL-2.0 or later"), like simplos.
+
+`fs/ext4` compiles it with the host's C compiler and a few settings in its
+`build.rs`: no debug `printf`, lwext4's own errno values, and `malloc` and
+friends from Rust's allocator. Nothing outside `fs/ext4` sees it, so it can be
+replaced by Rust code without touching the rest. Two of its habits are handled
+there rather than patched: it mounts a file system whose journal still needs
+replaying as if it were clean, and unmounting after a failed mount crashes.
+Building `fs/ext4`'s tests needs e2fsprogs (`mke2fs`, `debugfs`) installed.
 
 ### The vendored bootloader
 

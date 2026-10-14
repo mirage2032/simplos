@@ -1,0 +1,13 @@
+[package]
+name = "ext4"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-only"
+publish = false
+
+[dependencies]
+spin = "0.10.0"
+
+[build-dependencies]
+# Compiles the vendored lwext4 with the host's C compiler.
+cc = "1"
