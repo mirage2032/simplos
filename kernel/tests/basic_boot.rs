@@ -90,3 +90,25 @@ fn lower_half_is_unmapped() {
     let pml4 = unsafe { &*(pml4 as *const x86_64::structures::paging::PageTable) };
     assert!(pml4.iter().take(256).all(|entry| entry.is_unused()));
 }
+
+#[test_case]
+fn timer_ticks_at_timer_hz() {
+    use core::sync::atomic::Ordering::Relaxed;
+    use simplos::io::hpet;
+    use simplos::io::interrupts::{idt::TIMER_COUNTER, pit::TIMER_HZ};
+
+    // Count ticks across half a second of HPET time, a separate clock. Loose
+    // bounds, since an emulated CPU can take a tick late; the PIT's power-on
+    // rate would give about 9 here, far outside them.
+    let start_ms = hpet::elapsed_millis().expect("QEMU has an HPET");
+    let start_ticks = TIMER_COUNTER.load(Relaxed);
+    while hpet::elapsed_millis().unwrap() - start_ms < 500 {
+        x86_64::instructions::hlt();
+    }
+    let ticks = TIMER_COUNTER.load(Relaxed) - start_ticks;
+    let expected = TIMER_HZ as usize / 2;
+    assert!(
+        (expected * 6 / 10..=expected * 14 / 10).contains(&ticks),
+        "{ticks} ticks in 500 ms of HPET time, expected about {expected}"
+    );
+}

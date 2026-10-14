@@ -2,6 +2,7 @@
 //! lines that are on screen. Drawing them is `main.rs`'s job.
 
 use crate::io::interrupts::idt::TIMER_COUNTER;
+use crate::io::interrupts::pit::TIMER_HZ;
 use crate::io::{disk, hpet};
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -132,9 +133,12 @@ fn time() -> String {
 
 fn uptime() -> String {
     let ticks = TIMER_COUNTER.load(Ordering::Relaxed);
+    let tick_ms = ticks as u64 * 1000 / TIMER_HZ as u64;
+    let timer =
+        format!("Timer: {ticks} ticks, {}.{:03}s at {TIMER_HZ} Hz", tick_ms / 1000, tick_ms % 1000);
     match hpet::elapsed_millis() {
-        Some(ms) => format!("Timer: {ticks}\nHPET: {}.{:03}s", ms / 1000, ms % 1000),
-        None => format!("Timer: {ticks}\nHPET: unavailable"),
+        Some(ms) => format!("{timer}\nHPET: {}.{:03}s", ms / 1000, ms % 1000),
+        None => format!("{timer}\nHPET: unavailable"),
     }
 }
 
