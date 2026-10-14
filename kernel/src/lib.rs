@@ -9,6 +9,7 @@ extern crate alloc;
 pub mod allocator;
 pub mod io;
 pub mod memory;
+pub mod shell;
 
 pub use io::console::CONSOLE;
 pub use io::serial;

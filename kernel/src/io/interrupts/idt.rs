@@ -71,13 +71,11 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
         let mut keyboard = KEYBOARD.lock();
         if let Ok(scancode) = controller.controller_mut().read_data()
             && let Ok(Some(key_event)) = keyboard.add_byte(scancode)
-            && let Some(key) = keyboard.process_keyevent(key_event)
+            // Raw keys (arrows, shift and friends) are dropped: nothing uses them yet.
+            && let Some(DecodedKey::Unicode(c)) = keyboard.process_keyevent(key_event)
         {
             // No heap in here: see `ConsoleBuffer::push`.
-            match key {
-                DecodedKey::Unicode(c) => CONSOLE.push(format_args!("{c}")),
-                DecodedKey::RawKey(k) => CONSOLE.push(format_args!("{k:?}")),
-            };
+            CONSOLE.push(format_args!("{c}"));
         }
     }
     pic::notify_end_of_interrupt(&InterruptIndex::Keyboard);

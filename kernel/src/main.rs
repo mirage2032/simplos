@@ -5,26 +5,20 @@
 #![reexport_test_harness_main = "test_main"]
 extern crate alloc;
 use alloc::format;
-use alloc::string::String;
-use alloc::string::ToString;
 use bootloader_api::{BootInfo, entry_point};
-use core::ops::DerefMut;
 use core::panic::PanicInfo;
-use core::sync::atomic::Ordering;
 use embedded_graphics::mono_font::MonoTextStyle;
 use embedded_graphics::mono_font::ascii::FONT_7X13;
 use embedded_graphics::pixelcolor::Rgb888;
 use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::Rectangle;
-use embedded_graphics::text::{Alignment, Text};
+use embedded_graphics::text::{Baseline, Text};
 use simplos::BOOTLOADER_CONFIG;
 use simplos::CONSOLE;
 use simplos::DISPLAY;
-use simplos::boot_mode;
-use simplos::io::hpet;
-use simplos::io::interrupts::idt::TIMER_COUNTER;
+use simplos::io::video::Display;
 use simplos::pre_init;
-use x86_rtc::Rtc;
+use simplos::shell::{PROMPT, Redraw, Shell};
 
 entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 #[allow(unreachable_code)]
@@ -38,91 +32,62 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
 #[unsafe(no_mangle)]
 fn start() -> ! {
-    const BACKGROUND: Rgb888 = Rgb888::new(23, 114, 243);
-    let character_style = MonoTextStyle::new(&FONT_7X13, Rgb888::new(94, 243, 23));
-    let rtc = Rtc::new();
-    let mut keyboard_input = String::new();
-
-    // Read CPUID once. The answer cannot change, and the brand string lives in
-    // extended leaves (0x8000_0002-4) that not every emulator implements, so it
-    // must not be able to take the kernel down mid-frame.
-    let cpu_id = x86::cpuid::CpuId::new();
-    let cpu_brand = cpu_id
-        .get_processor_brand_string()
-        .map_or_else(|| String::from("unknown"), |brand| brand.as_str().to_string());
-    let cpu_vendor = cpu_id
-        .get_vendor_info()
-        .map_or_else(|| String::from("unknown"), |vendor| vendor.as_str().to_string());
-    let firmware = boot_mode().as_str();
-    let disks = simplos::io::disk::list().len();
-
-    // Paint the background once. From here on only the status block is
-    // repainted, so a frame costs a few hundred scanlines instead of the screen.
-    {
-        let mut display = DISPLAY.lock();
-        display.clear(BACKGROUND).expect("Failed to clear screen");
-        display.present();
-    }
-
-    let mut val: u64 = 0;
-    let mut previous = Rectangle::new(Point::zero(), Size::zero());
-    let mut last_tick = usize::MAX;
+    let (rows, cols) = {
+        let size = DISPLAY.lock().bounding_box().size;
+        let text = |px: u32, cell: u32| (px.saturating_sub(2 * MARGIN as u32) / cell) as usize;
+        (text(size.height, LINE_HEIGHT as u32), text(size.width, CHAR_WIDTH as u32))
+    };
+    let mut shell = Shell::new(rows, cols);
+    let mut redraw = Redraw::All;
 
     loop {
-        // Drain console messages from interrupts (keyboard input)
-        let mut typed = false;
+        // Keys arrive from the keyboard interrupt through `CONSOLE`.
         while let Some(msg) = CONSOLE.pop() {
-            keyboard_input.push_str(&msg);
-            // Keep last 40 chars for display
-            if keyboard_input.len() > 40 {
-                keyboard_input = keyboard_input[keyboard_input.len() - 40..].to_string();
+            for c in msg.chars() {
+                redraw = redraw.max(shell.key(c));
             }
-            typed = true;
         }
 
-        // One repaint per timer tick, and halt in between. Unthrottled this loop
-        // redraws as fast as the CPU allows, which is merely wasteful on real
-        // hardware and ruinous when the CPU is emulated.
-        let tick = TIMER_COUNTER.load(Ordering::Relaxed);
-        if tick == last_tick && !typed {
+        // Nothing changed: sleep until the next interrupt rather than spin,
+        // which is ruinous when the CPU is emulated.
+        if redraw == Redraw::None {
             x86_64::instructions::hlt();
             continue;
         }
-        last_tick = tick;
 
-        let time = rtc.get_unix_timestamp();
-        let hpet_ms = hpet::elapsed_millis().unwrap_or(0);
-        let hpet_secs = hpet_ms / 1000;
-        let hpet_frac = hpet_ms % 1000;
-        let status = format!(
-            "\
-            Update: {val}\n\
-            Boot: {firmware}\n\
-            Timer: {tick}\n\
-            RTC: {time}\n\
-            HPET: {hpet_secs}.{hpet_frac:03}\n\
-            CPU: {cpu_brand}\n\
-            Vendor: {cpu_vendor}\n\
-            Disks: {disks}\n\
-            \n\
-            Keyboard: {keyboard_input}\n\
-            "
-        );
-
-        {
-            let mut display = DISPLAY.lock();
-            let center = display.bounding_box().center();
-            let text =
-                Text::with_alignment(status.as_str(), center, character_style, Alignment::Center);
-            // Erase only what the last frame drew, then draw and blit the union.
-            display.fill_rect(&previous, BACKGROUND);
-            previous = text.bounding_box();
-            text.draw(display.deref_mut()).expect("Failed to draw text");
-            display.present();
+        let mut display = DISPLAY.lock();
+        let input = format!("{PROMPT}{}_", shell.line);
+        if redraw == Redraw::All {
+            display.clear(BACKGROUND).expect("Failed to clear screen");
+            for (row, line) in shell.history.iter().enumerate() {
+                draw_line(&mut display, row, line, cols);
+            }
         }
-
-        val += 1;
+        draw_line(&mut display, shell.history.len(), &input, cols);
+        display.present();
+        redraw = Redraw::None;
     }
+}
+
+const BACKGROUND: Rgb888 = Rgb888::new(23, 114, 243);
+const FOREGROUND: Rgb888 = Rgb888::new(94, 243, 23);
+const MARGIN: i32 = 8;
+const LINE_HEIGHT: i32 = 13;
+const CHAR_WIDTH: i32 = 7;
+
+/// Paint one text row, erasing what was there. Text past `cols` is cut off.
+fn draw_line(display: &mut Display, row: usize, text: &str, cols: usize) {
+    let y = MARGIN + row as i32 * LINE_HEIGHT;
+    let width = display.bounding_box().size.width;
+    display.fill_rect(
+        &Rectangle::new(Point::new(0, y), Size::new(width, LINE_HEIGHT as u32)),
+        BACKGROUND,
+    );
+    let text = text.char_indices().nth(cols).map_or(text, |(end, _)| &text[..end]);
+    let style = MonoTextStyle::new(&FONT_7X13, FOREGROUND);
+    Text::with_baseline(text, Point::new(MARGIN, y), style, Baseline::Top)
+        .draw(display)
+        .expect("Failed to draw text");
 }
 
 // Under `cargo test` the failure has to reach the host, which is what
@@ -145,6 +110,6 @@ fn panic(info: &PanicInfo) -> ! {
     simplos::hlt_loop();
 }
 
-// No `#[test_case]`s here on purpose. What this binary does — the render loop —
+// No `#[test_case]`s here on purpose. What this binary does — drawing the shell —
 // needs a screen to be worth asserting about; that it boots at all is covered by
 // tests/basic_boot.rs.
