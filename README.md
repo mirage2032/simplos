@@ -58,6 +58,23 @@ hardware, where those registers don't exist.
 
 One 1920x1080 image therefore serves everyone, the browser build included.
 
+## Disks
+
+At boot the kernel finds every hard disk on the legacy IDE channels (ATA PIO)
+and on any AHCI (SATA) controller on PCI, logs one `simplos: disk N: ...` line
+for each over serial, and shows the count on screen. Kernel code reads and
+writes raw 512-byte sectors with `io::disk::{list, read, write}`. Both drivers
+poll, and neither knows which disk it booted from, so `write` will happily
+overwrite the boot image if told to.
+
+Every `-drive` on QEMU's default machine is an IDE disk. For an AHCI one:
+
+```sh
+cargo run -- -device ich9-ahci,id=ahci -drive id=d,file=disk.img,format=raw,if=none -device ide-hd,drive=d,bus=ahci.0
+```
+
+NVMe isn't supported, and on many real PCs that is where the disk is.
+
 ## Tests
 
 ```sh
@@ -70,7 +87,8 @@ and no libtest, so `tools/boot-test` stands in as cargo's test runner: it wraps
 each test binary in a bootable image, starts QEMU, and turns how the guest shut
 itself down back into a pass or a fail. The guest's side of that is QEMU's
 `isa-debug-exit` device — writing to its port makes QEMU exit with a status
-derived from the value written.
+derived from the value written. Every test also gets two blank scratch disks,
+1 MiB on IDE and 2 MiB on AHCI, which `tests/disk.rs` writes to.
 
 `scripts/smoke-test.sh` is the coarser check, and the one that catches the most:
 it boots the real images both ways and asserts the kernel's boot banner names

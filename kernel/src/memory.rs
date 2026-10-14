@@ -1,4 +1,5 @@
 use bootloader_api::info::{MemoryRegionKind, MemoryRegions};
+use spin::{Mutex, Once};
 use x86_64::{
     PhysAddr, VirtAddr,
     structures::paging::{FrameAllocator, OffsetPageTable, PageTable, PhysFrame, Size4KiB},
@@ -13,6 +14,7 @@ use x86_64::{
 /// must be only called once to avoid aliasing `&mut` references (which is
 /// undefined behavior).
 pub unsafe fn init(physical_memory_offset: VirtAddr) -> OffsetPageTable<'static> {
+    PHYS_OFFSET.call_once(|| physical_memory_offset);
     unsafe {
         let level_4_table = active_level_4_table(physical_memory_offset);
         OffsetPageTable::new(level_4_table, physical_memory_offset)
@@ -35,6 +37,32 @@ unsafe fn active_level_4_table(physical_memory_offset: VirtAddr) -> &'static mut
     let page_table_ptr: *mut PageTable = virt.as_mut_ptr();
 
     unsafe { &mut *page_table_ptr }
+}
+
+/// Where all of physical memory is mapped, set once by [`init`].
+static PHYS_OFFSET: Once<VirtAddr> = Once::new();
+
+/// Where physical address `addr` is mapped. Only the first 4 GiB is
+/// guaranteed to be (the bootloader maps up to the end of RAM, and at least that).
+pub fn phys_ptr(addr: PhysAddr) -> Option<*mut u8> {
+    Some((*PHYS_OFFSET.get()? + addr.as_u64()).as_mut_ptr())
+}
+
+/// The frame allocator `pre_init` used for the heap, kept for drivers that
+/// need memory with a known physical address.
+pub static FRAMES: Mutex<Option<BootInfoFrameAllocator>> = Mutex::new(None);
+
+/// A zeroed 4 KiB frame for a device to DMA into, as its physical address and
+/// a pointer the kernel can use. `None` once memory runs out or before boot.
+///
+/// shortcut: frames are never freed, fine for a few per device at boot; add a
+/// free list if a driver starts allocating per request.
+pub fn alloc_dma_frame() -> Option<(PhysAddr, *mut u8)> {
+    let frame = FRAMES.lock().as_mut()?.allocate_frame()?;
+    let ptr = phys_ptr(frame.start_address())?;
+    // Safety: the frame is ours alone and mapped at the physical-memory offset.
+    unsafe { ptr.write_bytes(0, 4096) };
+    Some((frame.start_address(), ptr))
 }
 
 /// A FrameAllocator that returns usable frames from the bootloader's memory map.

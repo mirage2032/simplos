@@ -54,6 +54,7 @@ fn start() -> ! {
         .get_vendor_info()
         .map_or_else(|| String::from("unknown"), |vendor| vendor.as_str().to_string());
     let firmware = boot_mode().as_str();
+    let disks = simplos::io::disk::list().len();
 
     // Paint the background once. From here on only the status block is
     // repainted, so a frame costs a few hundred scanlines instead of the screen.
@@ -102,6 +103,7 @@ fn start() -> ! {
             HPET: {hpet_secs}.{hpet_frac:03}\n\
             CPU: {cpu_brand}\n\
             Vendor: {cpu_vendor}\n\
+            Disks: {disks}\n\
             \n\
             Keyboard: {keyboard_input}\n\
             "
