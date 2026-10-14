@@ -26,8 +26,8 @@ commands:
   uptime        timer ticks and HPET time since boot
   disks         disks found at boot
   info          all of the above
-  run [MODE]    run the user program in the ramdisk:
-                hello, float, bad-calls, fault or exit";
+  run [MODE]    run the user program in the ramdisk: hello,
+                sleep [MS], float, bad-calls, fault or exit";
 
 /// What a key changed, so the caller repaints no more than it has to. Ordered
 /// by how much, so several keys combine with `max`.

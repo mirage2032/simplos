@@ -142,6 +142,7 @@ fn call(nr: u64, [a0, a1, a2, a3, _a4, _a5]: [u64; 6]) -> i64 {
         13 => rt_sigaction(&process, a0, a2, a3),
         14 => rt_sigprocmask(&process, a2, a3),
         16 => -ENOTTY,
+        35 => clock_nanosleep(&process, CLOCK_MONOTONIC, 0, a0),
         // exit, exit_group: one thread per program, so the same.
         60 | 231 => {
             drop(process);
@@ -149,8 +150,11 @@ fn call(nr: u64, [a0, a1, a2, a3, _a4, _a5]: [u64; 6]) -> i64 {
         }
         131 => sigaltstack(&process, a1),
         158 => arch_prctl(&process, a0, a1),
+        // gettid: one thread per program, so its id is the program's.
+        186 => process.id as i64,
         // set_tid_address: nothing to clear at exit with one thread per program.
         218 => process.id as i64,
+        230 => clock_nanosleep(&process, a0, a1, a2),
         _ => {
             serial_println!("simplos: process {}: no system call {}", process.id, nr);
             -ENOSYS
@@ -330,6 +334,33 @@ fn sigaltstack(process: &Process, old: u64) -> i64 {
     if old != 0 && process.memory.lock().space.write(old, &stack).is_none() {
         return -EFAULT;
     }
+    0
+}
+
+const CLOCK_REALTIME: u64 = 0;
+const CLOCK_MONOTONIC: u64 = 1;
+
+/// Sleep for the `struct timespec` at `request`: what `std::thread::sleep`
+/// does, through `clock_nanosleep`, and `nanosleep` too. Nothing interrupts a
+/// sleep (no signals yet), so the time left over is never written.
+fn clock_nanosleep(process: &Process, clock: u64, flags: u64, request: u64) -> i64 {
+    // shortcut: relative sleeps only; TIMER_ABSTIME needs a clock a program
+    // can read, which comes with clock_gettime when one asks for it.
+    if flags != 0 || (clock != CLOCK_REALTIME && clock != CLOCK_MONOTONIC) {
+        return -EINVAL;
+    }
+    let mut timespec = [0u8; 16];
+    if process.memory.lock().space.read(request, &mut timespec).is_none() {
+        return -EFAULT;
+    }
+    let seconds = i64::from_le_bytes(timespec[..8].try_into().unwrap());
+    let nanos = i64::from_le_bytes(timespec[8..].try_into().unwrap());
+    if seconds < 0 || !(0..1_000_000_000).contains(&nanos) {
+        return -EINVAL;
+    }
+    let ms =
+        (seconds as u64).saturating_mul(1000).saturating_add((nanos as u64).div_ceil(1_000_000));
+    thread::sleep(ms);
     0
 }
 

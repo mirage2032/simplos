@@ -16,6 +16,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use bootloader_api::{BootInfo, entry_point};
 use core::panic::PanicInfo;
+use simplos::io::hpet;
 use simplos::process;
 use spin::Mutex;
 
@@ -78,10 +79,11 @@ fn a_fault_ends_only_the_program() {
 
 #[test_case]
 fn bad_system_calls_are_refused() {
-    // A pointer into the kernel's half and one into nothing are EFAULT, and
-    // an unknown call ENOSYS, as on Linux: never the kernel's memory, never a
-    // fault in the kernel.
-    assert_eq!(run(&["bad-calls"]), (0, String::from("-14 -14 -38\n")));
+    // A pointer into the kernel's half and one into nothing are EFAULT, an
+    // unknown call ENOSYS, a sleep for 2e9 nanoseconds EINVAL and one whose
+    // time is in the kernel EFAULT, as on Linux: never the kernel's memory,
+    // never a fault in the kernel.
+    assert_eq!(run(&["bad-calls"]), (0, String::from("-14 -14 -38 -22 -14\n")));
 }
 
 #[test_case]
@@ -104,4 +106,14 @@ fn finished_programs_give_their_memory_back() {
     for _ in 0..200 {
         assert_eq!(run(&["exit"]).0, 0);
     }
+}
+
+#[test_case]
+fn std_thread_sleep_sleeps() {
+    // What a Rust program's std::thread::sleep comes to: clock_nanosleep.
+    let start = hpet::elapsed_millis().expect("QEMU has an HPET");
+    let (status, output) = run(&["sleep", "200"]);
+    let took = hpet::elapsed_millis().unwrap() - start;
+    assert_eq!((status, output.as_str()), (0, "sleeping for 200 ms\nawake\n"));
+    assert!(took >= 200, "asked to sleep 200 ms, the whole run took {took}");
 }
