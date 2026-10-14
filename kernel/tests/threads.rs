@@ -177,3 +177,19 @@ fn a_waiting_thread_sleeps_until_woken() {
     wait_for(&done);
     assert!(done.load(Ordering::Relaxed));
 }
+
+#[test_case]
+fn an_endless_sleep_is_only_a_long_one() {
+    // Programs can ask to sleep for practically ever (nanosleep takes up to
+    // i64::MAX seconds), and working out when to wake mustn't overflow.
+    let asleep = Arc::new(AtomicBool::new(false));
+    let sleeper = asleep.clone();
+    spawn(move || {
+        sleeper.store(true, Ordering::Relaxed);
+        sleep(u64::MAX);
+    })
+    .expect("memory for a stack");
+    while !asleep.load(Ordering::Relaxed) {
+        yield_now();
+    }
+}

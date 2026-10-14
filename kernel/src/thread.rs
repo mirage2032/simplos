@@ -133,7 +133,8 @@ pub fn yield_now() {
 /// Sleep for at least `ms` milliseconds, letting other threads run meanwhile.
 pub fn sleep(ms: u64) {
     // Rounded up to whole ticks, and one more: the current tick is partly over.
-    let wake = ticks() + (ms * TIMER_HZ as u64).div_ceil(1000) + 1;
+    // Saturating: a program can ask for practically forever.
+    let wake = ms.saturating_mul(TIMER_HZ as u64).div_ceil(1000).saturating_add(ticks() + 1);
     interrupts::without_interrupts(|| {
         while ticks() < wake {
             block(|scheduler, me| scheduler.sleeping.push((wake, me)));

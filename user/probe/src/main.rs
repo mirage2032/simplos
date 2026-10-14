@@ -8,8 +8,9 @@ fn main() {
     match std::env::args().nth(1).as_deref() {
         None | Some("hello") => println!("hello from user space"),
         Some("sleep") => {
-            println!("sleeping for 100 ms");
-            std::thread::sleep(Duration::from_millis(100));
+            let ms = std::env::args().nth(2).and_then(|ms| ms.parse().ok()).unwrap_or(100);
+            println!("sleeping for {ms} ms");
+            std::thread::sleep(Duration::from_millis(ms));
             println!("awake");
         }
         // The kernel should end this program, and nothing else.
@@ -21,12 +22,16 @@ fn main() {
             println!("{sum}");
         }
         // The kernel must refuse these, not fault or hand over its memory: a
-        // pointer into its half, one into nothing, and a call it hasn't got.
+        // pointer into its half, one into nothing, a call it hasn't got, a
+        // sleep for an impossible time and one whose time is in the kernel.
         Some("bad-calls") => {
             let kernel = syscall(1, 1, 0xFFFF_8000_0000_0000, 8);
             let unmapped = syscall(1, 1, 0x1000, 8);
             let unknown = syscall(999, 0, 0, 0);
-            println!("{kernel} {unmapped} {unknown}");
+            let timespec: [i64; 2] = [0, 2_000_000_000];
+            let bad_time = syscall(35, timespec.as_ptr() as usize, 0, 0);
+            let kernel_time = syscall(230, 1, 0, 0xFFFF_8000_0000_0000);
+            println!("{kernel} {unmapped} {unknown} {bad_time} {kernel_time}");
         }
         Some("exit") => {}
         Some(other) => {
