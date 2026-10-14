@@ -5,6 +5,7 @@ use super::files::{self, AT_FDCWD, Result, lookup, path_at, ret, string_at};
 use super::{EFAULT, EINVAL, ENOMEM};
 use crate::fs;
 use crate::process::{self, Process, Registers};
+use crate::signal::ERESTARTSYS;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -78,29 +79,50 @@ fn strings_at(process: &Process, addr: u64, room: &mut usize) -> Result<Vec<Vec<
     Ok(strings)
 }
 
-/// Wait for a child to end: the one numbered `pid`, or with any other `pid`
-/// any of them. Its number, with how it ended in `wstatus`; or with WNOHANG
-/// and none ended yet, 0.
-///
-/// shortcut: no process groups, so 0 and below -1 mean any child too; and
-/// nothing stops, so WUNTRACED and WCONTINUED change nothing.
+/// Wait for a child to end, or with WUNTRACED to stop, or with WCONTINUED
+/// to continue: the one numbered `pid`; with -1 any; with 0 any in the
+/// caller's group; and below -1 any in group `-pid`. Its number, with how it
+/// ended, stopped or continued in `wstatus`; or with WNOHANG and nothing to
+/// tell yet, 0. A signal ends the wait early.
 pub fn wait4(process: &Process, pid: u64, wstatus: u64, options: u64, rusage: u64) -> i64 {
     const WNOHANG: u64 = 1;
-    let pid = pid as i32;
-    let wanted = |child: &Arc<Process>| pid <= 0 || child.id == pid as u64;
-    let (mut any, mut ended) = (false, None);
-    process.child_exited.wait_until(|| {
+    const WUNTRACED: u64 = 2;
+    const WCONTINUED: u64 = 8;
+    let (pid, pgid) = (pid as i32, process.pgid());
+    let wanted = |child: &Arc<Process>| match pid {
+        1.. => child.id == pid as u64,
+        0 => child.pgid() == pgid,
+        -1 => true,
+        _ => child.pgid() == u64::from(pid.unsigned_abs()),
+    };
+    let (stops, continues) = (options & WUNTRACED != 0, options & WCONTINUED != 0);
+    let (mut any, mut found) = (false, None);
+    let waited = process.child_exited.wait_until_interruptible(|| {
         let mut children = process.children.lock();
         any = children.iter().any(wanted);
-        let at = children.iter().position(|child| wanted(child) && child.ended().is_some());
-        // Taken out, but dropped only once interrupts are back on: it may be
-        // the last of it, and freeing its memory takes locks taken with
-        // them on.
-        ended = at.map(|at| children.remove(at));
-        !any || ended.is_some() || options & WNOHANG != 0
+        for at in 0..children.len() {
+            let child = &children[at];
+            if !wanted(child) {
+                continue;
+            }
+            if let Some(status) = child.ended() {
+                // Taken out, but dropped only once interrupts are back on:
+                // it may be the last of it, and freeing its memory takes
+                // locks taken with them on.
+                found = Some((children.remove(at), status));
+                return true;
+            }
+            if let Some(status) = child.signals.take_report(stops, continues) {
+                found = Some((child.clone(), status));
+                return true;
+            }
+        }
+        !any || options & WNOHANG != 0
     });
-    let Some(child) = ended else { return if any { 0 } else { -ECHILD } };
-    let status = child.ended().expect("it ended");
+    if waited.is_err() {
+        return -ERESTARTSYS;
+    }
+    let Some((child, status)) = found else { return if any { 0 } else { -ECHILD } };
     ret((|| {
         let mut memory = process.memory.lock();
         if wstatus != 0 {

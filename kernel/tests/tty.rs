@@ -156,6 +156,61 @@ fn the_first_program_there_is_runs_as_linux_starts_it() {
 }
 
 #[test_case]
+fn control_c_ends_the_program_in_the_foreground() {
+    let (tty, screen) = terminal();
+    let probe = start(&tty, &["sleep", "100000"]);
+    wait_for(&screen, "sleeping for 100000 ms\r\n");
+    tty.input(b"\x03");
+    // 128 plus SIGINT's number, as a shell would say.
+    assert_eq!((probe.wait(), text(&screen)), (130, String::from("sleeping for 100000 ms\r\n^C")));
+}
+
+#[test_case]
+fn what_the_terminal_sends_reaches_handlers() {
+    let (tty, screen) = terminal();
+    let probe = start(&tty, &["catch"]);
+    wait_for(&screen, "ready\r\n");
+    tty.input(b"\x1c");
+    assert_eq!(
+        (probe.wait(), text(&screen)),
+        ok("ready\r\n^\\caught 3, from the kernel: true\r\n")
+    );
+}
+
+#[test_case]
+fn control_z_stops_no_one_in_a_group_no_one_could_continue() {
+    // The kernel started it, so no one outside its group could continue
+    // it: it runs on, and ^C, which a stopped program wouldn't take until
+    // continued, ends it.
+    let (tty, screen) = terminal();
+    let probe = start(&tty, &["sleep", "100000"]);
+    wait_for(&screen, "sleeping for 100000 ms\r\n");
+    tty.input(b"\x1a");
+    thread::sleep(50);
+    tty.input(b"\x03");
+    assert_eq!(probe.wait(), 130);
+    assert!(text(&screen).ends_with("^Z^C"));
+}
+
+#[test_case]
+fn the_foreground_is_whichever_group_a_program_puts_there() {
+    // A copy put in the foreground in a group of its own, as a shell puts a
+    // job: ^C is its, and the program goes on to say how it ended.
+    let (tty, screen) = terminal();
+    let probe = start(&tty, &["foreground"]);
+    wait_for(&screen, "0 true\r\n");
+    tty.input(b"\x03");
+    assert_eq!((probe.wait(), text(&screen)), ok("0 true\r\n^Csignal: 2\r\n"));
+}
+
+#[test_case]
+fn a_session_s_leader_ending_hangs_up_on_its_foreground() {
+    let (tty, screen) = terminal();
+    assert_eq!(start(&tty, &["hangup"]).wait(), 0);
+    wait_for(&screen, "hung up\r\n");
+}
+
+#[test_case]
 fn poll_waits_for_what_it_asks_and_no_longer() {
     let (tty, screen) = terminal();
     // At once and after 50 ms, nothing; then POLLIN once the copy writes,

@@ -2,7 +2,9 @@
 //! of their own. Each runs on one thread, whose system calls `syscall.rs`
 //! handles, and which a fault ends without touching anything else. A program
 //! can copy itself (`fork`), replace itself with another (`exec`), and wait
-//! for the copies it made to end.
+//! for the copies it made to end. Programs are in process groups, which are
+//! in sessions, as on Linux: a session's leader has a terminal, and one of
+//! its groups is in the terminal's foreground, which ^C signals.
 //!
 //! The lower half of a program's address space:
 //!
@@ -15,10 +17,12 @@
 use crate::elf::{self, Elf};
 use crate::fs;
 use crate::io::interrupts::gdt;
-use crate::memory::AddressSpace;
+use crate::memory::{AddressSpace, USER_END};
+use crate::signal::{self, Info, Signals};
 use crate::thread::{self, WaitQueue};
 use crate::tty::Tty;
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
@@ -48,16 +52,9 @@ pub const MMAP_END: u64 = STACK_TOP - STACK_SIZE - 0x10_0000;
 /// What `status` holds until the program ends.
 const RUNNING: i32 = i32::MIN;
 
-/// The signals Linux would send for a fault, which end a program here.
-pub const SIGILL: i32 = 4;
-pub const SIGTRAP: i32 = 5;
-pub const SIGBUS: i32 = 7;
-pub const SIGFPE: i32 = 8;
-pub const SIGSEGV: i32 = 11;
-
 /// The exit status of a program a segmentation fault ended, as a shell
 /// reports it: 128 plus the signal.
-pub const KILLED_SIGSEGV: i32 = 128 + SIGSEGV;
+pub const KILLED_SIGSEGV: i32 = 128 + signal::SIGSEGV as i32;
 
 /// Why a program couldn't be loaded, for the system call's errno.
 pub const NO_MEMORY: &str = "out of memory";
@@ -71,11 +68,13 @@ pub struct Process {
     /// to `exit` shifted up a byte, or the signal that ended it.
     status: AtomicI32,
     exited: WaitQueue,
-    /// Its terminal, which /dev/tty opens, if it has one.
-    ///
-    /// shortcut: no sessions: a program the kernel starts has the first
-    /// terminal among its descriptors, and its copies have its.
-    pub tty: Option<Arc<Tty>>,
+    /// Its process group, and its session.
+    pgid: AtomicU64,
+    sid: AtomicU64,
+    /// Its session's terminal, which /dev/tty opens, if it has one. Taken
+    /// with interrupts on.
+    pub tty: Mutex<Option<Arc<Tty>>>,
+    pub signals: Signals,
     /// Its file descriptors, by number; `None` for one that's closed. Taken
     /// only with interrupts on, by the program's own system calls.
     pub files: Mutex<Vec<Option<Fd>>>,
@@ -136,6 +135,84 @@ impl Process {
     pub fn parent_id(&self) -> u64 {
         self.parent.upgrade().map_or(0, |parent| parent.id)
     }
+
+    pub fn pgid(&self) -> u64 {
+        self.pgid.load(Ordering::Relaxed)
+    }
+
+    pub fn set_pgid(&self, pgid: u64) {
+        self.pgid.store(pgid, Ordering::Relaxed);
+    }
+
+    pub fn sid(&self) -> u64 {
+        self.sid.load(Ordering::Relaxed)
+    }
+
+    /// `setsid`: lead a new session, its own group's, with no terminal.
+    pub fn lead_session(&self) {
+        self.sid.store(self.id, Ordering::Relaxed);
+        self.pgid.store(self.id, Ordering::Relaxed);
+        *self.tty.lock() = None;
+    }
+
+    /// Tell its parent, if it has one, that it ended, stopped or continued:
+    /// SIGCHLD, unless the parent asked not to hear of stops, and whoever
+    /// waits for it with `wait4`.
+    pub fn notify_parent(&self, code: i32, status: i32) {
+        let Some(parent) = self.parent.upgrade() else { return };
+        let ended = code != signal::CLD_STOPPED && code != signal::CLD_CONTINUED;
+        if ended || !parent.signals.ignores_child_stops() {
+            signal::send(&parent, signal::SIGCHLD, Info { code, pid: self.id, status });
+        }
+        parent.child_exited.wake_all();
+    }
+}
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        TABLE.lock().remove(&self.id);
+    }
+}
+
+/// Every process there is, by id, for `kill` to find. Taken with interrupts
+/// on.
+static TABLE: Mutex<BTreeMap<u64, Weak<Process>>> = Mutex::new(BTreeMap::new());
+
+fn register(process: &Arc<Process>) {
+    TABLE.lock().insert(process.id, Arc::downgrade(process));
+}
+
+/// The process numbered `id`, if there is one.
+pub fn find(id: u64) -> Option<Arc<Process>> {
+    TABLE.lock().get(&id).and_then(Weak::upgrade)
+}
+
+/// Every process there is.
+pub fn all() -> Vec<Arc<Process>> {
+    TABLE.lock().values().filter_map(Weak::upgrade).collect()
+}
+
+/// The processes in group `pgid`.
+pub fn group(pgid: u64) -> Vec<Arc<Process>> {
+    all().into_iter().filter(|process| process.pgid() == pgid).collect()
+}
+
+/// Send `signal` to every process in group `pgid`, from `info`.
+pub fn signal_group(pgid: u64, signal: usize, info: Info) {
+    for process in group(pgid) {
+        signal::send(&process, signal, info);
+    }
+}
+
+/// Whether group `pgid` is orphaned: no one in it has a parent in another
+/// group of its session, who could continue it if it stopped. A group the
+/// kernel started is, having no parent at all.
+pub fn group_orphaned(pgid: u64) -> bool {
+    !group(pgid).iter().any(|process| {
+        process.parent.upgrade().is_some_and(|parent| {
+            parent.pgid() != pgid && parent.sid() == process.sid() && parent.ended().is_none()
+        })
+    })
 }
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -171,12 +248,21 @@ pub fn spawn_with(
         _ => None,
     });
     let files = files.into_iter().map(|file| file.map(|handle| Fd { handle, cloexec: false }));
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    // It leads a session of its own, its own group in its terminal's
+    // foreground, as if `setsid` and TIOCSCTTY had made it so.
+    if let Some(tty) = &tty {
+        tty.control(id, id);
+    }
     let process = Arc::new(Process {
-        id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+        id,
         memory: Mutex::new(memory),
         status: AtomicI32::new(RUNNING),
         exited: WaitQueue::new(),
-        tty,
+        pgid: AtomicU64::new(id),
+        sid: AtomicU64::new(id),
+        tty: Mutex::new(tty),
+        signals: Signals::new(),
         files: Mutex::new(files.collect()),
         cwd: Mutex::new(String::new()),
         umask: AtomicU32::new(0o022),
@@ -184,6 +270,7 @@ pub fn spawn_with(
         children: Mutex::new(Vec::new()),
         child_exited: WaitQueue::new(),
     });
+    register(&process);
     let user = UserState {
         process: process.clone(),
         start,
@@ -244,7 +331,10 @@ pub fn fork(parent: &Arc<Process>, registers: Registers) -> Option<u64> {
         memory: Mutex::new(memory),
         status: AtomicI32::new(RUNNING),
         exited: WaitQueue::new(),
-        tty: parent.tty.clone(),
+        pgid: AtomicU64::new(parent.pgid()),
+        sid: AtomicU64::new(parent.sid()),
+        tty: Mutex::new(parent.tty.lock().clone()),
+        signals: parent.signals.fork(),
         files: Mutex::new(parent.files.lock().clone()),
         cwd: Mutex::new(parent.cwd.lock().clone()),
         umask: AtomicU32::new(parent.umask.load(Ordering::Relaxed)),
@@ -252,6 +342,7 @@ pub fn fork(parent: &Arc<Process>, registers: Registers) -> Option<u64> {
         children: Mutex::new(Vec::new()),
         child_exited: WaitQueue::new(),
     });
+    register(&child);
     let user = thread::with_current_user(|user| user.fork(child.clone(), pml4, registers))?;
     thread::spawn_user(Box::new(user))?;
     // Even if it has already ended, it's there to be waited for: the parent
@@ -275,6 +366,7 @@ pub fn exec(
     thread::with_current_user(|user| user.start_over(pml4));
     // Only now that the CPU is off its page tables.
     drop(old);
+    process.signals.exec();
     Ok(start)
 }
 
@@ -284,10 +376,10 @@ pub fn exit_current(code: i32) -> ! {
     end_current((code & 0xFF) << 8)
 }
 
-/// End the current thread's program as `signal` would have, from a fault it
-/// caused.
-pub fn kill_current(signal: i32) -> ! {
-    end_current(signal)
+/// End the current thread's program as `signal` does: from a fault it
+/// caused, or a signal it was sent.
+pub fn kill_current(signal: usize) -> ! {
+    end_current(signal as i32)
 }
 
 /// End the current thread's program, which ended as `status` says. Its memory
@@ -305,11 +397,44 @@ fn end_current(status: i32) -> ! {
         drop(tree);
         process.status.store(status, Ordering::Release);
         process.exited.wake_all();
-        if let Some(parent) = process.parent.upgrade() {
-            parent.child_exited.wake_all();
+        let (code, how) = match status & 0x7f {
+            0 => (signal::CLD_EXITED, status >> 8),
+            signal => (signal::CLD_KILLED, signal),
+        };
+        process.notify_parent(code, how);
+        // A parent that said it won't wait for its children doesn't keep
+        // them once they've ended.
+        if let Some(parent) = process.parent.upgrade()
+            && parent.signals.reaps_children()
+        {
+            let me = interrupts::without_interrupts(|| {
+                let mut children = parent.children.lock();
+                let at = children.iter().position(|child| child.id == process.id);
+                at.map(|at| children.remove(at))
+            });
+            drop(me);
         }
+        hang_up(&process);
     }
     thread::exit()
+}
+
+/// As a session's leader ends: its terminal is no one's, and whoever's in
+/// its foreground is told so, with SIGHUP, and continued to hear it.
+fn hang_up(process: &Process) {
+    if process.sid() != process.id {
+        return;
+    }
+    let Some(tty) = process.tty.lock().clone() else { return };
+    if tty.session() != process.id {
+        return;
+    }
+    let foreground = tty.foreground();
+    tty.control(0, 0);
+    if foreground != 0 {
+        signal_group(foreground, signal::SIGHUP, Info::kernel());
+        signal_group(foreground, signal::SIGCONT, Info::kernel());
+    }
 }
 
 /// What the scheduler swaps in and out for a thread that runs a program: the
@@ -389,6 +514,38 @@ impl UserState {
 #[repr(C, align(16))]
 struct FpuState([u8; 512]);
 
+/// The CPU's x87 and SSE registers, which while a program's thread runs are
+/// the program's: for a signal handler's frame.
+pub fn save_fpu() -> [u8; 512] {
+    let mut area = FpuState([0; 512]);
+    // Safety: a 512-byte, 16-byte aligned area.
+    unsafe { core::arch::asm!("fxsave64 [{}]", in(reg) &mut area, options(nostack)) };
+    area.0
+}
+
+/// Load `area`, from a signal frame, into the CPU's x87 and SSE registers,
+/// for the running thread's program; MXCSR's reserved bits cleared first, as
+/// loading them would fault.
+pub fn load_fpu(area: &[u8; 512]) {
+    let mask = match u32::from_le_bytes(save_fpu()[28..32].try_into().unwrap()) {
+        0 => 0xFFBF,
+        mask => mask,
+    };
+    let mut state = FpuState(*area);
+    let mxcsr = u32::from_le_bytes(state.0[24..28].try_into().unwrap()) & mask;
+    state.0[24..28].copy_from_slice(&mxcsr.to_le_bytes());
+    // Safety: as in `save_fpu`, and every bit it loads is allowed.
+    unsafe { core::arch::asm!("fxrstor64 [{}]", in(reg) &state, options(nostack)) };
+}
+
+/// The CPU's x87 and SSE registers as a new program's, for the running
+/// thread's program.
+pub fn reset_fpu() {
+    let state = FpuState::new();
+    // Safety: as in `save_fpu`.
+    unsafe { core::arch::asm!("fxrstor64 [{}]", in(reg) &state, options(nostack)) };
+}
+
 impl FpuState {
     /// As after `fninit`: x87 control word 0x37F and MXCSR 0x1F80, every
     /// exception masked, round to nearest.
@@ -442,8 +599,14 @@ pub struct Registers {
 
 /// Drop to ring 3 with `registers`, never to return: the program's thread
 /// comes back to the kernel only through system calls and interrupts, each
-/// on a fresh stack, and leaves through `exit_current` or `kill_current`.
+/// on a fresh stack, and leaves through `exit_current` or `kill_current`. A
+/// `rip` outside the program's half, which a signal handler's address or
+/// frame can be, ends it with SIGSEGV, as returning there would fault in the
+/// kernel.
 pub fn enter_user(registers: Registers) -> ! {
+    if registers.rip >= USER_END {
+        kill_current(signal::SIGSEGV);
+    }
     let selectors = gdt::selectors();
     // Carry, parity, adjust, zero, sign, trap, direction and overflow.
     const USER_FLAGS: u64 = 0xDD5;
