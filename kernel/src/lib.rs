@@ -32,16 +32,34 @@ use x86_64::VirtAddr;
 // variables at build time. Changing one no longer silently desyncs the other.
 include!(concat!(env!("OUT_DIR"), "/framebuffer.rs"));
 
+/// Where the kernel image is loaded: the top 2 GiB, as is conventional on x86-64.
+/// `fullkernel/build.rs` repeats it for the debugger scripts.
+pub const KERNEL_BASE: u64 = 0xFFFF_FFFF_8000_0000;
+
 // `frame_buffer` is deprecated in favour of configuring the mode when the disk
 // image is created. That is the wrong place for this kernel: the request has to
 // travel with the kernel so that `cargo run`, the released images and the
 // browser build all ask for the same thing, and so the BIOS stage-2 cap
 // generated from the same two variables cannot drift away from it.
+//
+// The kernel lives entirely in the upper half of the address space, so the
+// lower half (PML4 entries 0-255) is left for user programs and every process
+// can share one set of kernel mappings:
+//
+//   0xFFFF_8000_0000_0000  all of physical memory      memory::PHYS_MAP_BASE
+//   (next free entries)    kernel stack, boot info,    placed by the bootloader
+//                          framebuffer, ramdisk
+//   0xFFFF_C000_0000_0000  heap                        allocator::HEAP_START
+//   0xFFFF_FFFF_8000_0000  kernel image                KERNEL_BASE
 #[allow(deprecated)]
 pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
-    config.mappings.physical_memory = Some(Mapping::Dynamic);
-    config.mappings.kernel_base = Mapping::FixedAddress(0x8000000000);
+    config.mappings.physical_memory = Some(Mapping::FixedAddress(memory::PHYS_MAP_BASE));
+    config.mappings.kernel_base = Mapping::FixedAddress(KERNEL_BASE);
+    // Whatever the bootloader places itself goes between the physical map and
+    // the heap, which it doesn't know about.
+    config.mappings.dynamic_range_start = Some(memory::PHYS_MAP_BASE);
+    config.mappings.dynamic_range_end = Some(allocator::HEAP_START as u64 - 1);
     config.frame_buffer.minimum_framebuffer_width = Some(FRAMEBUFFER_WIDTH);
     config.frame_buffer.minimum_framebuffer_height = Some(FRAMEBUFFER_HEIGHT);
     config
@@ -98,6 +116,9 @@ pub fn pre_init(boot_info: &'static mut BootInfo) {
             boot_info.physical_memory_offset.take().expect("No physical memory offset found"),
         );
         let mut mapper = unsafe { memory::init(phys_mem_offset) };
+        // After `init_io`: the bootloader's GDT, which lives down there, is no
+        // longer the one loaded.
+        memory::clear_lower_half(&mut mapper);
         let mut frame_allocator =
             unsafe { BootInfoFrameAllocator::init(&boot_info.memory_regions) };
         allocator::init_heap(&mut mapper, &mut frame_allocator)
