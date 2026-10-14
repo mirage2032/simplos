@@ -3,7 +3,8 @@
 A small x86_64 operating system written in Rust, from the boot sector up. It
 brings up long mode, a GDT and IDT, paging and a heap, a PS/2 keyboard, the
 HPET, and drops into a small command line (type `help`) drawn into a linear
-framebuffer. It boots under both BIOS and UEFI firmware, on real hardware or an
+framebuffer, from which `run` starts an unmodified Linux x86-64 program in user
+mode. It boots under both BIOS and UEFI firmware, on real hardware or an
 emulator — including [in a browser tab](https://lazyscript.com/projects/simplos), where QEMU itself
 is compiled to WebAssembly.
 
@@ -105,7 +106,7 @@ the right firmware and the right framebuffer mode.
 | `kernel/` | the OS. A `no_std` library plus the binary that draws the screen. |
 | `fullkernel/` | host-side: builds the disk images, runs QEMU. |
 | `tools/boot-test/` | cargo's test runner for the kernel's bare-metal tests. |
-| `user/probe/` | a user program: ordinary Rust with `std`, built for Linux (static musl). Both images and every test boot carry it as the bootloader's ramdisk. |
+| `user/probe/` | a user program: ordinary Rust with `std`, built for Linux (static musl). Both images and every test boot carry it as the bootloader's ramdisk, and the shell's `run` runs it. |
 | `vendor/bootloader/` | [rust-osdev/bootloader](https://github.com/rust-osdev/bootloader) 0.11.17, vendored and patched. |
 | `vendor/ps2/` | the `ps2` crate, with its `x86_64` dependency bumped. |
 | `scripts/` | `build-images.sh`, `smoke-test.sh`, `boot-test.sh`. |

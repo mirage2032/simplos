@@ -17,9 +17,11 @@
 //! free.
 
 use crate::io::interrupts::{idt::TIMER_COUNTER, pit::TIMER_HZ};
-use crate::memory::KernelStack;
+use crate::memory::{self, KernelStack};
+use crate::process::{self, Process, UserState};
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 use spin::{Lazy, Mutex, MutexGuard};
@@ -33,6 +35,9 @@ struct Thread {
     _stack: Option<KernelStack>,
     /// What a new thread runs, taken when it starts.
     entry: Option<Box<dyn FnOnce() + Send>>,
+    /// For a thread that runs a user program: what of the CPU's state is the
+    /// program's, swapped in and out on every switch.
+    user: Option<Box<UserState>>,
 }
 
 struct Scheduler {
@@ -55,7 +60,7 @@ struct Scheduler {
 static SCHEDULER: Lazy<Mutex<Scheduler>> = Lazy::new(|| {
     Mutex::new(Scheduler {
         // Whoever first touches the scheduler is the boot thread.
-        current: Box::new(Thread { rsp: 0, _stack: None, entry: None }),
+        current: Box::new(Thread { rsp: 0, _stack: None, entry: None, user: None }),
         ready: VecDeque::new(),
         idle: None,
         idling: false,
@@ -67,19 +72,39 @@ static SCHEDULER: Lazy<Mutex<Scheduler>> = Lazy::new(|| {
 /// Create the idle thread. `pre_init` calls it before turning interrupts on;
 /// without it, a thread that blocks with no one else ready has nowhere to go.
 pub fn init() {
-    let idle = new_thread(Box::new(idle)).expect("memory for the idle thread's stack");
+    let idle = new_thread(Some(Box::new(idle))).expect("memory for the idle thread's stack");
     interrupts::without_interrupts(|| SCHEDULER.lock().idle = Some(idle));
 }
 
 /// Start `entry` on a thread of its own. It first runs when the current
 /// thread yields or blocks. `None` when there's no memory for its stack.
 pub fn spawn(entry: impl FnOnce() + Send + 'static) -> Option<()> {
-    let thread = new_thread(Box::new(entry))?;
+    let thread = new_thread(Some(Box::new(entry)))?;
     interrupts::without_interrupts(|| SCHEDULER.lock().ready.push_back(thread));
     Some(())
 }
 
-fn new_thread(entry: Box<dyn FnOnce() + Send>) -> Option<Box<Thread>> {
+/// Start a thread that drops into a user program, at `user.start`.
+pub fn spawn_user(mut user: Box<UserState>) -> Option<()> {
+    let mut thread = new_thread(None)?;
+    user.kernel_stack_top = thread._stack.as_ref()?.top();
+    thread.user = Some(user);
+    interrupts::without_interrupts(|| SCHEDULER.lock().ready.push_back(thread));
+    Some(())
+}
+
+/// The program the current thread runs, if it runs one.
+pub fn current_process() -> Option<Arc<Process>> {
+    with_current_user(|user| user.process.clone())
+}
+
+/// Run `f` on the current thread's user state, if it has one. With interrupts
+/// off and the scheduler locked, so `f` must be quick.
+pub fn with_current_user<R>(f: impl FnOnce(&mut UserState) -> R) -> Option<R> {
+    interrupts::without_interrupts(|| SCHEDULER.lock().current.user.as_deref_mut().map(f))
+}
+
+fn new_thread(entry: Option<Box<dyn FnOnce() + Send>>) -> Option<Box<Thread>> {
     let stack = KernelStack::new()?;
     // What the first `switch` to this thread pops: the six registers it saves,
     // then `start` as the address to return to, then a dummy return address
@@ -89,7 +114,7 @@ fn new_thread(entry: Box<dyn FnOnce() + Send>) -> Option<Box<Thread>> {
     let frame: [u64; 8] = [0, 0, 0, 0, 0, 0, start as *const () as u64, 0];
     // Safety: the top of a fresh stack, mapped and used by nothing yet.
     unsafe { (rsp as *mut [u64; 8]).write(frame) };
-    Some(Box::new(Thread { rsp, _stack: Some(stack), entry: Some(entry) }))
+    Some(Box::new(Thread { rsp, _stack: Some(stack), entry, user: None }))
 }
 
 /// Let the next ready thread run. Returns when this thread's turn comes round
@@ -202,6 +227,16 @@ fn switch_to(
     park: impl FnOnce(&mut Scheduler, Box<Thread>),
 ) {
     let to = next.rsp;
+    // A program's registers and page table are in the CPU while its thread
+    // runs: put the outgoing one's away and bring the incoming one's out.
+    // Kernel threads run on the kernel's page table.
+    if let Some(user) = scheduler.current.user.as_deref_mut() {
+        user.switch_out();
+    }
+    match next.user.as_deref() {
+        Some(user) => user.switch_in(),
+        None => memory::use_kernel_page_table(),
+    }
     let mut previous = core::mem::replace(&mut scheduler.current, next);
     // Into the Box, whose contents stay put while the Box itself moves.
     let from = &raw mut previous.rsp;
@@ -248,11 +283,18 @@ fn idle() {
 
 /// Where a new thread begins, returned to by its first [`switch`].
 extern "C" fn start() -> ! {
-    let entry = SCHEDULER.lock().current.entry.take().expect("a new thread has an entry");
+    let (entry, user) = {
+        let mut scheduler = SCHEDULER.lock();
+        let current = &mut scheduler.current;
+        (current.entry.take(), current.user.as_ref().map(|user| user.start))
+    };
     interrupts::enable();
     // Whoever switched here may have just exited.
     reap();
-    entry();
+    if let Some((rip, rsp)) = user {
+        process::enter_user(rip, rsp);
+    }
+    entry.expect("a new thread has an entry or a program")();
     exit()
 }
 

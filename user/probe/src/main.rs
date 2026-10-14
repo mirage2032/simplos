@@ -14,10 +14,43 @@ fn main() {
         }
         // The kernel should end this program, and nothing else.
         Some("fault") => unsafe { std::ptr::null_mut::<u8>().write_volatile(1) },
+        // Long enough to be preempted many times; a second copy running
+        // alongside must not disturb its floating-point registers.
+        Some("float") => {
+            let sum: f64 = (0..2_000_000u32).map(|i| f64::from(i).sqrt()).sum();
+            println!("{sum}");
+        }
+        // The kernel must refuse these, not fault or hand over its memory: a
+        // pointer into its half, one into nothing, and a call it hasn't got.
+        Some("bad-calls") => {
+            let kernel = syscall(1, 1, 0xFFFF_8000_0000_0000, 8);
+            let unmapped = syscall(1, 1, 0x1000, 8);
+            let unknown = syscall(999, 0, 0, 0);
+            println!("{kernel} {unmapped} {unknown}");
+        }
         Some("exit") => {}
         Some(other) => {
             eprintln!("probe: unknown mode {other:?}");
             std::process::exit(2);
         }
     }
+}
+
+/// A system call made directly, bypassing libc's checks.
+fn syscall(nr: isize, a0: usize, a1: usize, a2: usize) -> isize {
+    let result;
+    // Safety: the calls made here touch no memory of the program's.
+    unsafe {
+        std::arch::asm!(
+            "syscall",
+            inlateout("rax") nr => result,
+            in("rdi") a0,
+            in("rsi") a1,
+            in("rdx") a2,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack),
+        )
+    };
+    result
 }

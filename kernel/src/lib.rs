@@ -7,9 +7,12 @@
 extern crate alloc;
 
 pub mod allocator;
+pub mod elf;
 pub mod io;
 pub mod memory;
+pub mod process;
 pub mod shell;
+pub mod syscall;
 pub mod thread;
 
 pub use io::console::CONSOLE;
@@ -138,6 +141,7 @@ pub fn pre_init(boot_info: &'static mut BootInfo) {
         // Needs the page table for the idle thread's stack, and must be done
         // before interrupts are on: the first tick may want to switch threads.
         thread::init();
+        process::init();
 
         // Initialize display with framebuffer
         let fb = boot_info.framebuffer.take().expect("No framebuffer found");
