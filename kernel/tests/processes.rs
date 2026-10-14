@@ -64,6 +64,11 @@ fn a_copy_has_memory_of_its_own() {
 }
 
 #[test_case]
+fn a_copy_starts_with_every_register_the_call_keeps() {
+    assert_eq!(run(&["fork-registers"]), ok("child: true\nparent: true exit status: 0\n"));
+}
+
+#[test_case]
 fn a_fault_ends_only_the_copy() {
     assert_eq!(run(&["fork-fault"]), ok("signal: 11\n"));
 }

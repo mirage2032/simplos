@@ -130,6 +130,64 @@ fn main() {
             let (waited, status) = wait(child);
             println!("parent: {on_stack} {} {} {status}", on_heap, waited == child);
         }
+        // Every register a system call keeps set to a value of its own, then
+        // fork: whether each side has them back as they were.
+        Some("fork-registers") => {
+            let mut seen = [0u64; 11];
+            let child: isize;
+            // Safety: rbx and rbp, which can't be named, are put back;
+            // `seen` is what's written.
+            unsafe {
+                std::arch::asm!(
+                    "push rbx",
+                    "push rbp",
+                    "mov rbx, 1",
+                    "mov rbp, 2",
+                    "mov rsi, 3",
+                    "mov rdx, 4",
+                    "mov r8, 5",
+                    "mov r9, 6",
+                    "mov r10, 7",
+                    "mov r12, 8",
+                    "mov r13, 9",
+                    "mov r14, 10",
+                    "mov r15, 11",
+                    "syscall",
+                    "mov [rdi], rbx",
+                    "mov [rdi + 8], rbp",
+                    "mov [rdi + 16], rsi",
+                    "mov [rdi + 24], rdx",
+                    "mov [rdi + 32], r8",
+                    "mov [rdi + 40], r9",
+                    "mov [rdi + 48], r10",
+                    "mov [rdi + 56], r12",
+                    "mov [rdi + 64], r13",
+                    "mov [rdi + 72], r14",
+                    "mov [rdi + 80], r15",
+                    "pop rbp",
+                    "pop rbx",
+                    in("rdi") seen.as_mut_ptr(),
+                    inlateout("rax") 57isize => child,
+                    out("rcx") _,
+                    out("rdx") _,
+                    out("rsi") _,
+                    out("r8") _,
+                    out("r9") _,
+                    out("r10") _,
+                    out("r11") _,
+                    out("r12") _,
+                    out("r13") _,
+                    out("r14") _,
+                    out("r15") _,
+                )
+            };
+            let kept = seen == std::array::from_fn(|i| i as u64 + 1);
+            if child == 0 {
+                println!("child: {kept}");
+                std::process::exit(0);
+            }
+            println!("parent: {kept} {}", wait(child).1);
+        }
         // A copy that faults, which ends it alone.
         Some("fork-fault") => {
             let child = syscall(57, 0, 0, 0);
