@@ -21,6 +21,7 @@ use crate::memory::{AddressSpace, USER_END};
 use crate::signal::{self, Info, Signals};
 use crate::syscall;
 use crate::thread::{self, WaitQueue};
+use crate::time;
 use crate::tty::Tty;
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -87,6 +88,11 @@ pub struct Process {
     /// Its resource limits, soft and hard, by `RLIMIT_*` number. Taken with
     /// interrupts on.
     pub limits: Mutex<[(u64, u64); syscall::LIMITS]>,
+    /// The CPU time it has had, and its children it waited for have.
+    pub times: Times,
+    /// Its alarm, which the alarm thread sends it when due. Taken with
+    /// interrupts on.
+    pub alarm: Mutex<time::Alarm>,
     /// The program it's a copy of; none for one the kernel started.
     parent: Weak<Process>,
     /// The copies it made that it hasn't waited for, ended or not. Taken only
@@ -98,6 +104,39 @@ pub struct Process {
     pub children: Mutex<Vec<Arc<Process>>>,
     /// Woken as each of them ends.
     pub child_exited: WaitQueue,
+}
+
+/// CPU time, in timer ticks: a program's own, running and in the kernel for
+/// it; and that of the children it has waited for, theirs and their own
+/// children's.
+#[derive(Default)]
+pub struct Times {
+    pub user: AtomicU64,
+    pub system: AtomicU64,
+    pub children_user: AtomicU64,
+    pub children_system: AtomicU64,
+}
+
+impl Times {
+    /// Count a child's, as its parent waits for it.
+    pub fn add_child(&self, child: &Times) {
+        let all = |own: &AtomicU64, children: &AtomicU64| {
+            own.load(Ordering::Relaxed) + children.load(Ordering::Relaxed)
+        };
+        self.children_user.fetch_add(all(&child.user, &child.children_user), Ordering::Relaxed);
+        self.children_system
+            .fetch_add(all(&child.system, &child.children_system), Ordering::Relaxed);
+    }
+}
+
+/// From the timer interrupt: the tick that's ending is the running program's,
+/// its own (`user`) or the kernel's for it. Nothing for the kernel's threads.
+pub fn charge_tick(user: bool) {
+    thread::with_current_user(|current| {
+        let times = &current.process.times;
+        let count = if user { &times.user } else { &times.system };
+        count.fetch_add(1, Ordering::Relaxed);
+    });
 }
 
 /// A file descriptor: what it refers to, shared with its copies, and whether
@@ -271,6 +310,8 @@ pub fn spawn_with(
         cwd: Mutex::new(String::new()),
         umask: AtomicU32::new(0o022),
         limits: Mutex::new(syscall::DEFAULT_LIMITS),
+        times: Times::default(),
+        alarm: Mutex::new(time::Alarm::default()),
         parent: Weak::new(),
         children: Mutex::new(Vec::new()),
         child_exited: WaitQueue::new(),
@@ -344,6 +385,8 @@ pub fn fork(parent: &Arc<Process>, registers: Registers) -> Option<u64> {
         cwd: Mutex::new(parent.cwd.lock().clone()),
         umask: AtomicU32::new(parent.umask.load(Ordering::Relaxed)),
         limits: Mutex::new(*parent.limits.lock()),
+        times: Times::default(),
+        alarm: Mutex::new(time::Alarm::default()),
         parent: Arc::downgrade(parent),
         children: Mutex::new(Vec::new()),
         child_exited: WaitQueue::new(),

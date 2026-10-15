@@ -228,6 +228,25 @@ ended by ^C. For now:
 - a program in the background isn't stopped for reading or writing its
   terminal, and one whose parent ended isn't given to an init.
 
+## Time
+
+The time of day comes from the CMOS real-time clock, read once at boot, and
+the HPET carries it on from there (`time.rs`). Programs read it, and the
+time since boot, with `clock_gettime`, `gettimeofday` and `time`, to the
+nanosecond; `clock_nanosleep` sleeps for a while or until a time. Each timer
+tick is counted to the program it interrupts, as its own time or the
+kernel's for it, which `getrusage`, `times` and `wait4` report, its waited-for
+children's too. `setitimer` and `alarm` set a program's alarm, which the
+alarm thread sends as SIGALRM when it's due, and every so often after if
+asked. For now:
+
+- the clock is taken to be UTC, as QEMU keeps it, and can't be set;
+- CPU time is counted to the tick, 10 ms;
+- an alarm can come up to a tick late, though never early, and only the
+  real-time one is there: none that counts CPU time (`ITIMER_VIRTUAL`,
+  `ITIMER_PROF`);
+- writing a file doesn't change its times.
+
 ## The first program
 
 Once it's up, the kernel runs the first of `/sbin/init`, `/etc/init`,
@@ -263,7 +282,8 @@ ext4 disk made by e2fsprogs' `mke2fs`, which `tests/ext4.rs` writes to, and
 `tests/files.rs` has the user program read and write through system calls. It holds
 the user program as `/bin/probe`, which `tests/processes.rs` has it start
 copies of and run again; `tests/tty.rs` types into a terminal for it to read;
-`tests/signals.rs` has it send signals to itself and its copies.
+`tests/signals.rs` has it send signals to itself and its copies;
+`tests/time.rs` has it read the clocks, count CPU time and set alarms.
 After a run that passes, e2fsck must find nothing wrong with it, and it must have been
 unmounted, so the tests need e2fsprogs installed.
 

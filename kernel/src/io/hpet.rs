@@ -143,6 +143,11 @@ pub fn init_hpet(rsdp_addr: u64, phys_mem_offset: VirtAddr) -> Result<(), &'stat
     Ok(())
 }
 
+/// Nanoseconds since the HPET started, if there's one.
+pub fn elapsed_nanos() -> Option<u64> {
+    HPET.get().map(Hpet::elapsed_nanos)
+}
+
 /// Get elapsed milliseconds since HPET initialization
 pub fn elapsed_millis() -> Option<u64> {
     HPET.get().map(Hpet::elapsed_millis)

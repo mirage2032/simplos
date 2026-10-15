@@ -19,6 +19,7 @@ pub mod signal;
 pub mod syscall;
 pub mod terminal;
 pub mod thread;
+pub mod time;
 pub mod tty;
 
 pub use io::console::CONSOLE;
@@ -183,6 +184,7 @@ pub fn pre_init(boot_info: &'static mut BootInfo) {
             // HPET init failed, continue without it
             serial_println!("HPET init failed: {}", e);
         }
+        time::init();
 
         io::disk::init();
 

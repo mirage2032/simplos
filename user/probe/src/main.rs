@@ -9,7 +9,7 @@ use std::os::unix::fs::{FileExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicIsize, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn main() {
     let arg = |n: usize| std::env::args().nth(n).unwrap_or_default();
@@ -783,6 +783,142 @@ fn main() {
                 mask[0]
             );
         }
+        // The time of day, which the disk's files were stamped with just
+        // before boot, by each call that tells it; a sleep, never short; one
+        // until a time, and until one past; how fine the clock is; and a
+        // clock there isn't.
+        Some("clocks") => {
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+            let stamped =
+                or_fail("/hello.txt", fs::metadata("/hello.txt").and_then(|m| m.modified()));
+            let stamped = stamped.duration_since(UNIX_EPOCH).unwrap().as_secs();
+            let mut timeval = [0u64; 2];
+            syscall(96, timeval.as_mut_ptr() as usize, 0, 0);
+            let seconds = syscall(201, 0, 0, 0) as u64;
+            let agree = timeval[0].abs_diff(now) <= 1
+                && timeval[1] < 1_000_000
+                && seconds.abs_diff(now) <= 1;
+            let start = Instant::now();
+            std::thread::sleep(Duration::from_millis(100));
+            let slept = (100..2000).contains(&start.elapsed().as_millis());
+            // Until a time of day, which taken for a while would be decades.
+            let mut realtime = [0u64; 2];
+            syscall(228, 0, realtime.as_mut_ptr() as usize, 0);
+            let at = realtime[0] * 1_000_000_000 + realtime[1] + 100_000_000;
+            let until = [at / 1_000_000_000, at % 1_000_000_000];
+            let start = Instant::now();
+            let absolute = syscall5(230, [0, 1, until.as_ptr() as usize, 0, 0]);
+            let waited = (90..2000).contains(&start.elapsed().as_millis());
+            let start = Instant::now();
+            let past = syscall5(230, [0, 1, [1u64, 0].as_ptr() as usize, 0, 0]);
+            let past = (past, start.elapsed().as_millis() < 500);
+            let mut resolution = [0u64; 2];
+            syscall(229, 1, resolution.as_mut_ptr() as usize, 0);
+            let none = syscall(228, 99, realtime.as_mut_ptr() as usize, 0);
+            println!(
+                "{} {agree} {slept} {absolute} {waited} {past:?} {resolution:?} {none}",
+                now.abs_diff(stamped) < 600
+            );
+        }
+        // CPU time: computing, a program's own; making system calls, the
+        // kernel's for it; a copy's, as wait4 tells it, its parent's
+        // children's once waited for.
+        Some("cpu-time") => {
+            let usage = |who: usize| {
+                let mut usage = [0u64; 18];
+                syscall(98, who, usage.as_mut_ptr() as usize, 0);
+                [usage[0] * 1000 + usage[1] / 1000, usage[2] * 1000 + usage[3] / 1000]
+            };
+            let computing = |ms| {
+                let start = Instant::now();
+                let mut x = 0u64;
+                while start.elapsed() < Duration::from_millis(ms) {
+                    for i in 0..100_000 {
+                        x = std::hint::black_box(x.wrapping_mul(31).wrapping_add(i));
+                    }
+                }
+            };
+            computing(300);
+            let [user, system] = usage(0);
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_millis(300) {
+                (0..100).for_each(|_| _ = syscall(110, 0, 0, 0));
+            }
+            let in_kernel = usage(0)[1] - system;
+            let mut clock = [0u64; 2];
+            syscall(228, 2, clock.as_mut_ptr() as usize, 0);
+            let mut tms = [0u64; 4];
+            let ticks = syscall(100, tms.as_mut_ptr() as usize, 0, 0);
+            let child = syscall(57, 0, 0, 0);
+            if child == 0 {
+                computing(300);
+                std::process::exit(0);
+            }
+            let before = usage(usize::MAX)[0];
+            let mut told = [0u64; 18];
+            syscall5(61, [child as usize, 0, 0, told.as_mut_ptr() as usize, 0]);
+            let after = usage(usize::MAX)[0];
+            println!(
+                "{} {} {} {} {} {} {} {}",
+                user >= 200,
+                in_kernel >= 30,
+                clock[0] * 1000 + clock[1] / 1_000_000 >= 200,
+                tms[0] >= 20,
+                ticks > 0,
+                before == 0,
+                told[0] * 1000 + told[1] / 1000 >= 200,
+                after >= 200
+            );
+        }
+        // Alarms: SIGALRM in 100 ms, which ends a wait for it; one every
+        // 50 ms, three times; what's left of one, as getitimer and alarm say;
+        // a copy starts without one; not handled, it ends the program; and
+        // it ends a read, with EINTR.
+        Some("alarms") => {
+            sigaction(SIGALRM, record, SA_SIGINFO);
+            let start = Instant::now();
+            syscall(38, 0, [0u64, 0, 0, 100_000].as_ptr() as usize, 0);
+            let paused = syscall(34, 0, 0, 0);
+            let after =
+                start.elapsed().as_millis() >= 100 && LAST.load(Ordering::SeqCst) == SIGALRM;
+            CAUGHT.store(0, Ordering::SeqCst);
+            let start = Instant::now();
+            syscall(38, 0, [0u64, 50_000, 0, 50_000].as_ptr() as usize, 0);
+            while CAUGHT.load(Ordering::SeqCst) < 3 {
+                syscall(34, 0, 0, 0);
+            }
+            syscall(38, 0, [0u64; 4].as_ptr() as usize, 0);
+            let repeated = start.elapsed().as_millis() >= 150;
+            let none = syscall(37, 10, 0, 0);
+            let mut left = [0u64; 4];
+            syscall(36, 0, left.as_mut_ptr() as usize, 0);
+            let off = syscall(37, 0, 0, 0);
+            syscall(37, 5, 0, 0);
+            let child = syscall(57, 0, 0, 0);
+            if child == 0 {
+                let mut left = [0u64; 4];
+                syscall(36, 0, left.as_mut_ptr() as usize, 0);
+                std::process::exit(i32::from(left != [0; 4]));
+            }
+            let copy = wait(child).1;
+            syscall(37, 0, 0, 0);
+            let child = syscall(57, 0, 0, 0);
+            if child == 0 {
+                set_action(SIGALRM, SIG_DFL, 0);
+                syscall(38, 0, [0u64, 0, 0, 50_000].as_ptr() as usize, 0);
+                loop {
+                    syscall(34, 0, 0, 0);
+                }
+            }
+            let ended = wait(child).1;
+            let (mut reader, _writer) = or_fail("pipe", io::pipe());
+            syscall(38, 0, [0u64, 0, 0, 50_000].as_ptr() as usize, 0);
+            let read = reader.read(&mut [0]).map_err(|e| e.raw_os_error());
+            println!(
+                "{paused} {after} {repeated} {none} {} {off} {copy} {ended} {read:?}",
+                (9..=10).contains(&left[2])
+            );
+        }
         Some(other) => {
             eprintln!("probe: unknown mode {other:?}");
             std::process::exit(2);
@@ -830,6 +966,7 @@ const SIGKILL: usize = 9;
 const SIGUSR1: usize = 10;
 const SIGUSR2: usize = 12;
 const SIGPIPE: usize = 13;
+const SIGALRM: usize = 14;
 const SIGTERM: usize = 15;
 const SIGCHLD: usize = 17;
 const SIGCONT: usize = 18;

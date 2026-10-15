@@ -1,6 +1,7 @@
 //! System calls on programs: copying one (`fork` and the like), replacing
 //! one with another (`execve`), and waiting for copies to end (`wait4`).
 
+use super::clocks;
 use super::files::{self, AT_FDCWD, Result, lookup, path_at, ret, string_at};
 use super::{EFAULT, EINVAL, ENOMEM};
 use crate::fs;
@@ -123,14 +124,18 @@ pub fn wait4(process: &Process, pid: u64, wstatus: u64, options: u64, rusage: u6
         return -ERESTARTSYS;
     }
     let Some((child, status)) = found else { return if any { 0 } else { -ECHILD } };
+    // Its CPU time is its parent's children's, once it's waited for.
+    if child.ended().is_some() {
+        process.times.add_child(&child.times);
+    }
     ret((|| {
         let mut memory = process.memory.lock();
         if wstatus != 0 {
             memory.space.write(wstatus, &status.to_le_bytes()).ok_or(EFAULT)?;
         }
-        // `struct rusage`: nothing is counted yet.
         if rusage != 0 {
-            memory.space.write(rusage, &[0; 144]).ok_or(EFAULT)?;
+            let (user, system) = clocks::total(&child.times);
+            memory.space.write(rusage, &clocks::rusage(user, system)).ok_or(EFAULT)?;
         }
         Ok(child.id as i64)
     })())

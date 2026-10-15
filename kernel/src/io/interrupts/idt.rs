@@ -169,6 +169,7 @@ unsafe extern "C" fn timer_entry() {
 extern "sysv64" fn timer_interrupt_handler(frame: &TrapFrame) {
     let now = TIMER_COUNTER.fetch_add(1, Ordering::Relaxed) as u64 + 1;
     crate::check_test_deadline(now);
+    crate::process::charge_tick(frame.cs & 3 == 3);
     pic::notify_end_of_interrupt(&InterruptIndex::Timer);
     // After the end-of-interrupt: this thread may not get back here for a
     // while, and the PIC sends no more ticks until the last one is acknowledged.

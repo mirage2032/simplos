@@ -8,6 +8,7 @@
 //! checked against its page tables (`AddressSpace::read` and `write`): a bad
 //! one is EFAULT, never a fault in the kernel.
 
+mod clocks;
 mod files;
 mod processes;
 mod signals;
@@ -248,6 +249,9 @@ fn call(frame: &Frame) -> i64 {
         33 => files::dup3(&process, a0, a1, 0, true),
         34 => signals::pause(&process),
         35 => clock_nanosleep(&process, CLOCK_MONOTONIC, 0, a0, a1),
+        36 => clocks::getitimer(&process, a0, a1),
+        37 => clocks::alarm(&process, a0),
+        38 => clocks::setitimer(&process, a0, a1, a2),
         39 => process.id as i64,
         // The copy starts as the call returns, with 0 its result.
         56 => processes::clone(&process, frame.registers(0), a0, a1),
@@ -278,7 +282,10 @@ fn call(frame: &Frame) -> i64 {
         87 => files::unlinkat(&process, files::AT_FDCWD, a0, 0),
         89 => files::readlinkat(&process, files::AT_FDCWD, a0, a2),
         95 => files::umask(&process, a0),
+        96 => clocks::gettimeofday(&process, a0, a1),
         97 => system::prlimit(&process, 0, a0, 0, a1),
+        98 => clocks::getrusage(&process, a0, a1),
+        100 => clocks::times(&process, a0),
         // getuid, getgid, geteuid and getegid.
         102 | 104 | 107 | 108 => 0,
         105 | 106 => system::set_id(a0),
@@ -299,9 +306,12 @@ fn call(frame: &Frame) -> i64 {
         186 => process.id as i64,
         // set_tid_address: nothing to clear at exit with one thread per program.
         200 => signals::tkill(&process, None, a0, a1),
+        201 => clocks::time(&process, a0),
         204 => system::sched_getaffinity(&process, a0, a1, a2),
         217 => files::getdents64(&process, a0, a1, a2),
         218 => process.id as i64,
+        228 => clocks::clock_gettime(&process, a0, a1),
+        229 => clocks::clock_getres(&process, a0, a1),
         230 => clock_nanosleep(&process, a0, a1, a2, a3),
         234 => signals::tkill(&process, Some(a0), a1, a2),
         257 => files::open(&process, a0, a1, a2, a3),
@@ -504,20 +514,31 @@ fn brk(process: &Process, addr: u64) -> i64 {
 
 const CLOCK_REALTIME: u64 = 0;
 const CLOCK_MONOTONIC: u64 = 1;
+const CLOCK_BOOTTIME: u64 = 7;
 
-/// Sleep for the `struct timespec` at `request`: what `std::thread::sleep`
-/// does, through `clock_nanosleep`, and `nanosleep` too. A signal ends it
-/// early, with what was left of it at `remain`.
+/// Sleep for the `struct timespec` at `request`, or with TIMER_ABSTIME until
+/// `clock` says that time: what `std::thread::sleep` does, through
+/// `clock_nanosleep`, and `nanosleep` too. A signal ends it early, with what
+/// was left of a sleep for a while at `remain`.
 ///
 /// shortcut: one that stops the program and continues it starts the whole
 /// sleep again, where Linux sleeps for what's left.
 fn clock_nanosleep(process: &Process, clock: u64, flags: u64, request: u64, remain: u64) -> i64 {
-    // shortcut: relative sleeps only; TIMER_ABSTIME needs a clock a program
-    // can read, which comes with clock_gettime when one asks for it.
-    if flags != 0 || (clock != CLOCK_REALTIME && clock != CLOCK_MONOTONIC) {
+    const TIMER_ABSTIME: u64 = 1;
+    if flags & !TIMER_ABSTIME != 0
+        || ![CLOCK_REALTIME, CLOCK_MONOTONIC, CLOCK_BOOTTIME].contains(&clock)
+    {
         return -EINVAL;
     }
-    let ms = match timespec_ms(process, request) {
+    let ms = match flags {
+        TIMER_ABSTIME => timespec_ns(process, request).and_then(|until| {
+            Ok(until.saturating_sub(clocks::now(process, clock)?).div_ceil(1_000_000))
+        }),
+        _ => timespec_ms(process, request),
+    };
+    let ms = match ms {
+        // Already past.
+        Ok(0) if flags == TIMER_ABSTIME => return 0,
         Ok(ms) => ms,
         Err(errno) => return -errno,
     };
@@ -525,7 +546,7 @@ fn clock_nanosleep(process: &Process, clock: u64, flags: u64, request: u64, rema
     if thread::poll_until(Some(deadline), || false).is_ok() {
         return 0;
     }
-    if remain != 0 {
+    if remain != 0 && flags != TIMER_ABSTIME {
         let left = deadline.saturating_sub(thread::ticks()) * 1000 / TIMER_HZ as u64;
         let mut timespec = [0u8; 16];
         timespec[..8].copy_from_slice(&(left / 1000).to_le_bytes());
@@ -539,6 +560,11 @@ fn clock_nanosleep(process: &Process, clock: u64, flags: u64, request: u64, rema
 
 /// The `struct timespec` at `addr`, in milliseconds, rounded up.
 fn timespec_ms(process: &Process, addr: u64) -> Result<u64, i64> {
+    Ok(timespec_ns(process, addr)?.div_ceil(1_000_000))
+}
+
+/// The `struct timespec` at `addr`, in nanoseconds.
+fn timespec_ns(process: &Process, addr: u64) -> Result<u64, i64> {
     let mut timespec = [0u8; 16];
     process.memory.lock().space.read(addr, &mut timespec).ok_or(EFAULT)?;
     let seconds = i64::from_le_bytes(timespec[..8].try_into().unwrap());
@@ -546,7 +572,7 @@ fn timespec_ms(process: &Process, addr: u64) -> Result<u64, i64> {
     if seconds < 0 || !(0..1_000_000_000).contains(&nanos) {
         return Err(EINVAL);
     }
-    Ok((seconds as u64).saturating_mul(1000).saturating_add((nanos as u64).div_ceil(1_000_000)))
+    Ok((seconds as u64).saturating_mul(1_000_000_000).saturating_add(nanos as u64))
 }
 
 /// `fs`, where musl keeps its thread-local storage.
