@@ -255,9 +255,33 @@ copies of and run again; `tests/tty.rs` types into a terminal for it to read;
 After a run that passes, e2fsck must find nothing wrong with it, and it must have been
 unmounted, so the tests need e2fsprogs installed.
 
-Each test boots twice, under BIOS and then under UEFI, and passes only if it
-passes both times. The runner tells the guest which firmware it started, and
-`tests/basic_boot.rs` checks that the kernel saw the same one.
+Each test boots twice, under BIOS and UEFI at once, and passes only if it
+passes both times; what each run prints is shown in turn. The runner tells the
+guest which firmware it started, and `tests/basic_boot.rs` checks that the
+kernel saw the same one. `SIMPLOS_FIRMWARE=bios cargo test` (or `uefi`) boots
+just the one.
+
+A test still running after 30 s is taken to hang: it fails there and then,
+named, rather than leaving its kernel to the runner's limit of 180 s. Test
+kernels are built a little optimised and without debug information
+(`[profile.test]` in `kernel/Cargo.toml`): with it each was 15 MB, which the
+BIOS bootloader takes 18 s to read through emulated disk I/O, and unoptimised
+copying made the slowest test take 18 s. To step through a test kernel in a
+debugger, take `debug` and `strip` out of it.
+
+`scripts/mutants.sh` checks that the tests notice what they should. Give it
+patches, as `git diff` prints them, each a change to the kernel that some test
+ought to fail for, and it reports any change that no test fails for:
+
+```sh
+scripts/mutants.sh no-sigpipe.patch rcx-lost.patch
+```
+
+A patch may start with a line naming the test kernels to boot for it, such as
+`Test: signals tty`, so that the others don't. Each change is built in a
+worktree of its own under `target/mutants`, kept between runs so each build
+takes seconds, and booted under BIOS only, many at a time: a change that hangs
+a test leaves its QEMU idle until the 30 s are up.
 
 `scripts/smoke-test.sh` is the coarser check, and the one that catches the most:
 it boots the real images both ways and asserts the kernel's boot banner names

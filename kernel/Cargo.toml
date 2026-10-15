@@ -7,6 +7,21 @@ license = "GPL-2.0-only"
 [profile.dev]
 panic = "abort"
 
+# Test kernels boot under emulation, where the BIOS bootloader reads the whole
+# file through emulated disk I/O: without debug information or symbols, it's
+# half a megabyte where it was 15. Optimised a little, the tests that copy a
+# lot take a third of the time, and a rebuild after a change no longer. To step
+# through one in a debugger, take `debug` and `strip` out.
+[profile.test]
+opt-level = 1
+debug = false
+strip = true
+
+# What the kernel uses, `memcpy` and lwext4 among it, optimised properly: built
+# once, as it seldom changes.
+[profile.test.package."*"]
+opt-level = 2
+
 [profile.release]
 panic = "abort"
 
