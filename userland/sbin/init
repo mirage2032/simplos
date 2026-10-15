@@ -1,0 +1,7 @@
+#!/bin/sh
+# The first program the kernel runs, as on Linux: here, root's shell, logged
+# in as login(1) would have it, in its home. Once it ends, the kernel's own
+# shell takes over.
+export HOME=/root SHELL=/bin/zsh USER=root LOGNAME=root PATH=/sbin:/usr/sbin:/bin:/usr/bin
+cd "$HOME" || exit 1
+exec /bin/zsh -l

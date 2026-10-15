@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 # Builds the programs simplos runs from its disk, as a tree for one, in
 # target/userland/root: busybox, with a link for each of its applets where
-# Linux keeps them (/bin/sh among them), and zsh with its shell functions,
-# and the few files in /etc they read. All static, for x86-64 Linux with
-# musl, compiled by zig cc from the sources pinned below, which have to match
-# their checksums.
+# Linux keeps them (/bin/sh among them), and zsh with its shell functions.
+# All static, for x86-64 Linux with musl, compiled by zig cc from the sources
+# pinned below, which have to match their checksums. Then over them, the
+# files of simplos's own in userland/: /sbin/init, and what's in /etc.
 #
 # Usage: scripts/userland.sh
 #
-# What it built is kept: run again, it does nothing unless this script has
-# changed since. The downloads are kept in target/userland/downloads.
+# What it built is kept: run again, it only copies userland/ again, unless
+# this script has changed since. The downloads are kept in
+# target/userland/downloads.
 #
 # It runs on x86-64 Linux, which can run what zig makes for the target as the
 # builds need to (the C compiler checks, ncurses' and busybox's generators),
@@ -46,8 +47,19 @@ mkdir -p "$downloads"
 exec 9>"$work/lock"
 flock 9
 
+# userland/, over what's built: copied every time, as it's quick, so that
+# changing it needs no new build. git keeps neither /tmp nor modes of
+# directories.
+overlay() {
+    cp -a "$root/userland/." "$out/"
+    mkdir -p "$out/tmp"
+    chmod 700 "$out/root"
+    chmod 1777 "$out/tmp"
+}
+
 stamp=$(sha256sum "${BASH_SOURCE[0]}" | cut -d' ' -f1)
 if [[ -d $out && $(cat "$work/built" 2>/dev/null) == "$stamp" ]]; then
+    overlay
     exit 0
 fi
 echo "userland: building busybox $busybox_version and zsh $zsh_version into $out" >&2
@@ -132,16 +144,16 @@ step ./configure --prefix=/usr --bindir=/bin CC="$cc" \
 step make -j"$jobs"
 install -m 755 Src/zsh "$out/bin/zsh"
 step make DESTDIR="$out" install.fns
+# compinit's record of what the completion functions complete, which it
+# checks against the functions there are and uses if it's right: made here
+# by the same zsh, as simplos writes it a line at a time, for most of a
+# minute, the first time root's zsh starts.
+mkdir -p "$out/root"
+step "$out/bin/zsh" -f -c "fpath=($out/usr/share/zsh/site-functions \
+    $out/usr/share/zsh/$zsh_version/functions)
+    autoload -Uz compinit && compinit -u -d $out/root/.zcompdump"
 
-# Who root is, and the shells there are.
-cd "$out"
-mkdir -p etc root tmp
-chmod 700 root
-chmod 1777 tmp
-echo 'root:x:0:0:root:/root:/bin/zsh' >etc/passwd
-echo 'root:x:0:' >etc/group
-printf '%s\n' /bin/sh /bin/ash /bin/zsh >etc/shells
-
+overlay
 # The sources and objects, half a gigabyte, aren't needed again.
 rm -rf "$build"
 echo "$stamp" >"$work/built"

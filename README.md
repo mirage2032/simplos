@@ -289,28 +289,47 @@ cargo run -- -fw_cfg name=opt/simplos/init,string="/bin/probe colors"
 When there's none, or once it ends, which on Linux would stop everything,
 the kernel's own shell runs instead, and its `run /PATH ARGS` runs a program
 from the disk. With the userland below on the disk, the first program is
-busybox's `/bin/sh`.
+its `/sbin/init`, a script that logs root in to zsh.
 
 ## Userland
 
 `scripts/userland.sh` builds the programs that make a disk a system to use:
 busybox 1.38.0, with a link for each of its applets where Linux keeps them
 (`/bin/sh`, `/bin/ls`, `/usr/bin/awk` and the rest), and zsh 5.9.2 with its
-shell functions, on ncurses 6.6 with the terminals it knows built in; and
-`/etc/passwd`, `/etc/group` and `/etc/shells`, which make zsh root's shell.
+shell functions, on ncurses 6.6 with the terminals it knows built in.
 They're static programs for x86-64 Linux, linked with musl by zig cc 0.17.0,
 from the sources the script pins and checks by their SHA-256, into
 `target/userland/root`. The first build takes a few minutes and needs the
 network; after that it's done, until the script changes. It builds on x86-64
 Linux only.
 
-`cargo run`'s disk gets them as it's made: delete `fullkernel/disk.img` for
-one that has them. Then `zsh` at busybox's prompt runs zsh. For now:
+Over them go the files in `userland/`, copied every time, so changing them
+needs no new build:
+
+- `/sbin/init`, which the kernel runs first: it logs root in to zsh, as
+  `login` would, in `/root`;
+- `/etc/passwd`, `/etc/group` and `/etc/shells`, in which zsh is root's
+  shell;
+- `/etc/zshrc`, for every interactive zsh: completion, with a menu;
+  history, kept in `~/.zsh_history`; Emacs's keys and the console's Home,
+  End and Delete; and a prompt saying who, where and in which directory.
+
+What the completion system knows of its 998 functions it keeps in
+`~/.zcompdump`, which the build makes for root, by running the same zsh:
+written on simplos, a line at a time, it took a minute.
+
+`cargo run`'s disk gets all of it as it's made: delete `fullkernel/disk.img`
+for one that has it. Then zsh is what you type at, and once it ends, the
+kernel's own shell. For now:
 
 - busybox is built without `init`, which the kernel would run first, and
   which wants a console and an `inittab` there aren't; and without `tc`;
 - there's no `/proc`, so `ps`, `top`, `df` and `mount` have nothing to say,
-  nor `/dev/fd`, which zsh's `<(...)` needs.
+  nor `/dev/fd`, which zsh's `<(...)` needs;
+- the disk's files belong to whoever made it, as `mke2fs -d` copies owners,
+  which is why `/etc/zshrc` has `compinit -u`;
+- every write is a transaction of its own, on the disk before the call
+  returns, so a program writing a little at a time is slow.
 
 busybox is GPL-2.0, as simplos is; zsh and ncurses are MIT-style. A disk
 made with them holds their programs, built from the upstream releases the
@@ -441,9 +460,12 @@ few headers in `fs/ext4/src/include` and the few functions in
 registers of a thread that's in it, so it must never touch SSE ones, which
 hold user programs' state. Compiled without it, an optimised kernel has a
 couple of hundred SSE instructions; CI checks it has none. Its `build.rs` also
-turns off debug `printf`, picks lwext4's own errno values, and gives it
-`malloc` and friends from Rust's allocator. Nothing outside `fs/ext4` sees it, so it can be
-replaced by Rust code without touching the rest. Its habits that differ from
+turns off debug `printf`, picks lwext4's own errno values, gives it `malloc`
+and friends from Rust's allocator, and has it keep up to 512 blocks of each
+file system in memory, where upstream's 8 had every lookup in a big directory
+read it from the disk again: zsh's `compinit` checking its 1185 functions, in
+one directory, took 24 s, and now takes 1.6 s. Nothing outside `fs/ext4` sees
+it, so it can be replaced by Rust code without touching the rest. Its habits that differ from
 Linux's are handled there rather than patched: it would mount a file system
 whose journal needs replaying as if it were clean, make the missing
 directories on the way to a new file, say nothing to making a directory that's

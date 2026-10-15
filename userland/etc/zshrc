@@ -1,0 +1,26 @@
+# zsh's settings for everyone's interactive shells, as simplos has them.
+# Your own go in ~/.zshrc, which is read after this. See zshall(1).
+
+# Completion, by the functions in $fpath, chosen from a menu with the arrow
+# keys once there's more than one; what it found is kept in ~/.zcompdump.
+# Whoever's they are (-u): the disk's files are whoever made it's, not
+# root's, which compinit would otherwise ask about every time.
+autoload -Uz compinit && compinit -u
+zstyle ':completion:*' menu select
+
+# What was typed, kept between sessions.
+HISTFILE=~/.zsh_history
+HISTSIZE=1000
+SAVEHIST=1000
+setopt inc_append_history hist_ignore_dups
+
+# Emacs's keys, and the console's Home, End and Delete.
+bindkey -e
+bindkey '^[[1~' beginning-of-line '^[[4~' end-of-line '^[[3~' delete-char
+
+# user@host:directory, and # for root: in bright white and yellow, which
+# read on the console's blue and on black. As codes, as zsh's own %F leaves
+# out what's past the 8 colours the linux terminal says it has.
+PROMPT=$'%{\e[1;97m%}%n@%m%{\e[0m%}:%{\e[1;93m%}%~%{\e[0m%}%# '
+
+alias ll='ls -l' la='ls -A'

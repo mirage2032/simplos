@@ -18,9 +18,10 @@ use alloc::vec;
 use alloc::vec::Vec;
 use bootloader_api::{BootInfo, entry_point};
 use core::panic::PanicInfo;
-use simplos::fs::{self, Handle};
+use simplos::fs::{self, Handle, ROOT};
+use simplos::process::{self, Process};
 use simplos::tty::Tty;
-use simplos::{process, thread};
+use simplos::{init, thread};
 use spin::Mutex;
 
 entry_point!(main, config = &simplos::BOOTLOADER_CONFIG);
@@ -68,9 +69,18 @@ enum Step<'a> {
 }
 use Step::*;
 
-/// Run `argv` on a terminal of its own, 24 rows by 80, as someone would,
-/// with `steps`; then wait for it to end: how it did, and all it wrote.
+/// Run `argv` on a terminal of its own, as someone would, with `steps`;
+/// then wait for it to end: how it did, and all it wrote.
 fn session(argv: &[&str], steps: &[Step]) -> (i32, String) {
+    let start = |tty: &Arc<Tty>| {
+        let files = vec![Some(Arc::new(Handle::tty(tty.clone()))); 3];
+        process::spawn_program(argv[0], argv, &ENVIRONMENT, files).expect("it runs")
+    };
+    terminal(start, steps)
+}
+
+/// `session` for the program `start` starts on a terminal, 24 rows by 80.
+fn terminal(start: impl FnOnce(&Arc<Tty>) -> Arc<Process>, steps: &[Step]) -> (i32, String) {
     let screen = Arc::new(Mutex::new(Vec::new()));
     let sink = screen.clone();
     let tty = Arc::new(Tty::new(
@@ -78,8 +88,7 @@ fn session(argv: &[&str], steps: &[Step]) -> (i32, String) {
         24,
         80,
     ));
-    let files = vec![Some(Arc::new(Handle::tty(tty.clone()))); 3];
-    let program = process::spawn_program(argv[0], argv, &ENVIRONMENT, files).expect("it runs");
+    let program = start(&tty);
     let mut seen = 0;
     // Wait for `done`, or fail saying what for, and what's on the screen.
     let until = |what: &str, done: &mut dyn FnMut() -> bool| {
@@ -268,4 +277,53 @@ fn busybox_sh_is_typed_at() {
         ],
     );
     assert_eq!(status, 0, "{screen}");
+}
+
+#[test_case]
+fn the_first_program_is_root_s_zsh() {
+    // /sbin/init, a script, logs root in to zsh, which reads /etc/zshrc:
+    // its prompt; root's home; a command and a file name completed; one
+    // run again from the history, which is kept in a file; Home and End;
+    // and out, which leaves the kernel's own shell to take over.
+    let mut path = String::new();
+    let start = |tty: &Arc<Tty>| {
+        let (started, first) = init::start(tty, &init::PROGRAMS, &[]).expect("a first program");
+        path = started;
+        first
+    };
+    let (status, screen) = terminal(
+        start,
+        &[
+            Shown("root@simplos"),
+            Shown("# "),
+            Typed("print $HOME $SHELL $USER $PWD\r"),
+            Shown("\r\n/root /bin/zsh root /root\r\n"),
+            Shown("# "),
+            Typed("whoam\t"),
+            Shown("whoami"),
+            Typed("\r"),
+            Shown("\r\nroot\r\n"),
+            Shown("# "),
+            Typed("cat /etc/pass\t"),
+            Shown("passwd"),
+            Typed("\r"),
+            Shown("\r\nroot:x:0:0:root:/root:/bin/zsh\r\n"),
+            Shown("# "),
+            Typed("\x1b[A\r"),
+            Shown("\r\nroot:x:0:0:root:/root:/bin/zsh\r\n"),
+            Shown("# "),
+            Typed("o at the end\x1b[1~ech\x1b[4~ too\r"),
+            Shown("\r\nat the end too\r\n"),
+            Shown("# "),
+            Typed("exit\r"),
+        ],
+    );
+    assert_eq!((path.as_str(), status), ("/sbin/init", 0), "{screen}");
+    let root = ROOT.lock();
+    let fs = root.as_ref().unwrap();
+    let file = fs.open("root/.zsh_history").unwrap();
+    let mut history = vec![0; file.size().unwrap() as usize];
+    file.read_at(0, &mut history).unwrap();
+    let history = String::from_utf8_lossy(&history);
+    assert!(history.contains("cat /etc/passwd\n"), "{history}");
 }
