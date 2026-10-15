@@ -273,8 +273,10 @@ fn make_ext4(image: &Path, userland: Option<&Path>) -> Result<(), Box<dyn Error 
             return Err(format!("couldn't copy {} ({copied})", userland.display()).into());
         }
     }
+    // 4 KiB blocks, which the tests count in: for a disk this small, some
+    // mke2fs.conf say 1 KiB.
     let output = e2fsprogs("mke2fs")
-        .args(["-q", "-F", "-t", "ext4", "-d"])
+        .args(["-q", "-F", "-t", "ext4", "-b", "4096", "-d"])
         .arg(&tree)
         .arg(image)
         .arg(if userland.is_some() { "64M" } else { "16M" })
