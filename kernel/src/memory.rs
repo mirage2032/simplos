@@ -186,13 +186,16 @@ pub struct AddressSpace {
     pml4: PhysFrame,
     /// How many pages the program has mapped, each with a frame.
     pages: u64,
+    /// Where the stack grows to as it's used: a page here is mapped as the
+    /// program reaches it, or the kernel does for it (`grow`).
+    stack: Range<u64>,
 }
 
 impl AddressSpace {
     /// `None` when memory runs out.
     pub fn new() -> Option<AddressSpace> {
         let pml4 = FRAMES.lock().as_mut()?.allocate_frame()?;
-        let space = AddressSpace { pml4, pages: 0 };
+        let space = AddressSpace { pml4, pages: 0, stack: 0..0 };
         let table = table(pml4);
         table.zero();
         let kernel = PAGE_TABLE.lock();
@@ -216,12 +219,31 @@ impl AddressSpace {
     pub fn duplicate(&self) -> Option<AddressSpace> {
         let mut copy = AddressSpace::new()?;
         copy.pages = self.pages;
+        copy.stack = self.stack.clone();
         // Declared after `copy`, so released before a failed copy's `drop`
         // takes it again.
         let mut frames = FRAMES.lock();
         copy_tables(self.pml4, copy.pml4, 4, 256, frames.as_mut()?)?;
         drop(frames);
         Some(copy)
+    }
+
+    /// Let the stack grow down over `stack` as it's used.
+    pub fn grow_stack(&mut self, stack: Range<u64>) {
+        self.stack = stack;
+    }
+
+    /// Map the page at `addr`, zeroed, if it's where the stack grows and
+    /// isn't yet: whether it's mapped now. For a page fault there, and for
+    /// the kernel's own reads and writes of the program's memory, which
+    /// Linux grows the stack for too.
+    pub fn grow(&mut self, addr: u64) -> bool {
+        if !self.stack.contains(&addr) {
+            return false;
+        }
+        let page = Page::containing_address(VirtAddr::new(addr));
+        let flags = PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
+        self.map(Page::range(page, page + 1), flags).is_some()
     }
 
     /// How many pages the program has mapped, each with a frame of its own.
@@ -296,6 +318,19 @@ impl AddressSpace {
             }
         }
         self.pages -= unmapped;
+    }
+
+    /// Zero what's in the mapped pages among `pages`, which stay mapped.
+    pub fn zero(&mut self, pages: PageRange) {
+        let mapper = self.mapper();
+        for page in pages {
+            if let TranslateResult::Mapped { frame, .. } = mapper.translate(page.start_address())
+                && let Some(at) = phys_ptr(frame.start_address())
+            {
+                // Safety: a frame of the program's, mapped, 4 KiB.
+                unsafe { at.write_bytes(0, 4096) };
+            }
+        }
     }
 
     /// Give the mapped pages among `pages` these flags, besides being present
@@ -388,13 +423,15 @@ impl AddressSpace {
         if addr.checked_add(len as u64)? > USER_END {
             return None;
         }
-        let mapper = self.mapper();
         let mut done = 0;
         while done < len {
             let at = addr + done as u64;
-            let TranslateResult::Mapped { frame, offset, flags } =
-                mapper.translate(VirtAddr::new(at))
-            else {
+            let translated = self.mapper().translate(VirtAddr::new(at));
+            let TranslateResult::Mapped { frame, offset, flags } = translated else {
+                // Where the stack hasn't reached yet, it does now.
+                if self.grow(at) {
+                    continue;
+                }
                 return None;
             };
             if !flags.contains(need) {

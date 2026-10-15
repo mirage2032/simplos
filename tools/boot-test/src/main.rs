@@ -160,7 +160,10 @@ fn run(
     // And an ext4 one, made by Linux's own mke2fs and checked afterwards by
     // its e2fsck, for what the kernel's file system code does to it.
     let ext4_scratch = file("ext4.img");
-    make_ext4(&ext4_scratch, userland)?;
+    // A program bigger than the kernel's heap, for tests/processes.rs.
+    let big =
+        kernel.file_name().is_some_and(|name| name.to_string_lossy().starts_with("processes"));
+    make_ext4(&ext4_scratch, userland, big)?;
 
     let mut qemu = Command::new("qemu-system-x86_64");
     if let Firmware::Uefi = firmware {
@@ -251,8 +254,13 @@ const EXT4_TREE: &[(&str, &str)] =
 
 /// A 16 MiB ext4 file system holding `EXT4_TREE`, as Linux makes them, and in
 /// /bin, user/probe for programs to run, and a script whose interpreter isn't
-/// there. With `userland`'s tree too, 128 MiB, and /bin/sh is.
-fn make_ext4(image: &Path, userland: Option<&Path>) -> Result<(), Box<dyn Error + Send + Sync>> {
+/// there. With `userland`'s tree too, 128 MiB, and /bin/sh is; with `big`,
+/// 64 MiB, and /bin/big, from `big_program`.
+fn make_ext4(
+    image: &Path,
+    userland: Option<&Path>,
+    big: bool,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     use std::os::unix::fs::PermissionsExt;
     let tree = image.with_extension("tree");
     let _ = std::fs::remove_dir_all(&tree);
@@ -266,6 +274,11 @@ fn make_ext4(image: &Path, userland: Option<&Path>) -> Result<(), Box<dyn Error 
     let script = tree.join("bin/script");
     std::fs::write(&script, "#!/bin/sh\necho a script\n")?;
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+    if big {
+        let probe = std::fs::read(env!("CARGO_BIN_FILE_PROBE_probe"))?;
+        std::fs::write(tree.join("bin/big"), big_program(&probe))?;
+        std::fs::set_permissions(tree.join("bin/big"), std::fs::Permissions::from_mode(0o755))?;
+    }
     if let Some(userland) = userland {
         // Links and modes as they are.
         let copied = Command::new("cp").arg("-a").arg(userland.join(".")).arg(&tree).status()?;
@@ -279,13 +292,51 @@ fn make_ext4(image: &Path, userland: Option<&Path>) -> Result<(), Box<dyn Error 
         .args(["-q", "-F", "-t", "ext4", "-b", "4096", "-d"])
         .arg(&tree)
         .arg(image)
-        .arg(if userland.is_some() { "128M" } else { "16M" })
+        .arg(match (userland.is_some(), big) {
+            (true, _) => "128M",
+            (false, true) => "64M",
+            (false, false) => "16M",
+        })
         .output()
         .map_err(|error| format!("couldn't run mke2fs ({error}); is e2fsprogs installed?"))?;
     if !output.status.success() {
         return Err(format!("mke2fs failed: {}", String::from_utf8_lossy(&output.stderr)).into());
     }
     Ok(())
+}
+
+/// Where /bin/big's segment of its own is, past where user/probe's are, and
+/// how long: bigger than the kernel's heap, which programs were once read
+/// into whole.
+const BIG_AT: u64 = 0x1000_0000;
+const BIG_LEN: usize = 24 << 20;
+
+/// user/probe, with a segment more: its PT_GNU_STACK header, which simplos
+/// doesn't look at, made a PT_LOAD of `BIG_LEN` bytes, each its offset in it
+/// modulo 251, read-only, at `BIG_AT`, from past the end of the file as it
+/// was. Its mode `peek` tells whether they're there.
+fn big_program(probe: &[u8]) -> Vec<u8> {
+    const PT_GNU_STACK: u32 = 0x6474_e551;
+    let at = |at: usize, len: usize| {
+        u64::from_le_bytes(probe[at..at + 8].try_into().unwrap()) as usize & len
+    };
+    let (phoff, phnum) = (at(32, usize::MAX), at(56, 0xffff));
+    let header = (0..phnum)
+        .map(|i| phoff + i * 56)
+        .find(|&header| at(header, 0xffff_ffff) as u32 == PT_GNU_STACK)
+        .expect("user/probe has a PT_GNU_STACK header");
+    let offset = probe.len().next_multiple_of(4096);
+    let mut big = probe.to_vec();
+    // PT_LOAD, PF_R; then where in the file, where in memory twice, how
+    // long in each, and its alignment.
+    big[header..header + 8].copy_from_slice(&[1, 0, 0, 0, 4, 0, 0, 0]);
+    let fields = [offset as u64, BIG_AT, BIG_AT, BIG_LEN as u64, BIG_LEN as u64, 4096];
+    for (i, field) in fields.into_iter().enumerate() {
+        big[header + 8 + i * 8..header + 16 + i * 8].copy_from_slice(&field.to_le_bytes());
+    }
+    big.resize(offset, 0);
+    big.extend((0..BIG_LEN).map(|i| (i % 251) as u8));
+    big
 }
 
 /// What's wrong with the ext4 disk after a run: anything e2fsck finds,

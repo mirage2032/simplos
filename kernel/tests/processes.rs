@@ -103,6 +103,13 @@ fn execve_replaces_the_program() {
 }
 
 #[test_case]
+fn a_program_bigger_than_the_kernel_s_heap_runs() {
+    // /bin/big, which tools/boot-test makes: user/probe with a segment of
+    // 24 MiB more, each byte where it should be, from the PIE's base on.
+    assert_eq!(run(&["exec", "/bin/big", "peek", "10400000", "1800000"]), ok("ok\n"));
+}
+
+#[test_case]
 fn execve_refuses_what_isnt_a_program() {
     let refused = |path, error| (path, failed(path, error));
     for (path, expected) in [

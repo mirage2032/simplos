@@ -162,6 +162,113 @@ fn main() {
                 "{stuck} {taken} {shrunk} {fixed} {refused:?} {back} {in_place} {reallocated}"
             );
         }
+        // The stack, past what's mapped as a program starts: 4 MiB of calls
+        // deep; written to 4 MiB below where it is, and read into 6 MiB
+        // below, by read(2), past where the calls went; and a copy that
+        // writes 100 MiB below, past where it can grow, which ends it.
+        Some("deep-stack") => {
+            #[inline(never)]
+            fn dive(depth: u64) -> u64 {
+                let mut frame = [0u8; 16 << 10];
+                std::hint::black_box(&mut frame);
+                frame[0] = depth as u8;
+                if depth == 0 { 0 } else { dive(depth - 1) + u64::from(frame[0]) }
+            }
+            let dived = dive(256);
+            let here = &raw const dived as usize;
+            let written = (here - (4 << 20)) & !7;
+            // Safety: where the stack grows to, which it will have to.
+            unsafe { (written as *mut u64).write_volatile(0x5157) };
+            let kept = unsafe { (written as *const u64).read_volatile() } == 0x5157;
+            let (reader, mut writer) = or_fail("pipe", io::pipe());
+            or_fail("pipe", writer.write_all(b"deep"));
+            let into = (here - (6 << 20)) & !7;
+            let read = syscall(0, reader.as_raw_fd() as usize, into, 4);
+            // Safety: what read(2) just wrote.
+            let landed = unsafe { std::slice::from_raw_parts(into as *const u8, 4) } == b"deep";
+            let child = syscall(57, 0, 0, 0);
+            if child == 0 {
+                // Safety: past where the stack can grow, which ends it.
+                unsafe { ((here - (100 << 20)) as *mut u8).write_volatile(1) };
+                std::process::exit(0);
+            }
+            println!("{dived} {kept} {read} {landed} {}", wait(child).1);
+        }
+        // madvise: MADV_DONTNEED zeroing what it's given; advice taken and
+        // nothing done; and what it refuses: an address not a page's,
+        // memory not mapped, and advice there isn't; and nothing, taken.
+        Some("madvise") => {
+            let mmap = |len: usize| syscall5(9, [0, len, 3, 0x22, 0]) as usize;
+            let at = mmap(2 * 4096);
+            // Safety: the two pages just mapped.
+            unsafe { std::ptr::write_bytes(at as *mut u8, 7, 2 * 4096) };
+            let dropped = syscall(28, at, 2 * 4096, 4);
+            // Safety: as above.
+            let bytes = unsafe { std::slice::from_raw_parts(at as *const u8, 2 * 4096) };
+            let zeroed = bytes.iter().all(|&b| b == 0);
+            let gone = mmap(4096);
+            syscall(11, gone, 4096, 0);
+            let refused = [
+                syscall(28, at + 1, 4096, 4),
+                syscall(28, gone, 4096, 4),
+                syscall(28, at, 4096, 999),
+            ];
+            println!(
+                "{dropped} {zeroed} {} {refused:?} {}",
+                syscall(28, at, 4096, 0),
+                syscall(28, at, 0, 4)
+            );
+        }
+        // mmap of the file at PATH, which it makes, three pages and 100
+        // bytes: from its second page, all of what's left, and zeros past
+        // its end; MAP_SHARED, as the program can't write it; a private
+        // copy written, which leaves the file as it was; and what it
+        // refuses: an offset not a page's, a descriptor not open, a pipe,
+        // a file open only to be written, and MAP_SHARED to write one open
+        // only to be read.
+        Some("file-mmap") => {
+            let path = arg(2);
+            let contents: Vec<u8> = (0..3 * 4096 + 100).map(|i: u32| (i % 251) as u8).collect();
+            or_fail(&path, fs::write(&path, &contents));
+            let file = or_fail(&path, fs::File::open(&path));
+            let fd = file.as_raw_fd() as usize;
+            let mmap =
+                |len, prot, flags, fd, offset| syscall6(9, [0, len, prot, flags, fd], offset);
+            // Safety: `len` bytes mapped at `at`.
+            let bytes = |at: isize, len: usize| unsafe {
+                std::slice::from_raw_parts(at as *const u8, len).to_vec()
+            };
+            let rest = mmap(3 * 4096, 1, 2, fd, 4096);
+            let mapped = rest > 0
+                && bytes(rest, 2 * 4096 + 100) == contents[4096..]
+                && bytes(rest + 2 * 4096 + 100, 4096 - 100).iter().all(|&b| b == 0);
+            let shared = mmap(4096, 1, 1, fd, 0);
+            let shared = shared > 0 && bytes(shared, 4096) == contents[..4096];
+            let copy = mmap(4096, 3, 2, fd, 0);
+            // Safety: the page just mapped, to be written.
+            unsafe { (copy as *mut u8).write_volatile(0xff) };
+            let private = bytes(copy, 1) == [0xff] && or_fail(&path, fs::read(&path)) == contents;
+            let (reader, _writer) = or_fail("pipe", io::pipe());
+            let writing = or_fail(&path, OpenOptions::new().write(true).open(&path));
+            let refused = [
+                mmap(4096, 1, 2, fd, 100),
+                mmap(4096, 1, 2, 1000, 0),
+                mmap(4096, 1, 2, reader.as_raw_fd() as usize, 0),
+                mmap(4096, 1, 2, writing.as_raw_fd() as usize, 0),
+                mmap(4096, 3, 1, fd, 0),
+            ];
+            println!("{mapped} {shared} {private} {refused:?}");
+        }
+        // That the LEN bytes at ADDR are i % 251 for each i: what tools/boot-test
+        // puts in /bin/big, a segment bigger than the kernel's heap.
+        Some("peek") => {
+            let number = |n: usize| usize::from_str_radix(arg(n).trim_start_matches("0x"), 16);
+            let (at, len) = (number(2).unwrap_or(0), number(3).unwrap_or(0));
+            // Safety: what the program's own segment maps, as the caller says.
+            let bytes = unsafe { std::slice::from_raw_parts(at as *const u8, len) };
+            let wrong = bytes.iter().enumerate().position(|(i, &b)| b != (i % 251) as u8);
+            println!("{}", wrong.map_or(String::from("ok"), |at| format!("wrong at {at}")));
+        }
         Some("exit") => std::process::exit(arg(2).parse().unwrap_or(0)),
         Some("mkdir") => or_fail(&arg(2), fs::create_dir(arg(2))),
         Some("mkdir-p") => or_fail(&arg(2), fs::create_dir_all(arg(2))),

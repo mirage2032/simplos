@@ -192,8 +192,9 @@ of big blocks. For now:
 - every id is 0, and can't be set to another, as there are no other users;
   what `setgroups` sets is forgotten;
 - limits and niceness are kept and reported, not enforced: a program has the
-  1024 descriptors and 256 KiB of stack there are, whatever it sets, and the
-  same turns at the CPU as any other;
+  1024 descriptors and 64 MiB of stack there are, whatever it sets, its
+  stack mapped a page at a time as it's used, and the same turns at the CPU
+  as any other;
 
 - `fork` copies all of a program's memory at once, rather than sharing it
   until either side writes to it;
@@ -202,7 +203,8 @@ of big blocks. For now:
   parent back;
 - a program that ended keeps its memory until it's waited for, and those
   never waited for go with their parent rather than to an init;
-- `execve` takes ELF programs of up to 4 MiB, which it reads whole;
+- `execve` reads all of a program's segments into memory as it starts it,
+  rather than as they're used;
 - `mremap` grows a mapping where it is only if it's the last `mmap`
   handed out, where Linux grows into any room after it, and moves it
   otherwise; it takes no part that's `PROT_NONE`, and has no

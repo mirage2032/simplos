@@ -298,6 +298,16 @@ fn a_program_has_a_working_directory() {
 }
 
 #[test_case]
+fn mmap_maps_files() {
+    // What Linux says, from the same program: from a page on, with zeros
+    // past the end; MAP_SHARED read-only; a private copy written, which
+    // leaves the file as it was; and EINVAL, EBADF, ENODEV, EACCES and
+    // EACCES.
+    assert_eq!(run(&["file-mmap", "/mapped.bin"]), ok("true true true [-22, -9, -19, -13, -13]\n"));
+    ROOT.lock().as_ref().unwrap().remove_file("mapped.bin").unwrap();
+}
+
+#[test_case]
 fn fchdir_moves_to_the_directory_open() {
     // And not to a file, ENOTDIR, nor a descriptor not open, EBADF.
     assert_eq!(run(&["fchdir", "/dir", "/hello.txt"]), ok("0 /dir (-20, -9)\n"));

@@ -226,7 +226,7 @@ fn call(frame: &Frame) -> i64 {
         5 => files::fstat(&process, a0, a1),
         7 => poll(&process, a0, a1, (a2 as i32 >= 0).then_some(a2 as i32 as u64)),
         8 => files::lseek(&process, a0, a1, a2),
-        9 => mmap(&process, a0, a1, a2, a3),
+        9 => mmap(&process, a0, a1, a2, a3, a4, a5),
         10 => mprotect(&process, a0, a1, a2),
         11 => munmap(&process, a0, a1),
         12 => brk(&process, a0),
@@ -258,6 +258,7 @@ fn call(frame: &Frame) -> i64 {
             thread::yield_now();
             0
         }
+        28 => madvise(&process, a0, a1, a2),
         25 => mremap(&process, a0, a1, a2, a3, a4),
         32 => files::dup(&process, a0),
         33 => files::dup3(&process, a0, a1, 0, true),
@@ -599,14 +600,51 @@ fn user_range(start: u64, len: u64) -> Option<(u64, u64)> {
         .then_some((start, end))
 }
 
-/// Anonymous memory only: no files yet.
-fn mmap(process: &Process, addr: u64, len: u64, prot: u64, flags: u64) -> i64 {
+/// Memory for the program: zeros, anonymous; or from `offset` on in the file
+/// `fd` is open on, as MAP_PRIVATE maps it, a copy of the program's own.
+///
+/// shortcut: a file is read into memory as it's mapped, rather than as it's
+/// used, and nothing written to it after shows through. MAP_SHARED is taken
+/// as MAP_PRIVATE when the mapping can't be written, as nothing could tell,
+/// and refused (ENODEV) when it can be; and no MAP_SHARED anonymous memory.
+fn mmap(
+    process: &Process,
+    addr: u64,
+    len: u64,
+    prot: u64,
+    flags: u64,
+    fd: u64,
+    offset: u64,
+) -> i64 {
+    const MAP_SHARED: u64 = 0x01;
     const MAP_PRIVATE: u64 = 0x02;
     const MAP_FIXED: u64 = 0x10;
     const MAP_ANONYMOUS: u64 = 0x20;
-    if flags & MAP_ANONYMOUS == 0 || flags & MAP_PRIVATE == 0 {
+    const EACCES: i64 = 13;
+    const ENODEV: i64 = 19;
+    let (shared, private) = (flags & MAP_SHARED != 0, flags & 3 == MAP_PRIVATE);
+    if !shared && !private {
         return -EINVAL;
     }
+    // The file, if it's one's: open to be read.
+    let file = match flags & MAP_ANONYMOUS {
+        0 => {
+            if !offset.is_multiple_of(4096) {
+                return -EINVAL;
+            }
+            let Some(handle) = files::open_handle(process, fd as i32) else { return -EBADF };
+            match &*handle {
+                Handle::File { read: false, .. } => return -EACCES,
+                Handle::File { write, .. } if shared && prot & PROT_WRITE != 0 => {
+                    return if *write { -ENODEV } else { -EACCES };
+                }
+                Handle::File { .. } => Some(handle),
+                _ => return -ENODEV,
+            }
+        }
+        _ if shared => return -EINVAL,
+        _ => None,
+    };
     let Some(len) = len.checked_next_multiple_of(4096) else { return -ENOMEM };
     let mut memory = process.memory.lock();
     let start = if flags & MAP_FIXED != 0 {
@@ -625,13 +663,76 @@ fn mmap(process: &Process, addr: u64, len: u64, prot: u64, flags: u64) -> i64 {
     // Nor will what's handed out after: past what MAP_FIXED maps.
     claim(&mut memory, start, end);
     // PROT_NONE: reserved, and left unmapped so any access faults.
-    if prot != 0 && memory.space.map(pages(start, end), page_flags(prot)).is_none() {
+    if prot == 0 {
+        return start as i64;
+    }
+    if memory.space.map(pages(start, end), page_flags(prot)).is_none() {
         // What memory there was goes back: the program, told it got none,
         // has no address to unmap it by.
         memory.space.unmap(pages(start, end));
         return -ENOMEM;
     }
+    // Reading the file takes the tree, which mustn't wait with this held:
+    // /proc takes the two the other way round.
+    drop(memory);
+    if let Some(handle) = file
+        && let Err(errno) = fill(process, &handle, offset, start, len)
+    {
+        process.memory.lock().space.unmap(pages(start, end));
+        return -errno;
+    }
     start as i64
+}
+
+/// Copy `len` bytes of the file `handle` is open on, from `offset` on, into
+/// the program's memory at `start`, already mapped: as many as there are,
+/// zeros past its end.
+fn fill(process: &Process, handle: &Handle, offset: u64, start: u64, len: u64) -> Result<(), i64> {
+    const EIO: i64 = 5;
+    let Handle::File { file, .. } = handle else { return Ok(()) };
+    let mut piece = vec![0; 64 << 10];
+    let mut done = 0;
+    while done < len {
+        let want = (len - done).min(piece.len() as u64) as usize;
+        let read = {
+            let _tree = crate::fs::lock();
+            file.read_at(offset + done, &mut piece[..want]).map_err(|_| EIO)?
+        };
+        if read == 0 {
+            break;
+        }
+        process.memory.lock().space.load(start + done, &piece[..read]).ok_or(EIO)?;
+        done += read as u64;
+    }
+    Ok(())
+}
+
+/// Advice on how the program will use the memory at `addr`: taken, and of
+/// it MADV_DONTNEED and MADV_FREE acted on, which say it needs nothing that
+/// is there, which is zeroed, as Linux does to private anonymous memory.
+///
+/// shortcut: a file's copy is zeroed too, where Linux reads it from the
+/// file again; and memory that's PROT_NONE, which here isn't mapped, is
+/// ENOMEM.
+fn madvise(process: &Process, addr: u64, len: u64, advice: u64) -> i64 {
+    const MADV_DONTNEED: u64 = 4;
+    const MADV_FREE: u64 = 8;
+    // The advice there is, as Linux has it.
+    if !matches!(advice, 0..=4 | 8..=25) {
+        return -EINVAL;
+    }
+    if len == 0 {
+        return if addr.is_multiple_of(4096) { 0 } else { -EINVAL };
+    }
+    let Some((start, end)) = user_range(addr, len) else { return -EINVAL };
+    let mut memory = process.memory.lock();
+    if pages(start, end).any(|page| memory.space.flags(page).is_none()) {
+        return -ENOMEM;
+    }
+    if advice == MADV_DONTNEED || advice == MADV_FREE {
+        memory.space.zero(pages(start, end));
+    }
+    0
 }
 
 /// Hand nothing out from `mmap_next` that `start..end` now maps: so all
