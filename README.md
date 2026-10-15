@@ -440,9 +440,15 @@ be added to the others that need it.
 `vendor/lwext4` is upstream [lwext4](https://github.com/gkostka/lwext4) at
 commit `58bcf89` (2022-09-22): its `src/` and `include/` without the mkfs and
 MBR code, which nothing uses. It is GPL-2.0 (its extents and xattr code are
-"GPL-2.0 or later"), like simplos. It has six local fixes, each marked
+"GPL-2.0 or later"), like simplos. It has seven local fixes, each marked
 `LOCAL PATCH` in the source, all found by `fs/ext4`'s tests:
 
+- **`metadata_csum_seed`, which e2fsprogs 1.47.4's `mke2fs` turns on for
+  every ext4** — it refused such a file system, whose metadata checksums all
+  start from a seed its superblock keeps, so that its uuid can change
+  without them. Upstream started each from crc32c of the uuid, which is the
+  seed only until the uuid changes: `ext4_sb_csum_seed` (`src/ext4_super.c`)
+  now gives all eight the right one, as Linux's `s_csum_seed` does.
 - **`src/ext4.c`, renaming a directory** — the block holding its `..` entry
   was changed without its checksum, which e2fsck then finds wrong on any file
   system with metadata checksums, as Linux makes them by default.

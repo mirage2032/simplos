@@ -96,6 +96,14 @@ static uint32_t ext4_sb_csum(struct ext4_sblock *s)
 #define ext4_sb_csum(...) 0
 #endif
 
+/* LOCAL PATCH: see ext4_super.h. */
+uint32_t ext4_sb_csum_seed(struct ext4_sblock *s)
+{
+	if (ext4_sb_feature_incom(s, EXT4_FINCOM_CSUM_SEED))
+		return ext4_get32(s, checksum_seed);
+	return ext4_crc32c(EXT4_CRC32_INIT, s->uuid, sizeof(s->uuid));
+}
+
 static bool ext4_sb_verify_csum(struct ext4_sblock *s)
 {
 	if (!ext4_sb_feature_ro_com(s, EXT4_FRO_COM_METADATA_CSUM))

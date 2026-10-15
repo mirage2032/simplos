@@ -211,6 +211,16 @@ int ext4_sb_read(struct ext4_blockdev *bdev, struct ext4_sblock *s);
  * @return  true if OK*/
 bool ext4_sb_check(struct ext4_sblock *s);
 
+/* LOCAL PATCH: upstream started each from crc32c of the uuid, which is
+ * wrong once the uuid has changed on a file system with csum_seed. */
+/**@brief   What every metadata checksum but the superblock's starts from:
+ *          the seed the superblock keeps, with csum_seed, which lets the
+ *          uuid change without every checksum changing; else crc32c of the
+ *          uuid, which is what mke2fs keeps there to begin with.
+ * @param   s superblock descriptor
+ * @return  the seed*/
+uint32_t ext4_sb_csum_seed(struct ext4_sblock *s);
+
 /**@brief   Superblock presence in block group.
  * @param   s superblock descriptor
  * @param   block_group block group id

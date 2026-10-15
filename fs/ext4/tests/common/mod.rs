@@ -100,6 +100,17 @@ pub fn make_tree(root: &Path) {
 /// `mke2fs` `options` over the tree at `root`, `size` big, as an image in
 /// memory.
 pub fn image(dir: &Path, root: &Path, options: &[&str], size: &str) -> Image {
+    image_after(dir, root, options, size, |_| {})
+}
+
+/// `image`, with `after` done to the file mke2fs made before it's read.
+pub fn image_after(
+    dir: &Path,
+    root: &Path,
+    options: &[&str],
+    size: &str,
+    after: impl FnOnce(&Path),
+) -> Image {
     let image = dir.join("fs.img");
     let status = e2fsprogs("mke2fs")
         .args(["-q", "-F", "-U", UUID, "-E", &format!("hash_seed={UUID}"), "-d"])
@@ -110,6 +121,7 @@ pub fn image(dir: &Path, root: &Path, options: &[&str], size: &str) -> Image {
         .status()
         .expect("mke2fs, from e2fsprogs, makes the test images");
     assert!(status.success(), "mke2fs {options:?} failed");
+    after(&image);
     Image::new(fs::read(image).unwrap())
 }
 

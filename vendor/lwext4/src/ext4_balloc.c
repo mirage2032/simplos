@@ -91,9 +91,8 @@ static uint32_t ext4_balloc_bitmap_csum(struct ext4_sblock *sb,
 	if (ext4_sb_feature_ro_com(sb, EXT4_FRO_COM_METADATA_CSUM)) {
 		uint32_t blocks_per_group = ext4_get32(sb, blocks_per_group);
 
-		/* First calculate crc32 checksum against fs uuid */
-		checksum = ext4_crc32c(EXT4_CRC32_INIT, sb->uuid,
-				sizeof(sb->uuid));
+		/* LOCAL PATCH: first the seed, not always crc32c of the uuid */
+		checksum = ext4_sb_csum_seed(sb);
 		/* Then calculate crc32 checksum against block_group_desc */
 		checksum = ext4_crc32c(checksum, bitmap, blocks_per_group / 8);
 	}

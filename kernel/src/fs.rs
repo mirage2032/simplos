@@ -63,12 +63,26 @@ pub fn init() {
         .expect("memory for the disk's writer");
     });
     for (index, info) in disk::list().into_iter().enumerate() {
-        if let Ok(fs) = Ext4::mount_writable(Box::new(Disk { index, sectors: info.sectors })) {
-            serial_println!("simplos: ext4 on disk {}", index);
-            *ROOT.lock() = Some(fs);
-            return;
+        match Ext4::mount_writable(Box::new(Disk { index, sectors: info.sectors })) {
+            Ok(fs) => {
+                serial_println!("simplos: ext4 on disk {}", index);
+                *ROOT.lock() = Some(fs);
+                return;
+            }
+            // Said so, or it looks as if there were no ext4 disk at all.
+            Err(error) if is_ext4(index) => {
+                serial_println!("simplos: disk {}: ext4 that won't mount: {:?}", index, error);
+            }
+            Err(_) => {}
         }
     }
+}
+
+/// Whether disk `index` has ext4's (or ext3's, or ext2's) magic number,
+/// 56 bytes into the superblock, which is 1 KiB in.
+fn is_ext4(index: usize) -> bool {
+    let mut sector = [0; disk::SECTOR];
+    disk::read(index, 2, &mut sector).is_ok() && sector[56..58] == 0xef53u16.to_le_bytes()
 }
 
 /// Unmount it, leaving the disk clean: before the machine goes off.

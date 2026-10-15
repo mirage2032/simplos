@@ -6,6 +6,7 @@ mod common;
 use common::*;
 use ext4::{Changes, Error, Ext4, Kind, Usage};
 use std::os::unix::fs::MetadataExt;
+use std::path::Path;
 
 /// Unlike `big`'s, and a few bytes into its last block.
 fn bigger() -> Vec<u8> {
@@ -14,11 +15,16 @@ fn bigger() -> Vec<u8> {
 
 /// Make an image with `options` and change it in every way there is.
 fn writes_the_tree(test: &str, options: &[&str]) {
+    writes_the_tree_after(test, options, |_| {});
+}
+
+/// `writes_the_tree`, with `after` done to the image before it's mounted.
+fn writes_the_tree_after(test: &str, options: &[&str], after: impl FnOnce(&Path)) {
     let _serial = serial();
     let dir = workspace(test);
     let root = dir.join("tree");
     make_tree(&root);
-    let image = image(&dir, &root, options, "64M");
+    let image = image_after(&dir, &root, options, "64M", after);
     let fs = Ext4::mount_writable(Box::new(image.clone())).expect("mounts");
 
     fs.create_dir("new").unwrap();
@@ -83,6 +89,22 @@ fn writes_the_tree(test: &str, options: &[&str]) {
 #[test]
 fn writes_ext4_as_mkfs_makes_it_by_default() {
     writes_the_tree("default", &["-t", "ext4"]);
+}
+
+#[test]
+fn writes_ext4_whose_uuid_changed_after_mkfs() {
+    // With metadata_csum_seed, every checksum starts from a seed the
+    // superblock keeps, which a new uuid leaves as it was: no longer crc32c
+    // of the uuid, which they start from without it. Asked for, as not
+    // every mke2fs turns it on.
+    writes_the_tree_after("csum_seed", &["-t", "ext4", "-O", "metadata_csum_seed"], |image| {
+        let output = e2fsprogs("tune2fs")
+            .args(["-U", "0e4e4e4e-1111-4000-8000-00000000e4e4"])
+            .arg(image)
+            .output()
+            .expect("tune2fs, from e2fsprogs");
+        assert!(output.status.success(), "tune2fs -U failed");
+    });
 }
 
 #[test]
@@ -644,8 +666,9 @@ fn tells_how_much_is_used() {
     assert_eq!(
         before,
         Usage {
-            block_size: 4096,
-            blocks: 16384,
+            // 4096 or 1024, as mke2fs.conf has it for a disk this small.
+            block_size: count("Block size:") as u32,
+            blocks: count("Block count:"),
             free_blocks: count("Free blocks:"),
             inodes: count("Inode count:") as u32,
             free_inodes: count("Free inodes:") as u32,

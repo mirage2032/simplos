@@ -226,8 +226,8 @@ static uint32_t ext4_dir_dx_checksum(struct ext4_inode_ref *inode_ref, void *de,
 		sz = count_offset + (count * sizeof(struct ext4_dir_idx_tail));
 		orig_cum = t->checksum;
 		t->checksum = 0;
-		/* First calculate crc32 checksum against fs uuid */
-		csum = ext4_crc32c(EXT4_CRC32_INIT, sb->uuid, sizeof(sb->uuid));
+		/* LOCAL PATCH: first the seed, not always crc32c of the uuid */
+		csum = ext4_sb_csum_seed(sb);
 		/* Then calculate crc32 checksum against inode number
 		 * and inode generation */
 		csum = ext4_crc32c(csum, &ino_index, sizeof(ino_index));
