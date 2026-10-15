@@ -203,7 +203,13 @@ ends, its foreground is sent SIGHUP. In the shell, `run sleep 100000` is
 ended by ^C. For now:
 
 - a fault ends its program with its signal even if it has a handler for it;
+- a signal whose default dumps core just ends the program, as there's
+  nowhere to dump it;
 - real-time signals aren't queued: one of each is kept at a time;
+- a sleep that a stop, or a signal with no handler, interrupts starts its
+  whole time again, where Linux's sleeps for what's left;
+- a session's leader giving its terminal up (`TIOCNOTTY`) doesn't hang up
+  the terminal's foreground;
 - ^Z, SIGTTIN and SIGTTOU stop no one in a group no one outside it could
   continue, as POSIX says, which a program the kernel starts is in; a job a
   shell starts can be stopped;
