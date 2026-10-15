@@ -118,6 +118,15 @@ fn ppoll_lets_signals_through_only_while_it_waits() {
 }
 
 #[test_case]
+fn select_and_pselect6_wait_as_poll_does() {
+    // What Linux says, from the same program: an empty pipe, not ready at
+    // once nor in 50 ms, and its sets cleared; a byte in it, read and
+    // write ready, and nothing exceptional; EBADF and EINVAL; and pselect6
+    // ended by SIGALRM, which only its mask lets through, then put back.
+    assert_eq!(run(&["select"]), ok("(0, [0, 0, 0]) 0 true (2, true) (-9, -22) -4 1 true\n"));
+}
+
+#[test_case]
 fn a_signal_whose_stack_is_past_the_end_of_memory_ends_the_program() {
     // Its handler's alternate stack ends past the last address there is:
     // no frame fits, so SIGSEGV, as on Linux, and not the kernel stopped

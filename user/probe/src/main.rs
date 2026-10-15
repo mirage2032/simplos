@@ -187,6 +187,61 @@ fn main() {
             let contents = or_fail(&arg(3), fs::read(arg(3)));
             or_fail(&arg(3), io::stdout().write_all(&contents));
         }
+        // fchdir: to DIR, open, which getcwd then says; and not to FILE,
+        // nor to a descriptor that isn't open.
+        Some("fchdir") => {
+            let dir = or_fail(&arg(2), fs::File::open(arg(2)));
+            let moved = syscall(81, dir.as_raw_fd() as usize, 0, 0);
+            let here = or_fail(&arg(2), std::env::current_dir());
+            let file = or_fail(&arg(3), fs::File::open(arg(3)));
+            let refused = (syscall(81, file.as_raw_fd() as usize, 0, 0), syscall(81, 1000, 0, 0));
+            println!("{moved} {} {refused:?}", here.display());
+        }
+        // select and pselect6: an empty pipe, not ready, at once and after a
+        // while; one with a byte in it, ready to be read, its writing end
+        // to be written, and nothing exceptional; a descriptor that isn't
+        // open, and a time that isn't one; then pselect6 as busybox's
+        // shells use ppoll, every signal blocked but while it waits, which
+        // SIGALRM ends, the mask from before back.
+        Some("select") => {
+            let (reader, mut writer) = or_fail("pipe", io::pipe());
+            let (read, write) = (reader.as_raw_fd() as usize, writer.as_raw_fd() as usize);
+            // fd_sets of the first 64 descriptors, all one word needs.
+            let select = |sets: &mut [u64; 3], timeout: Option<[i64; 2]>| {
+                let at = |set: &mut u64| set as *mut u64 as usize;
+                let time = timeout.as_ref().map_or(0, |time| time.as_ptr() as usize);
+                let [r, w, e] = sets;
+                syscall5(23, [64, at(r), at(w), at(e), time])
+            };
+            let mut sets = [1 << read, 0, 1 << read];
+            let now = (select(&mut sets, Some([0, 0])), sets);
+            let start = Instant::now();
+            let mut sets = [1 << read, 0, 0];
+            let later = select(&mut sets, Some([0, 50_000]));
+            let waited = start.elapsed() >= Duration::from_millis(50);
+            or_fail("pipe", writer.write_all(b"x"));
+            let mut sets = [1 << read, 1 << write, 1 << read | 1 << write];
+            let ready = (select(&mut sets, None), sets == [1 << read, 1 << write, 0]);
+            let refused = (
+                select(&mut [1 << 60, 0, 0], Some([0, 0])),
+                select(&mut [1 << read, 0, 0], Some([0, -1])),
+            );
+            or_fail("pipe", (&reader).read_exact(&mut [0]));
+            sigaction(SIGALRM, record, SA_SIGINFO);
+            sigprocmask(SIG_BLOCK, !0);
+            let all = sigprocmask(SIG_BLOCK, 0);
+            let none = 0u64;
+            let mask = [&raw const none as usize, 8];
+            syscall(38, 0, [0u64, 0, 0, 50_000].as_ptr() as usize, 0);
+            let mut set = 1u64 << read;
+            let args = [64, &raw mut set as usize, 0, 0, 0];
+            let pselected = syscall6(270, args, mask.as_ptr() as usize);
+            let restored = sigprocmask(SIG_BLOCK, 0) == all && MASK.load(Ordering::SeqCst) == all;
+            println!(
+                "{now:?} {later} {waited} {ready:?} {refused:?} {pselected} {} {restored}",
+                CAUGHT.load(Ordering::SeqCst)
+            );
+        }
         // A pipe within the program: through it and out, then into one no
         // one reads any more.
         Some("pipe") => {
@@ -1682,7 +1737,12 @@ fn syscall(nr: isize, a0: usize, a1: usize, a2: usize) -> isize {
 
 /// The same, with up to five arguments, and a sixth of 0: mmap's offset,
 /// which Linux refuses if it isn't a page's.
-fn syscall5(nr: isize, [a0, a1, a2, a3, a4]: [usize; 5]) -> isize {
+fn syscall5(nr: isize, args: [usize; 5]) -> isize {
+    syscall6(nr, args, 0)
+}
+
+/// The same, with a sixth argument.
+fn syscall6(nr: isize, [a0, a1, a2, a3, a4]: [usize; 5], a5: usize) -> isize {
     let result;
     // Safety: whatever a call is pointed at outlives it, and the compiler
     // takes the asm to read and write memory, as without `nomem` it does.
@@ -1695,7 +1755,7 @@ fn syscall5(nr: isize, [a0, a1, a2, a3, a4]: [usize; 5]) -> isize {
             in("rdx") a2,
             in("r10") a3,
             in("r8") a4,
-            in("r9") 0,
+            in("r9") a5,
             out("rcx") _,
             out("r11") _,
             options(nostack),

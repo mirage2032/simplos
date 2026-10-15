@@ -305,6 +305,33 @@ fn busybox_sh_s_read_ends_for_a_signal() {
 }
 
 #[test_case]
+fn vim_edits_a_file() {
+    // Typed into, a line read in from a shell it runs, and written, which
+    // stays written once it's quit.
+    let (status, screen) = session(
+        &["/usr/bin/vim", "/tmp/vim.txt"],
+        &[
+            Shown("\"/tmp/vim.txt\" [New]"),
+            Typed("ihello from vim"),
+            Shown("hello from vim"),
+            Typed("\x1b"),
+            Typed(":r !echo from a shell\r"),
+            Shown("from a shell"),
+            Typed(":wq\r"),
+        ],
+    );
+    assert_eq!(status, 0, "{screen}");
+    let root = ROOT.lock();
+    let fs = root.as_ref().unwrap();
+    let file = fs.open("tmp/vim.txt").unwrap();
+    let mut written = vec![0; file.size().unwrap() as usize];
+    file.read_at(0, &mut written).unwrap();
+    assert_eq!(String::from_utf8_lossy(&written), "hello from vim\nfrom a shell\n");
+    drop(file);
+    fs.remove_file("tmp/vim.txt").unwrap();
+}
+
+#[test_case]
 fn the_first_program_is_root_s_zsh() {
     // /sbin/init, a script, logs root in to zsh, which reads /etc/zshrc:
     // its prompt; root's home; a command and a file name completed; one
@@ -368,8 +395,8 @@ fn the_system_shows_itself_in_proc() {
                   readlink /proc/self | grep -c '^[0-9][0-9]*$'";
     assert_eq!(
         run(&["/bin/sh", "-c", script]),
-        ok("Mem: 1 1\nMem: 1 1\nCPU:\nLoad\nS    sh\nS    sleep\nR    ps\n/dev/root 65536 1 /\n\
-            ext2/ext3 16384\n/dev/root on / type ext4 (rw,relatime)\n\
+        ok("Mem: 1 1\nMem: 1 1\nCPU:\nLoad\nS    sh\nS    sleep\nR    ps\n/dev/root 131072 1 /\n\
+            ext2/ext3 32768\n/dev/root on / type ext4 (rw,relatime)\n\
             devtmpfs on /dev type devtmpfs (rw)\nproc on /proc type proc (rw)\n\
             cat /proc/self/cmdline \n1\n")
     );

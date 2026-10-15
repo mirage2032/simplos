@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Builds the programs simplos runs from its disk, as a tree for one, in
 # target/userland/root: busybox, with a link for each of its applets where
-# Linux keeps them (/bin/sh among them), and zsh with its shell functions.
+# Linux keeps them (/bin/sh among them), zsh with its shell functions, and
+# vim with its runtime files.
 # All static, for x86-64 Linux with musl, compiled by zig cc from the sources
 # pinned below, which have to match their checksums. Then over them, the
 # files of simplos's own in userland/: /sbin/init, and what's in /etc.
@@ -16,8 +17,9 @@
 # builds need to (the C compiler checks, ncurses' and busybox's generators),
 # with the host's make, cc, strip, curl and sha256sum, as CI has them.
 #
-# busybox is GPL-2.0, zsh and ncurses MIT-style: their sources are these,
-# unchanged, configured as below.
+# busybox is GPL-2.0, zsh and ncurses MIT-style, vim under the Vim license,
+# which is GPL-compatible: their sources are these, unchanged, configured as
+# below.
 set -euo pipefail
 
 zig_version=0.17.0
@@ -30,6 +32,9 @@ ncurses_sha256=355b4cbbed880b0381a04c46617b7656e362585d52e9cf84a67e2009b749ff11
 # Verified against the zsh release key's signature when pinned.
 zsh_version=5.9.2
 zsh_sha256=36fa734374b44783582cec09bcd67822e2f992c779ec1624ab5596df078d2f81
+# The tag's source, as GitHub makes it an archive.
+vim_version=9.2.1202
+vim_sha256=9e97414b85bdcb2d28d5264c65dd730d86b9a75319b005c63da0bc130c715a2f
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 work=$root/target/userland
@@ -62,7 +67,8 @@ if [[ -d $out && $(cat "$work/built" 2>/dev/null) == "$stamp" ]]; then
     overlay
     exit 0
 fi
-echo "userland: building busybox $busybox_version and zsh $zsh_version into $out" >&2
+echo "userland: building busybox $busybox_version, zsh $zsh_version and vim $vim_version" \
+    "into $out" >&2
 
 # Download $1 as $2 unless it's there, and check it's what was pinned, $3.
 fetch() {
@@ -86,6 +92,8 @@ fetch "https://busybox.net/downloads/busybox-$busybox_version.tar.bz2" \
 fetch "https://invisible-island.net/archives/ncurses/ncurses-$ncurses_version.tar.gz" \
     "ncurses-$ncurses_version.tar.gz" "$ncurses_sha256"
 fetch "https://www.zsh.org/pub/zsh-$zsh_version.tar.xz" "zsh-$zsh_version.tar.xz" "$zsh_sha256"
+fetch "https://github.com/vim/vim/archive/refs/tags/v$vim_version.tar.gz" \
+    "vim-$vim_version.tar.gz" "$vim_sha256"
 
 # Every build afresh, from the sources as they came.
 rm -rf "$build" "$out" "$work/built"
@@ -123,7 +131,7 @@ grep -q '^CONFIG_STATIC=y$' .config && ! grep -qE '^CONFIG_(TC|INIT|LINUXRC)=y$'
 step make -j"$jobs" CC="$cc" HOSTCC=cc busybox
 step make CC="$cc" HOSTCC=cc CONFIG_PREFIX="$out" install
 
-echo "userland: ncurses, for zsh" >&2
+echo "userland: ncurses, for zsh and vim" >&2
 ncurses=$build/ncurses
 cd "$build/ncurses-$ncurses_version"
 # No terminfo files to read: the terminals it knows are built in.
@@ -152,6 +160,22 @@ mkdir -p "$out/root"
 step "$out/bin/zsh" -f -c "fpath=($out/usr/share/zsh/site-functions \
     $out/usr/share/zsh/$zsh_version/functions)
     autoload -Uz compinit && compinit -u -d $out/root/.zcompdump"
+
+echo "userland: vim" >&2
+cd "$build/vim-$vim_version"
+# Without timer_create, whose SIGEV_THREAD needs threads, which simplos
+# hasn't got: vim times regexps and 'redrawtime' out with setitimer then.
+# And without pkg-config, which would offer the host's libraries.
+step ./configure --prefix=/usr CC="$cc" PKG_CONFIG=false \
+    CPPFLAGS="-I$ncurses/include -I$ncurses/include/ncursesw" \
+    LDFLAGS="-static -s -L$ncurses/lib" \
+    --with-features=normal --with-tlib=ncursesw --enable-multibyte \
+    --enable-gui=no --without-x --enable-gpm=no --disable-sysmouse --disable-nls \
+    --disable-netbeans --disable-channel --disable-libsodium --disable-canberra \
+    --disable-selinux --disable-smack --disable-acl --disable-xattr --without-wayland \
+    --with-compiledby=simplos vim_cv_timer_create=no vim_cv_timer_create_with_lrt=no
+step make -j"$jobs"
+step make DESTDIR="$out" install
 
 overlay
 # The sources and objects, half a gigabyte, aren't needed again.

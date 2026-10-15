@@ -830,6 +830,17 @@ pub fn chdir(process: &Process, path: u64) -> i64 {
     })())
 }
 
+/// Make the directory `fd` is open on the working directory.
+pub fn fchdir(process: &Process, fd: u64) -> i64 {
+    ret(handle(process, fd).and_then(|handle| match &*handle {
+        Handle::Dir { path, .. } => {
+            *process.cwd.lock() = path.clone();
+            Ok(0)
+        }
+        _ => Err(ENOTDIR),
+    }))
+}
+
 /// The working directory, NUL-terminated: its length with the NUL.
 pub fn getcwd(process: &Process, buf: u64, size: u64) -> i64 {
     ret((|| {

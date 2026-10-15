@@ -212,7 +212,7 @@ extern "sysv64" fn dispatch(frame: &Frame) -> i64 {
 
 fn call(frame: &Frame) -> i64 {
     let process = thread::current_process().expect("system calls come from programs");
-    let [a0, a1, a2, a3, a4] = [frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8];
+    let [a0, a1, a2, a3, a4, a5] = [frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9];
     match frame.nr {
         0 => files::read(&process, a0, a1, a2),
         1 => files::write(&process, a0, a1, a2),
@@ -247,6 +247,13 @@ fn call(frame: &Frame) -> i64 {
         18 => files::pwrite(&process, a0, a1, a2, a3),
         21 => files::faccessat(&process, files::AT_FDCWD, a0, a1, 0),
         22 => files::pipe2(&process, a0, 0),
+        23 => match a4 {
+            0 => select(&process, a0, [a1, a2, a3], None),
+            timeout => match timeval_ms(&process, timeout) {
+                Ok(ms) => select(&process, a0, [a1, a2, a3], Some(ms)),
+                Err(errno) => -errno,
+            },
+        },
         24 => {
             thread::yield_now();
             0
@@ -284,6 +291,7 @@ fn call(frame: &Frame) -> i64 {
         72 => files::fcntl(&process, a0, a1, a2),
         79 => files::getcwd(&process, a0, a1),
         80 => files::chdir(&process, a0),
+        81 => files::fchdir(&process, a0),
         82 => files::renameat2(&process, files::AT_FDCWD, a0, files::AT_FDCWD, a1, 0),
         83 => files::mkdirat(&process, files::AT_FDCWD, a0, a1),
         84 => files::unlinkat(&process, files::AT_FDCWD, a0, files::AT_REMOVEDIR),
@@ -350,6 +358,7 @@ fn call(frame: &Frame) -> i64 {
         267 => files::readlinkat(&process, a0, a1, a2, a3),
         268 => files::fchmodat(&process, a0, a1, a2),
         269 => files::faccessat(&process, a0, a1, a2, 0),
+        270 => pselect6(&process, a0, [a1, a2, a3], a4, a5),
         271 => ppoll(&process, a0, a1, a2, a3, a4),
         280 => files::utimensat(&process, a0, a1, a2, a3),
         292 => files::dup3(&process, a0, a1, a2, false),
@@ -366,15 +375,49 @@ fn call(frame: &Frame) -> i64 {
     }
 }
 
+const POLLIN: i16 = 0x1;
+const POLLPRI: i16 = 0x2;
+const POLLOUT: i16 = 0x4;
+const POLLERR: i16 = 0x8;
+const POLLHUP: i16 = 0x10;
+const POLLNVAL: i16 = 0x20;
+
+/// What `handle` is ready for now, as `poll` tells it: to be read, written,
+/// or that its other end has gone.
+fn readiness(handle: &Handle) -> i16 {
+    match handle {
+        Handle::Tty { tty, .. } => POLLOUT | if tty.readable() { POLLIN } else { 0 },
+        Handle::Pipe { end, .. } => {
+            let pipe = end.poll();
+            match (end.write, pipe.closed) {
+                (false, closed) => {
+                    (if pipe.now { POLLIN } else { 0 }) | if closed { POLLHUP } else { 0 }
+                }
+                (true, true) => POLLERR,
+                (true, false) => {
+                    if pipe.now {
+                        POLLOUT
+                    } else {
+                        0
+                    }
+                }
+            }
+        }
+        // Files never make a program wait.
+        _ => POLLIN | POLLOUT,
+    }
+}
+
+/// The tick to wait until for `timeout` milliseconds, if there is one: 0,
+/// for 0, which only looks.
+fn deadline(timeout: Option<u64>) -> Option<u64> {
+    timeout.map(|ms| if ms == 0 { 0 } else { thread::ticks_after(ms) })
+}
+
 /// Wait until one of the descriptors in the `struct pollfd`s at `fds` is
 /// ready as asked, or for `timeout` milliseconds if it isn't `None`: how
 /// many are, each told how in its `revents`.
 fn poll(process: &Process, fds: u64, count: u64, timeout: Option<u64>) -> i64 {
-    const POLLIN: i16 = 0x1;
-    const POLLOUT: i16 = 0x4;
-    const POLLERR: i16 = 0x8;
-    const POLLHUP: i16 = 0x10;
-    const POLLNVAL: i16 = 0x20;
     if count > 1024 {
         return -EINVAL;
     }
@@ -398,36 +441,13 @@ fn poll(process: &Process, fds: u64, count: u64, timeout: Option<u64>) -> i64 {
             let ready = match handle {
                 None => 0,
                 Some(None) => POLLNVAL,
-                Some(Some(handle)) => match &**handle {
-                    Handle::Tty { tty, .. } => POLLOUT | if tty.readable() { POLLIN } else { 0 },
-                    Handle::Pipe { end, .. } => {
-                        let pipe = end.poll();
-                        match (end.write, pipe.closed) {
-                            (false, closed) => {
-                                (if pipe.now { POLLIN } else { 0 })
-                                    | if closed { POLLHUP } else { 0 }
-                            }
-                            (true, true) => POLLERR,
-                            (true, false) => {
-                                if pipe.now {
-                                    POLLOUT
-                                } else {
-                                    0
-                                }
-                            }
-                        }
-                    }
-                    // Files never make a program wait.
-                    _ => POLLIN | POLLOUT,
-                },
+                Some(Some(handle)) => readiness(handle),
             };
             *revents = ready & (events | POLLERR | POLLHUP | POLLNVAL);
         }
         revents.iter().any(|&revents| revents != 0)
     };
-    // A timeout of 0 only looks.
-    let deadline = timeout.map(|ms| if ms == 0 { 0 } else { thread::ticks_after(ms) });
-    if thread::poll_until(deadline, || check(&mut revents)).is_err() {
+    if thread::poll_until(deadline(timeout), || check(&mut revents)).is_err() {
         return -ERESTARTNOHAND;
     }
     let mut ready = 0;
@@ -454,8 +474,15 @@ fn ppoll(process: &Process, fds: u64, count: u64, timeout: u64, mask: u64, size:
             Err(errno) => return -errno,
         },
     };
+    masked(process, mask, size, || poll(process, fds, count, ms))
+}
+
+/// Run `wait`, a call that waits, with the signals in the set at `mask`
+/// blocked instead, if it's given, `size` bytes long, as `ppoll` and
+/// `pselect6` wait.
+fn masked(process: &Process, mask: u64, size: u64, wait: impl FnOnce() -> i64) -> i64 {
     if mask == 0 {
-        return poll(process, fds, count, ms);
+        return wait();
     }
     if size != 8 {
         return -EINVAL;
@@ -465,13 +492,85 @@ fn ppoll(process: &Process, fds: u64, count: u64, timeout: u64, mask: u64, size:
         return -EFAULT;
     }
     process.signals.suspend_with(u64::from_le_bytes(set));
-    let ready = poll(process, fds, count, ms);
+    let ready = wait();
     // Ended by a signal, `deliver` puts the mask back: after the handler,
     // which its frame tells, or before starting the call again.
     if ready != -ERESTARTNOHAND {
         process.signals.end_suspend();
     }
     ready
+}
+
+/// Wait until any of the first `count` descriptors the `fd_set`s at `sets`
+/// name, those that aren't 0, is ready: to be read, for the first; to be
+/// written, for the second; or with something exceptional, for the third,
+/// which none ever is here. Or for `timeout` milliseconds, if it isn't
+/// `None`. How many are, each set left with just those.
+fn select(process: &Process, count: u64, sets: [u64; 3], timeout: Option<u64>) -> i64 {
+    // What each set takes to be ready, as Linux's does.
+    const READY: [i16; 3] = [POLLIN | POLLHUP | POLLERR, POLLOUT | POLLERR, POLLPRI];
+    if (count as i32) < 0 {
+        return -EINVAL;
+    }
+    // None past the descriptors there can be, as Linux takes none past its.
+    let count = (count as u32 as u64).min(files::MOST_FILES as u64);
+    // A bit for each descriptor, in 64-bit words.
+    let bytes = count.div_ceil(64) as usize * 8;
+    let mut asked = [vec![0u8; bytes], vec![0u8; bytes], vec![0u8; bytes]];
+    for (set, &addr) in asked.iter_mut().zip(&sets) {
+        if addr != 0 && process.memory.lock().space.read(addr, set).is_none() {
+            return -EFAULT;
+        }
+    }
+    let has = |set: &[u8], fd: usize| set[fd / 8] & 1 << (fd % 8) != 0;
+    // Each descriptor asked of, with which of the sets it's in.
+    let mut entries = Vec::new();
+    for fd in 0..count as usize {
+        let of: Vec<usize> = (0..3).filter(|&set| has(&asked[set], fd)).collect();
+        if !of.is_empty() {
+            let Some(handle) = files::open_handle(process, fd as i32) else { return -EBADF };
+            entries.push((fd, of, handle));
+        }
+    }
+    let mut ready = asked.clone();
+    let check = |ready: &mut [Vec<u8>; 3]| {
+        ready.iter_mut().for_each(|set| set.fill(0));
+        for (fd, of, handle) in &entries {
+            let now = readiness(handle);
+            for &set in of.iter().filter(|&&set| now & READY[set] != 0) {
+                ready[set][fd / 8] |= 1 << (fd % 8);
+            }
+        }
+        ready.iter().flatten().any(|&byte| byte != 0)
+    };
+    if thread::poll_until(deadline(timeout), || check(&mut ready)).is_err() {
+        return -ERESTARTNOHAND;
+    }
+    for (set, &addr) in ready.iter().zip(&sets) {
+        if addr != 0 && process.memory.lock().space.write(addr, set).is_none() {
+            return -EFAULT;
+        }
+    }
+    ready.iter().flatten().map(|byte| i64::from(byte.count_ones())).sum()
+}
+
+/// `select`, with its timeout a `struct timespec` at `timeout`, or none;
+/// and while it waits, the signals blocked those of the set the pair at
+/// `mask` names, its address and size, if it's given, as for `ppoll`.
+fn pselect6(process: &Process, count: u64, sets: [u64; 3], timeout: u64, mask: u64) -> i64 {
+    let ms = match timeout {
+        0 => None,
+        timeout => match timespec_ms(process, timeout) {
+            Ok(ms) => Some(ms),
+            Err(errno) => return -errno,
+        },
+    };
+    let mut pair = [0u8; 16];
+    if mask != 0 && process.memory.lock().space.read(mask, &mut pair).is_none() {
+        return -EFAULT;
+    }
+    let word = |at: usize| u64::from_le_bytes(pair[at..at + 8].try_into().unwrap());
+    masked(process, word(0), word(8), || select(process, count, sets, ms))
 }
 
 const PROT_WRITE: u64 = 2;
@@ -711,6 +810,19 @@ fn clock_nanosleep(process: &Process, clock: u64, flags: u64, request: u64, rema
         }
     }
     -ERESTARTNOHAND
+}
+
+/// The `struct timeval` at `addr`, in milliseconds, rounded up: a million
+/// microseconds and more are seconds, as Linux's `select` takes them.
+fn timeval_ms(process: &Process, addr: u64) -> Result<u64, i64> {
+    let mut timeval = [0u8; 16];
+    process.memory.lock().space.read(addr, &mut timeval).ok_or(EFAULT)?;
+    let seconds = i64::from_le_bytes(timeval[..8].try_into().unwrap());
+    let micros = i64::from_le_bytes(timeval[8..].try_into().unwrap());
+    if seconds < 0 || micros < 0 {
+        return Err(EINVAL);
+    }
+    Ok((seconds as u64).saturating_mul(1000).saturating_add((micros as u64).div_ceil(1000)))
 }
 
 /// The `struct timespec` at `addr`, in milliseconds, rounded up.

@@ -251,7 +251,7 @@ const EXT4_TREE: &[(&str, &str)] =
 
 /// A 16 MiB ext4 file system holding `EXT4_TREE`, as Linux makes them, and in
 /// /bin, user/probe for programs to run, and a script whose interpreter isn't
-/// there. With `userland`'s tree too, 64 MiB, and /bin/sh is.
+/// there. With `userland`'s tree too, 128 MiB, and /bin/sh is.
 fn make_ext4(image: &Path, userland: Option<&Path>) -> Result<(), Box<dyn Error + Send + Sync>> {
     use std::os::unix::fs::PermissionsExt;
     let tree = image.with_extension("tree");
@@ -279,7 +279,7 @@ fn make_ext4(image: &Path, userland: Option<&Path>) -> Result<(), Box<dyn Error 
         .args(["-q", "-F", "-t", "ext4", "-b", "4096", "-d"])
         .arg(&tree)
         .arg(image)
-        .arg(if userland.is_some() { "64M" } else { "16M" })
+        .arg(if userland.is_some() { "128M" } else { "16M" })
         .output()
         .map_err(|error| format!("couldn't run mke2fs ({error}); is e2fsprogs installed?"))?;
     if !output.status.success() {
