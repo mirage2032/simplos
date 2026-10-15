@@ -40,6 +40,17 @@ fn writes_the_tree(test: &str, options: &[&str]) {
     fs.rename("new/going", "new/gone").unwrap();
     fs.remove_dir("new/gone").unwrap();
     fs.remove_file("link").unwrap();
+    // Symbolic links: a short one, kept in its inode, and one too long for
+    // that, in a block of its own.
+    let long = "new/deeper/".repeat(8) + "bigger.bin";
+    fs.symlink(b"hello.txt", "short").unwrap();
+    fs.symlink(long.as_bytes(), "long").unwrap();
+    assert_eq!(fs.metadata("short").unwrap().kind, Kind::Symlink);
+    assert_eq!(fs.read_link("short").unwrap(), b"hello.txt");
+    assert_eq!(fs.read_link("long").unwrap(), long.as_bytes());
+    // A hard link: two names for one file.
+    fs.link("big.bin", "new/also-big.bin").unwrap();
+    assert_eq!(fs.metadata("big.bin").unwrap().links, 2);
     drop(fs);
 
     let saved = dir.join("written.img");
@@ -52,8 +63,15 @@ fn writes_the_tree(test: &str, options: &[&str]) {
     assert_eq!(debugfs(&saved, "cat hello.txt"), b"rewritten\n");
     assert_eq!(debugfs(&saved, "cat new/deep.txt"), b"deep\n");
     assert_eq!(debugfs(&saved, "cat empty"), b"replaced\n");
-    assert_eq!(debugfs_ls(&saved, "/"), ["big.bin", "empty", "hello.txt", "lost+found", "new"]);
-    assert_eq!(debugfs_ls(&saved, "new"), ["deep.txt", "deeper", "dir"]);
+    assert_eq!(
+        debugfs_ls(&saved, "/"),
+        ["big.bin", "empty", "hello.txt", "long", "lost+found", "new", "short"]
+    );
+    assert_eq!(debugfs_ls(&saved, "new"), ["also-big.bin", "deep.txt", "deeper", "dir"]);
+    let stat = |path| String::from_utf8(debugfs(&saved, &format!("stat {path}"))).unwrap();
+    assert!(stat("short").contains("Fast link dest: \"hello.txt\""), "{}", stat("short"));
+    assert!(debugfs(&saved, "cat new/also-big.bin") == big, "the hard link reads back different");
+    assert!(stat("big.bin").contains("Links: 2"), "{}", stat("big.bin"));
     assert_eq!(debugfs_ls(&saved, "new/dir"), ["nested"]);
     assert!(debugfs_ls(&saved, "new/dir/nested").is_empty());
 
@@ -181,6 +199,14 @@ fn refuses_what_linux_refuses() {
     assert_eq!(fs.rename("dir", "dir/nested/dir").err(), Some(Error::InvalidArgument));
     // lwext4 alone would write to a file opened for reading.
     assert_eq!(fs.open("hello.txt").unwrap().write_at(0, b"no").err(), Some(Error::ReadOnly));
+    // Links: none where there's something, none to a directory, and reading
+    // one that isn't.
+    assert_eq!(fs.symlink(b"anything", "hello.txt").err(), Some(Error::AlreadyExists));
+    assert_eq!(fs.symlink(b"anything", "missing/link").err(), Some(Error::NotFound));
+    assert_eq!(fs.link("dir", "dir-again").err(), Some(Error::NotPermitted));
+    assert_eq!(fs.link("hello.txt", "empty").err(), Some(Error::AlreadyExists));
+    assert_eq!(fs.link("missing", "elsewhere").err(), Some(Error::NotFound));
+    assert_eq!(fs.read_link("hello.txt").err(), Some(Error::InvalidArgument));
     drop(fs);
 
     let saved = dir.join("refused.img");

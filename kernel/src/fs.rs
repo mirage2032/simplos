@@ -10,6 +10,7 @@ use crate::serial_println;
 use crate::thread::{SleepLock, SleepLockGuard};
 use crate::tty::Tty;
 use alloc::boxed::Box;
+use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -267,12 +268,66 @@ impl Tree<'_> {
     }
 }
 
+/// Where `path`, from the directory `base` (a path from the root, as
+/// `resolve` makes them), really leads, as a path from the root: with each
+/// symbolic link on the way followed, and the last one too if `follow_last`
+/// or the path ends in `/`, as on Linux. Every part before the last has to be
+/// a directory once followed: ENOENT or ENOTDIR if one isn't. ELOOP after 40
+/// links, where Linux gives up too.
+pub fn lookup(base: &str, path: &str, follow_last: bool) -> Result<String, i64> {
+    const ENOTDIR: i64 = 20;
+    const ELOOP: i64 = 40;
+    let tree = lock();
+    let mut here: Vec<String> = match path.starts_with('/') {
+        true => Vec::new(),
+        false => base.split('/').filter(|part| !part.is_empty()).map(String::from).collect(),
+    };
+    let follow_last = follow_last || path.ends_with('/');
+    let mut rest: VecDeque<String> = path.split('/').map(String::from).collect();
+    let mut links = 0;
+    while let Some(part) = rest.pop_front() {
+        match part.as_str() {
+            "" | "." => continue,
+            ".." => {
+                here.pop();
+                continue;
+            }
+            _ => here.push(part),
+        }
+        let last = rest.iter().all(|part| part.is_empty() || part == ".");
+        if last && !follow_last {
+            break;
+        }
+        let at = here.join("/");
+        match tree.metadata(&at) {
+            // What isn't there yet can be made, at the end of a path.
+            Err(_) if last => break,
+            Err(error) => return Err(errno(error)),
+            Ok(Metadata { kind: Kind::Symlink, .. }) => {
+                links += 1;
+                if links > 40 {
+                    return Err(ELOOP);
+                }
+                let target = tree.disk(&at).and_then(|disk| disk.read_link(&at)).map_err(errno)?;
+                here.pop();
+                if target.starts_with(b"/") {
+                    here.clear();
+                }
+                let target = String::from_utf8_lossy(&target);
+                target.rsplit('/').for_each(|part| rest.push_front(part.into()));
+            }
+            Ok(Metadata { kind: Kind::Directory, .. }) => {}
+            Ok(_) if last => {}
+            Ok(_) => return Err(ENOTDIR),
+        }
+    }
+    Ok(here.join("/"))
+}
+
 /// `path` made absolute against the directory `base`, and with `.`, `..`
 /// and repeated slashes taken out: a path from the root, without the leading
-/// slash, as `Ext4` takes it.
-///
-/// shortcut: `..` is taken out by its name alone, which is right as long as
-/// nothing on the way is a symbolic link; none are followed yet.
+/// slash, as `Ext4` takes it. By the names alone, which is where a path
+/// leads if nothing on the way is a symbolic link: `lookup` follows them.
 pub fn resolve(base: &str, path: &str) -> String {
     let mut parts: Vec<&str> = match path.starts_with('/') {
         true => Vec::new(),
@@ -324,6 +379,7 @@ pub fn read_program(path: &str) -> Result<Vec<u8>, i64> {
 pub fn errno(error: ext4::Error) -> i64 {
     use ext4::Error::*;
     match error {
+        NotPermitted => 1,
         NotFound => 2,
         Io | NeedsRecovery => 5,
         OutOfMemory | TooManyMounts => 12,

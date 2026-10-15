@@ -173,10 +173,18 @@ fn disks() -> String {
     out
 }
 
+/// Where `path` leads, symbolic links followed; or where it would if what
+/// isn't there were, for the call that's about to say so to say why.
+fn followed(path: &str) -> String {
+    fs::lookup("", path, true).unwrap_or_else(|_| fs::resolve("", path))
+}
+
 /// The entries of the directory at `path`, sorted, with a `/` after each
 /// directory's name.
 fn ls(path: &str) -> String {
-    match fs::lock().open_dir(&fs::resolve("", path)) {
+    // Before the tree is held: following takes it too.
+    let at = followed(path);
+    match fs::lock().open_dir(&at) {
         Ok((_, mut entries)) => {
             entries.sort_by(|a, b| a.name.cmp(&b.name));
             let names = entries.into_iter().map(|entry| match entry.kind {
@@ -192,8 +200,8 @@ fn ls(path: &str) -> String {
 /// The file at `path`, as text: a file on the disk, as there's nothing to
 /// read in the devices.
 fn cat(path: &str) -> String {
+    let at = followed(path);
     let tree = fs::lock();
-    let at = fs::resolve("", path);
     let file = match tree.metadata(&at).map(|metadata| metadata.kind) {
         Ok(ext4::Kind::File) => tree.disk(&at).and_then(|disk| disk.open(&at)),
         Ok(ext4::Kind::Directory) => Err(ext4::Error::IsADirectory),

@@ -2526,7 +2526,8 @@ static int ext4_fsymlink_set(ext4_file *f, const void *buf, uint32_t size)
 
 	/*Sync file size*/
 	block_size = ext4_sb_get_block_size(&f->mp->fs.sb);
-	if (size > block_size) {
+	/* LOCAL PATCH: with room for the NUL after it, as below. */
+	if (size >= block_size) {
 		r = EINVAL;
 		goto Finish;
 	}
@@ -2551,8 +2552,19 @@ static int ext4_fsymlink_set(ext4_file *f, const void *buf, uint32_t size)
 		if (r != EOK)
 			goto Finish;
 
+		/* LOCAL PATCH: the target in a block otherwise zeroed, as Linux
+		 * writes it. The block can hold whatever a file freed before left
+		 * there, and e2fsck takes a link whose block doesn't end its
+		 * target with a NUL to be broken. */
+		uint8_t *block = ext4_calloc(1, block_size);
+		if (!block) {
+			r = ENOMEM;
+			goto Finish;
+		}
+		memcpy(block, buf, size);
 		off = fblock * block_size;
-		r = ext4_block_writebytes(f->mp->fs.bdev, off, buf, size);
+		r = ext4_block_writebytes(f->mp->fs.bdev, off, block, block_size);
+		ext4_free(block);
 		if (r != EOK)
 			goto Finish;
 	}

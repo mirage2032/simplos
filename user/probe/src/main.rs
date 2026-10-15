@@ -5,7 +5,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::fs::{FileExt, PermissionsExt};
+use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicIsize, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -917,6 +917,55 @@ fn main() {
             println!(
                 "{paused} {after} {repeated} {none} {} {off} {copy} {ended} {read:?}",
                 (9..=10).contains(&left[2])
+            );
+        }
+        // Symbolic links: made and read back, followed, and lstat'd as
+        // themselves; through a directory, after which `..` is the
+        // directory's parent, not the link's; one that leads nowhere, which
+        // O_CREAT makes the file for; a loop; O_NOFOLLOW; a program run
+        // through one. Hard links: two names for a file, which outlives
+        // either. And what Linux refuses.
+        Some("links") => {
+            use std::os::unix::fs::{OpenOptionsExt, symlink};
+            let code = |result: io::Result<()>| result.map_err(|e| e.raw_os_error().unwrap_or(0));
+            or_fail("/links", fs::create_dir("/links"));
+            or_fail("abs", symlink("/hello.txt", "/links/abs"));
+            let target = or_fail("abs", fs::read_link("/links/abs"));
+            let through = or_fail("abs", fs::read_to_string("/links/abs"));
+            let itself =
+                or_fail("abs", fs::symlink_metadata("/links/abs")).file_type().is_symlink();
+            let followed = or_fail("abs", fs::metadata("/links/abs")).is_file();
+            or_fail("up", symlink("../dir", "/links/up"));
+            let deep = or_fail("up", fs::read_to_string("/links/up/nested/deep.txt"));
+            let inode = |path| or_fail(path, fs::metadata(path)).ino();
+            let parent = inode("/links/up/nested/..") == inode("/dir");
+            or_fail("nowhere", symlink("made-by-open", "/links/nowhere"));
+            or_fail("nowhere", fs::write("/links/nowhere", "made\n"));
+            let made = or_fail("made", fs::read_to_string("/links/made-by-open"));
+            or_fail("loop", symlink("loop2", "/links/loop1"));
+            or_fail("loop", symlink("loop1", "/links/loop2"));
+            let looped = code(fs::read("/links/loop1").map(drop));
+            let nofollow = code(
+                OpenOptions::new().read(true).custom_flags(0o400000).open("/links/abs").map(drop),
+            );
+            or_fail("probe", symlink("/bin/probe", "/links/probe"));
+            let ran = or_fail("probe", Command::new("/links/probe").output());
+            or_fail("one", fs::write("/links/one", "shared\n"));
+            or_fail("two", fs::hard_link("/links/one", "/links/two"));
+            let links = or_fail("one", fs::metadata("/links/one")).nlink();
+            or_fail("one", fs::remove_file("/links/one"));
+            let kept = or_fail("two", fs::read_to_string("/links/two"));
+            let refused = [
+                code(fs::hard_link("/dir", "/links/dir")),
+                code(symlink("anything", "/hello.txt")),
+                code(fs::read_link("/hello.txt").map(drop)),
+                code(fs::hard_link("/links/missing", "/links/three")),
+                code(fs::metadata("/hello.txt/../dir").map(drop)),
+            ];
+            println!(
+                "{target:?} {through:?} {itself} {followed} {deep:?} {parent} {made:?} \
+                 {looped:?} {nofollow:?} {:?} {links} {kept:?} {refused:?}",
+                String::from_utf8_lossy(&ran.stdout)
             );
         }
         Some(other) => {

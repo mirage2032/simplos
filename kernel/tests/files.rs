@@ -409,3 +409,16 @@ fn a_program_moves_several_buffers_in_one_call() {
     // isn't there.
     assert_eq!(run(&["vectors"]), ok("13 13 \"one \" \"two three\" -22 -14\n"));
 }
+
+#[test_case]
+fn symbolic_and_hard_links_lead_where_they_should() {
+    // Read back, followed, and lstat'd as itself; through a directory, with
+    // `..` the directory's parent; a link to nothing, which O_CREAT makes;
+    // a loop and O_NOFOLLOW, ELOOP; a program run through one; a hard link
+    // outliving the other name. Then refused: a hard link to a directory
+    // (EPERM), a link where there's a file (EEXIST), readlink of a file
+    // (EINVAL), a hard link to nothing (ENOENT), and a file on the way, even
+    // with `..` after it (ENOTDIR).
+    let expected = r#""/hello.txt" "hello from ext4\n" true true "deep\n" true "made\n" Err(40) Err(40) "hello from user space\n" 2 "shared\n" [Err(1), Err(17), Err(22), Err(2), Err(20)]"#;
+    assert_eq!(run(&["links"]), ok(&(String::from(expected) + "\n")));
+}

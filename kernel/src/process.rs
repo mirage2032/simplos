@@ -337,7 +337,7 @@ pub fn spawn_program(
     env: &[&str],
     files: Vec<Option<Arc<fs::Handle>>>,
 ) -> Result<Arc<Process>, i64> {
-    let elf = fs::read_program(&fs::resolve("", path))?;
+    let elf = fs::read_program(&fs::lookup("", path, true)?)?;
     spawn_with(&elf, args, env, files).map_err(load_errno)
 }
 

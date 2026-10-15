@@ -73,6 +73,8 @@ pub enum Error {
     Busy,
     /// A directory that would have to be empty isn't.
     NotEmpty,
+    /// Such as a hard link to a directory.
+    NotPermitted,
     /// As many file systems are mounted as can be.
     TooManyMounts,
     OutOfMemory,
@@ -86,6 +88,7 @@ fn check(errno: c_int) -> Result<(), Error> {
     // lwext4's own errno values, which are Linux's.
     Err(match errno {
         0 => return Ok(()),
+        1 => Error::NotPermitted,
         2 => Error::NotFound,
         5 => Error::Io,
         12 => Error::OutOfMemory,
@@ -438,6 +441,54 @@ impl Ext4 {
         check(unsafe { ffi::ext4_mode_set(path.as_ptr(), permissions & 0o7777) })
     }
 
+    /// Make a symbolic link at `path` to `target`, which can be anything:
+    /// it's only read as the link is followed.
+    pub fn symlink(&self, target: &[u8], path: &str) -> Result<(), Error> {
+        if self.metadata(path).is_ok() {
+            return Err(Error::AlreadyExists);
+        }
+        self.check_parent(path)?;
+        let target = CString::new(target).map_err(|_| Error::InvalidArgument)?;
+        let path = self.path(path)?;
+        let _lwext4 = LWEXT4.lock();
+        // Safety: two NUL-terminated strings, the second a path on our mount.
+        check(unsafe { ffi::ext4_fsymlink(target.as_ptr(), path.as_ptr()) })
+    }
+
+    /// Where the symbolic link at `path` points, as it was given.
+    pub fn read_link(&self, path: &str) -> Result<Vec<u8>, Error> {
+        let metadata = self.metadata(path)?;
+        if metadata.kind != Kind::Symlink {
+            return Err(Error::InvalidArgument);
+        }
+        let path = self.path(path)?;
+        let mut target = alloc::vec![0u8; metadata.size as usize];
+        let mut read = 0;
+        let _lwext4 = LWEXT4.lock();
+        // Safety: as in `metadata`, and a buffer of the length given.
+        check(unsafe {
+            ffi::ext4_readlink(path.as_ptr(), target.as_mut_ptr().cast(), target.len(), &mut read)
+        })?;
+        target.truncate(read);
+        Ok(target)
+    }
+
+    /// Another name, `to`, for the file at `from`, which can't be a
+    /// directory, as on Linux.
+    pub fn link(&self, from: &str, to: &str) -> Result<(), Error> {
+        if self.metadata(from)?.kind == Kind::Directory {
+            return Err(Error::NotPermitted);
+        }
+        if self.metadata(to).is_ok() {
+            return Err(Error::AlreadyExists);
+        }
+        self.check_parent(to)?;
+        let (from, to) = (self.path(from)?, self.path(to)?);
+        let _lwext4 = LWEXT4.lock();
+        // Safety: as in `rename`.
+        check(unsafe { ffi::ext4_flink(from.as_ptr(), to.as_ptr()) })
+    }
+
     /// That the directory `path` would go in is there: lwext4 makes any
     /// that are missing, where Linux says ENOENT.
     fn check_parent(&self, path: &str) -> Result<(), Error> {
@@ -772,6 +823,14 @@ mod ffi {
         pub fn ext4_mode_set(path: *const c_char, mode: u32) -> c_int;
         pub fn ext4_fremove(path: *const c_char) -> c_int;
         pub fn ext4_frename(path: *const c_char, new_path: *const c_char) -> c_int;
+        pub fn ext4_fsymlink(target: *const c_char, path: *const c_char) -> c_int;
+        pub fn ext4_readlink(
+            path: *const c_char,
+            buf: *mut c_char,
+            bufsize: usize,
+            rcnt: *mut usize,
+        ) -> c_int;
+        pub fn ext4_flink(path: *const c_char, hardlink_path: *const c_char) -> c_int;
         pub fn ext4_fread(
             file: *mut File,
             buf: *mut c_void,

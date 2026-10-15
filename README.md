@@ -110,9 +110,16 @@ stdio) works as it does on Linux: `open`, `openat`, `close`, `read`, `write`,
 `unlinkat`, `rename`, `renameat`, `renameat2`, `chdir`, `getcwd` and `umask`;
 and for what isn't a file, `pipe`, `pipe2`, `dup`, `dup2` and `dup3`, and
 `/dev/null`, `/dev/zero` and `/dev/tty`. In the shell, `run cat /hello.txt`
-has the user program read it, and `run` lists its other modes. For now:
+has the user program read it, and `run` lists its other modes.
 
-- no symbolic link is followed, so `stat` and `lstat` are the same;
+Symbolic links (`symlink`, `symlinkat`, `readlink`, `readlinkat`) are
+followed wherever a path goes through one, as Linux follows them
+(`fs::lookup`): at the end too, but for the calls about the link itself, as
+`lstat`, `unlink` and `rename`, or asked not to (`O_NOFOLLOW`,
+`AT_SYMLINK_NOFOLLOW`); `..` after one is the parent of where it led; 40 in a
+row is `ELOOP`. Hard links (`link`, `linkat`) give a file another name, to
+anything but a directory. For now:
+
 - a file that's open can't be removed or renamed over (`EBUSY`);
 - `/dev` holds just those three, and can't be written.
 
@@ -138,7 +145,6 @@ inherit. `readv` and `writev` move several buffers in one call, as musl's
 - every id is 0, and can't be set to another, as there are no other users;
 - limits are kept and reported, not enforced: a program has the 1024
   descriptors and 256 KiB of stack there are, whatever it sets;
-- `readlink` says what's there isn't a link, as there are none yet;
 
 - `fork` copies all of a program's memory at once, rather than sharing it
   until either side writes to it;
@@ -345,7 +351,7 @@ be added to the others that need it.
 `vendor/lwext4` is upstream [lwext4](https://github.com/gkostka/lwext4) at
 commit `58bcf89` (2022-09-22): its `src/` and `include/` without the mkfs and
 MBR code, which nothing uses. It is GPL-2.0 (its extents and xattr code are
-"GPL-2.0 or later"), like simplos. It has five local fixes, each marked
+"GPL-2.0 or later"), like simplos. It has six local fixes, each marked
 `LOCAL PATCH` in the source, all found by `fs/ext4`'s tests:
 
 - **`src/ext4.c`, renaming a directory** — the block holding its `..` entry
@@ -367,6 +373,9 @@ MBR code, which nothing uses. It is GPL-2.0 (its extents and xattr code are
 - **`src/ext4_fs.c`, mounting to write** — it marked the file system as
   having errors, where Linux clears its "clean" flag: after a crash, Linux
   would warn of errors that weren't there.
+- **`src/ext4.c`, a symbolic link too long for its inode** — its target went
+  into a block of its own, after whatever a file freed before had left
+  there, where Linux zeroes the rest: e2fsck took such links to be broken.
 
 And one addition, also marked: **`src/ext4.c`, renaming onto a file that's
 there** replaces it in the rename's own transaction, as `rename(2)` promises,

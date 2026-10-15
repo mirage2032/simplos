@@ -25,6 +25,7 @@ const ESPIPE: i64 = 29;
 const ERANGE: i64 = 34;
 const ENAMETOOLONG: i64 = 36;
 const ENOTEMPTY: i64 = 39;
+const ELOOP: i64 = 40;
 const EPIPE: i64 = 32;
 
 const O_ACCMODE: u64 = 3;
@@ -36,10 +37,14 @@ const O_TRUNC: u64 = 0o1000;
 const O_APPEND: u64 = 0o2000;
 const O_NONBLOCK: u64 = 0o4000;
 const O_DIRECTORY: u64 = 0o200000;
+const O_NOFOLLOW: u64 = 0o400000;
 const O_CLOEXEC: u64 = 0o2000000;
 
 /// A `dirfd` that means the working directory.
 pub const AT_FDCWD: u64 = -100i64 as u64;
+pub const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+/// The longest path, with its NUL.
+const PATH_MAX: usize = 4096;
 const AT_EMPTY_PATH: u64 = 0x1000;
 /// For `unlinkat`: remove a directory, as `rmdir` does.
 pub const AT_REMOVEDIR: u64 = 0x200;
@@ -124,25 +129,34 @@ pub(super) fn string_at(
 
 /// The path at `addr` in the program's memory.
 pub(super) fn path_at(process: &Process, addr: u64) -> Result<String> {
-    const PATH_MAX: usize = 4096;
     String::from_utf8(string_at(process, addr, PATH_MAX, ENAMETOOLONG)?).map_err(|_| EINVAL)
 }
 
 /// `path`, from the root, as `dirfd` says where it starts.
 pub(super) fn lookup(process: &Process, dirfd: u64, path: &str) -> Result<String> {
+    lookup_with(process, dirfd, path, true)
+}
+
+/// As `lookup`, but a symbolic link at the end of `path` followed only if
+/// `follow`: unless the call is about the link itself.
+pub(super) fn lookup_with(
+    process: &Process,
+    dirfd: u64,
+    path: &str,
+    follow: bool,
+) -> Result<String> {
     if path.is_empty() {
         return Err(ENOENT);
     }
-    if path.starts_with('/') {
-        return Ok(fs::resolve("", path));
-    }
-    if dirfd == AT_FDCWD {
-        return Ok(fs::resolve(&process.cwd.lock(), path));
-    }
-    match &*handle(process, dirfd)? {
-        Handle::Dir { path: base, .. } => Ok(fs::resolve(base, path)),
-        _ => Err(ENOTDIR),
-    }
+    let base = match (path.starts_with('/'), dirfd == AT_FDCWD) {
+        (true, _) => String::new(),
+        (false, true) => process.cwd.lock().clone(),
+        (false, false) => match &*handle(process, dirfd)? {
+            Handle::Dir { path: base, .. } => base.clone(),
+            _ => return Err(ENOTDIR),
+        },
+    };
+    fs::lookup(&base, path, follow)
 }
 
 pub fn open(process: &Process, dirfd: u64, path: u64, flags: u64, mode: u64) -> i64 {
@@ -151,7 +165,9 @@ pub fn open(process: &Process, dirfd: u64, path: u64, flags: u64, mode: u64) -> 
         if access == O_ACCMODE {
             return Err(EINVAL);
         }
-        let path = lookup(process, dirfd, &path_at(process, path)?)?;
+        // Not the link itself, unless it's asked for, or to be made new.
+        let follow = flags & O_NOFOLLOW == 0 && flags & (O_CREAT | O_EXCL) != O_CREAT | O_EXCL;
+        let path = lookup_with(process, dirfd, &path_at(process, path)?, follow)?;
         let cloexec = flags & O_CLOEXEC != 0;
         if let Some(device) = fs::device(&path) {
             let handle = match device {
@@ -171,8 +187,9 @@ pub fn open(process: &Process, dirfd: u64, path: u64, flags: u64, mode: u64) -> 
                 let (dir, entries) = tree.open_dir(&path).map_err(fs::errno)?;
                 Handle::Dir { dir, entries, path, next: 0.into() }
             }
-            Ok(_) if flags & O_DIRECTORY != 0 => return Err(ENOTDIR),
             Ok(_) if flags & O_CREAT != 0 && flags & O_EXCL != 0 => return Err(EEXIST),
+            Ok(Metadata { kind: Kind::Symlink, .. }) => return Err(ELOOP),
+            Ok(_) if flags & O_DIRECTORY != 0 => return Err(ENOTDIR),
             Err(ext4::Error::NotFound) if flags & O_CREAT != 0 => {
                 let disk = tree.disk(&path).map_err(fs::errno)?;
                 let file = disk.create(&path).map_err(fs::errno)?;
@@ -405,18 +422,64 @@ fn write_data(process: &Process, fd: u64, data: &[u8], at: Option<u64>) -> Resul
     }
 }
 
-/// Where the symbolic link at `path` points, at most `size` bytes of it.
-///
-/// shortcut: there are no symbolic links yet, so anything there isn't one:
-/// EINVAL, as Linux says for a file.
-pub fn readlinkat(process: &Process, dirfd: u64, path: u64, size: u64) -> i64 {
+/// Where the symbolic link at `path` points, at most `size` bytes of it, at
+/// `buf`, without a NUL: EINVAL for anything there that isn't a link.
+pub fn readlinkat(process: &Process, dirfd: u64, path: u64, buf: u64, size: u64) -> i64 {
     ret((|| {
         if size as i64 <= 0 {
             return Err(EINVAL);
         }
-        let path = lookup(process, dirfd, &path_at(process, path)?)?;
-        fs::lock().metadata(&path).map_err(fs::errno)?;
-        Err(EINVAL)
+        let path = lookup_with(process, dirfd, &path_at(process, path)?, false)?;
+        let tree = fs::lock();
+        let target = match tree.metadata(&path).map_err(fs::errno)?.kind {
+            Kind::Symlink => tree.disk(&path).and_then(|disk| disk.read_link(&path)),
+            _ => return Err(EINVAL),
+        };
+        let target = target.map_err(fs::errno)?;
+        let target = &target[..target.len().min(size as usize)];
+        process.memory.lock().space.write(buf, target).ok_or(EFAULT)?;
+        Ok(target.len() as i64)
+    })())
+}
+
+/// Make a symbolic link at `path` to `target`, which is taken as it is: it
+/// can lead anywhere, or nowhere yet.
+pub fn symlinkat(process: &Process, target: u64, dirfd: u64, path: u64) -> i64 {
+    ret((|| {
+        let target = string_at(process, target, PATH_MAX, ENAMETOOLONG)?;
+        if target.is_empty() {
+            return Err(ENOENT);
+        }
+        let path = lookup_with(process, dirfd, &path_at(process, path)?, false)?;
+        let tree = fs::lock();
+        tree.disk(&path).and_then(|disk| disk.symlink(&target, &path)).map_err(fs::errno)?;
+        Ok(0)
+    })())
+}
+
+/// Another name, `to`, for the file at `from`: which, if it's a symbolic
+/// link, is the link itself, unless `AT_SYMLINK_FOLLOW` says otherwise.
+pub fn linkat(
+    process: &Process,
+    from_dirfd: u64,
+    from: u64,
+    to_dirfd: u64,
+    to: u64,
+    flags: u64,
+) -> i64 {
+    const AT_SYMLINK_FOLLOW: u64 = 0x400;
+    ret((|| {
+        if flags & !AT_SYMLINK_FOLLOW != 0 {
+            return Err(EINVAL);
+        }
+        let follow = flags & AT_SYMLINK_FOLLOW != 0;
+        let from = lookup_with(process, from_dirfd, &path_at(process, from)?, follow)?;
+        let to = lookup_with(process, to_dirfd, &path_at(process, to)?, false)?;
+        let tree = fs::lock();
+        // Both on the disk, as for `rename`.
+        tree.disk(&from).map_err(fs::errno)?;
+        tree.disk(&to).and_then(|disk| disk.link(&from, &to)).map_err(fs::errno)?;
+        Ok(0)
     })())
 }
 
@@ -515,7 +578,7 @@ pub fn newfstatat(process: &Process, dirfd: u64, path: u64, buf: u64, flags: u64
         }
         let path = match path.is_empty() && flags & AT_EMPTY_PATH != 0 {
             true => String::new(),
-            false => lookup(process, dirfd, &path)?,
+            false => lookup_with(process, dirfd, &path, flags & AT_SYMLINK_NOFOLLOW == 0)?,
         };
         let metadata = fs::lock().metadata(&path).map_err(fs::errno)?;
         put_stat(process, &metadata, buf)
@@ -618,7 +681,7 @@ fn nonblocking_flag(nonblocking: &core::sync::atomic::AtomicBool) -> i64 {
 
 pub fn mkdirat(process: &Process, dirfd: u64, path: u64, mode: u64) -> i64 {
     ret((|| {
-        let path = lookup(process, dirfd, &path_at(process, path)?)?;
+        let path = lookup_with(process, dirfd, &path_at(process, path)?, false)?;
         let tree = fs::lock();
         let disk = tree.disk(&path).map_err(fs::errno)?;
         disk.create_dir(&path).map_err(fs::errno)?;
@@ -631,7 +694,7 @@ pub fn mkdirat(process: &Process, dirfd: u64, path: u64, mode: u64) -> i64 {
 pub fn unlinkat(process: &Process, dirfd: u64, path: u64, flags: u64) -> i64 {
     ret((|| {
         let name = path_at(process, path)?;
-        let path = lookup(process, dirfd, &name)?;
+        let path = lookup_with(process, dirfd, &name, false)?;
         let tree = fs::lock();
         let disk = tree.disk(&path).map_err(fs::errno)?;
         let removed = match flags & AT_REMOVEDIR {
@@ -665,8 +728,8 @@ pub fn renameat2(
         if flags & !RENAME_NOREPLACE != 0 {
             return Err(EINVAL);
         }
-        let from = lookup(process, from_dirfd, &path_at(process, from)?)?;
-        let to = lookup(process, to_dirfd, &path_at(process, to)?)?;
+        let from = lookup_with(process, from_dirfd, &path_at(process, from)?, false)?;
+        let to = lookup_with(process, to_dirfd, &path_at(process, to)?, false)?;
         let tree = fs::lock();
         if flags & RENAME_NOREPLACE != 0 && tree.metadata(&to).is_ok() {
             return Err(EEXIST);
