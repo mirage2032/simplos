@@ -85,6 +85,11 @@ pub struct Process {
     pub cwd: Mutex<String>,
     /// The permission bits taken off what it creates.
     pub umask: AtomicU32,
+    /// How nice it is to others, from -20 to 19, as `setpriority` set it.
+    ///
+    /// shortcut: kept and reported, but every thread gets the same turns;
+    /// weigh them by this when the scheduler has priorities.
+    pub nice: AtomicI32,
     /// Its resource limits, soft and hard, by `RLIMIT_*` number. Taken with
     /// interrupts on.
     pub limits: Mutex<[(u64, u64); syscall::LIMITS]>,
@@ -309,6 +314,7 @@ pub fn spawn_with(
         files: Mutex::new(files.collect()),
         cwd: Mutex::new(String::new()),
         umask: AtomicU32::new(0o022),
+        nice: AtomicI32::new(0),
         limits: Mutex::new(syscall::DEFAULT_LIMITS),
         times: Times::default(),
         alarm: Mutex::new(time::Alarm::default()),
@@ -384,6 +390,7 @@ pub fn fork(parent: &Arc<Process>, registers: Registers) -> Option<u64> {
         files: Mutex::new(parent.files.lock().clone()),
         cwd: Mutex::new(parent.cwd.lock().clone()),
         umask: AtomicU32::new(parent.umask.load(Ordering::Relaxed)),
+        nice: AtomicI32::new(parent.nice.load(Ordering::Relaxed)),
         limits: Mutex::new(*parent.limits.lock()),
         times: Times::default(),
         alarm: Mutex::new(time::Alarm::default()),

@@ -1,10 +1,14 @@
 //! System calls on the machine and on who a program runs as: what the system
-//! is called, which user and group, which CPUs, and its resource limits.
+//! is called, how long it's been up and how much memory it has, which user
+//! and groups, which CPUs, how nice, and its resource limits.
 
 use super::files::{Result, ret};
 use super::{EFAULT, EINVAL, EPERM};
 use crate::process::{self, Process};
+use crate::{memory, time};
 use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::sync::atomic::Ordering::Relaxed;
 
 const ESRCH: i64 = 3;
 
@@ -31,6 +35,70 @@ pub fn uname(process: &Process, buf: u64) -> i64 {
 /// set to 0; give processes ids of their own when there are others to be.
 pub fn set_id(id: u64) -> i64 {
     if id == 0 { 0 } else { -EPERM }
+}
+
+/// `getgroups`: the groups besides its own a program is in, none, as root
+/// with no others; and `setgroups`, which says it's done.
+///
+/// shortcut: what `setgroups` sets is forgotten, as nothing checks groups;
+/// keep it once something does.
+pub fn groups(count: u64) -> i64 {
+    if (count as i32) < 0 { -EINVAL } else { 0 }
+}
+
+/// `sysinfo`'s `struct sysinfo`: seconds since boot, the memory there is and
+/// is free, and how many processes, in bytes. Load averages and swap are 0.
+pub fn sysinfo(process: &Process, info: u64) -> i64 {
+    let (total, free) = memory::FRAMES.lock().as_ref().map_or((0, 0), |frames| frames.memory());
+    let mut sysinfo = [0u8; 112];
+    sysinfo[..8].copy_from_slice(&(time::since_boot() / time::NANOS).to_le_bytes());
+    sysinfo[32..40].copy_from_slice(&total.to_le_bytes());
+    sysinfo[40..48].copy_from_slice(&free.to_le_bytes());
+    sysinfo[80..82].copy_from_slice(&(process::all().len() as u16).to_le_bytes());
+    // mem_unit: the sizes are in bytes.
+    sysinfo[104..108].copy_from_slice(&1u32.to_le_bytes());
+    ret(process.memory.lock().space.write(info, &sysinfo).ok_or(EFAULT).map(|()| 0))
+}
+
+/// The processes `which` and `who` name for `getpriority` and
+/// `setpriority`: process `who`, those in group `who`, or those of user
+/// `who`, all of them; each the caller's own for 0. ESRCH for none.
+fn prioritized(process: &Process, which: u64, who: u64) -> Result<Vec<Arc<Process>>> {
+    const PRIO_PROCESS: u64 = 0;
+    const PRIO_PGRP: u64 = 1;
+    const PRIO_USER: u64 = 2;
+    let who = who as u32 as u64;
+    let named: Vec<_> = match which {
+        PRIO_PROCESS => {
+            let id = if who == 0 { process.id } else { who };
+            process::all().into_iter().filter(|other| other.id == id).collect()
+        }
+        PRIO_PGRP => process::group(if who == 0 { process.pgid() } else { who }),
+        // Root's are all there are.
+        PRIO_USER if who == 0 => process::all(),
+        PRIO_USER => Vec::new(),
+        _ => return Err(EINVAL),
+    };
+    if named.is_empty() { Err(ESRCH) } else { Ok(named) }
+}
+
+/// How nice the least nice of the processes named is, as 20 less it, as
+/// Linux's system call says it, so as never to be negative.
+pub fn getpriority(process: &Process, which: u64, who: u64) -> i64 {
+    ret(prioritized(process, which, who).map(|named| {
+        let least = named.iter().map(|other| other.nice.load(Relaxed)).min().unwrap_or(0);
+        i64::from(20 - least)
+    }))
+}
+
+/// Make the processes named `nice`, which is taken to be within -20 to 19:
+/// root may make them less nice as well as more.
+pub fn setpriority(process: &Process, which: u64, who: u64, nice: u64) -> i64 {
+    let nice = (nice as i32).clamp(-20, 19);
+    ret(prioritized(process, which, who).map(|named| {
+        named.iter().for_each(|other| other.nice.store(nice, Relaxed));
+        0
+    }))
 }
 
 /// The CPUs `pid` (the caller, for 0) may run on: the one there is, as a

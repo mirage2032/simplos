@@ -1079,6 +1079,71 @@ fn main() {
             or_fail(path, fs::remove_file(path));
             println!("{gone} {text:?} {was:?} {now:?}");
         }
+        // Scripts run by what their first line names: with its argument, the
+        // script's path as given, and the script's own arguments; through
+        // a script naming another; and those that can't be run.
+        Some("scripts") => {
+            let scripts = [
+                ("/script", "#!/bin/probe env\nnot run\n"),
+                ("/spaced", "#! \t/bin/probe   env \t\n"),
+                ("/outer", "#!/script\n"),
+                ("/loop", "#!/loop\n"),
+                ("/nothing", "#!  \n"),
+                ("/missing", "#!/not/there\n"),
+                ("/text", "echo hi\n"),
+            ];
+            for (path, text) in scripts {
+                or_fail(path, fs::write(path, text));
+                or_fail(path, fs::set_permissions(path, fs::Permissions::from_mode(0o755)));
+            }
+            let run = |path: &str| match Command::new(path).arg("a").env_clear().output() {
+                Ok(output) => String::from_utf8_lossy(&output.stdout).trim_end().to_string(),
+                Err(error) => error.raw_os_error().unwrap_or(0).to_string(),
+            };
+            let ran: Vec<String> = scripts.iter().map(|(path, _)| run(path)).collect();
+            let relative = run("./script");
+            for (path, _) in scripts {
+                or_fail(path, fs::remove_file(path));
+            }
+            println!("{} | {relative}", ran.join(" | "));
+        }
+        // What sysinfo says of the machine; the groups root is in besides
+        // its own, none; how nice it is, set by process and by group, and
+        // inherited; and a turn given up.
+        Some("machine") => {
+            let mut info = [0u64; 14];
+            let told = syscall(99, info.as_mut_ptr() as usize, 0, 0);
+            let mut boot = [0u64; 2];
+            syscall(228, 7, boot.as_mut_ptr() as usize, 0);
+            let (uptime, total, free, processes) = (info[0], info[4], info[5], info[10] & 0xFFFF);
+            let unit = info[13] & 0xFFFF_FFFF;
+            let machine = [
+                boot[0] - uptime <= 1,
+                total >= 64 << 20 && free < total,
+                processes >= 1,
+                unit == 1,
+            ];
+            let groups = [
+                syscall(115, 0, 0, 0),
+                syscall(116, 0, 0, 0),
+                syscall(115, -1isize as usize, 0, 0),
+            ];
+            let priority = || syscall(140, 0, 0, 0);
+            let mut nice = vec![priority(), syscall(141, 0, 0, 5), priority()];
+            let child = syscall(57, 0, 0, 0);
+            if child == 0 {
+                std::process::exit(priority() as i32);
+            }
+            let inherited = wait(child).1;
+            nice.extend([syscall(141, 1, 0, -3isize as usize), priority()]);
+            nice.extend([
+                syscall(141, 0, 0, 100),
+                priority(),
+                syscall(140, 3, 0, 0),
+                syscall(140, 0, 99999, 0),
+            ]);
+            println!("{told} {machine:?} {groups:?} {nice:?} {inherited} {}", syscall(24, 0, 0, 0));
+        }
         Some(other) => {
             eprintln!("probe: unknown mode {other:?}");
             std::process::exit(2);

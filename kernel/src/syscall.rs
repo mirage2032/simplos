@@ -247,6 +247,10 @@ fn call(frame: &Frame) -> i64 {
         18 => files::pwrite(&process, a0, a1, a2, a3),
         21 => files::faccessat(&process, files::AT_FDCWD, a0, a1, 0),
         22 => files::pipe2(&process, a0, 0),
+        24 => {
+            thread::yield_now();
+            0
+        }
         32 => files::dup(&process, a0),
         33 => files::dup3(&process, a0, a1, 0, true),
         34 => signals::pause(&process),
@@ -295,6 +299,7 @@ fn call(frame: &Frame) -> i64 {
         96 => clocks::gettimeofday(&process, a0, a1),
         97 => system::prlimit(&process, 0, a0, 0, a1),
         98 => clocks::getrusage(&process, a0, a1),
+        99 => system::sysinfo(&process, a0),
         100 => clocks::times(&process, a0),
         // getuid, getgid, geteuid and getegid.
         102 | 104 | 107 | 108 => 0,
@@ -303,6 +308,8 @@ fn call(frame: &Frame) -> i64 {
         110 => process.parent_id() as i64,
         111 => process.pgid() as i64,
         112 => signals::setsid(&process),
+        // getgroups, setgroups.
+        115 | 116 => system::groups(a0),
         121 => signals::getpgid(&process, a0),
         124 => signals::getsid(&process, a0),
         127 => signals::rt_sigpending(&process, a0, a1),
@@ -312,6 +319,8 @@ fn call(frame: &Frame) -> i64 {
         76 => files::truncate(&process, a0, a1),
         77 => files::ftruncate(&process, a0, a1),
         131 => signals::sigaltstack(&process, a0, a1, frame.rsp),
+        140 => system::getpriority(&process, a0, a1),
+        141 => system::setpriority(&process, a0, a1, a2),
         158 => arch_prctl(&process, a0, a1),
         160 => system::prlimit(&process, 0, a0, a1, 0),
         162 => files::sync(),

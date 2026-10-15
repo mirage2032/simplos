@@ -446,6 +446,8 @@ pub struct BootInfoFrameAllocator {
     /// shortcut: no contiguous runs and no double-free check; add a bitmap when
     /// something needs either (multi-frame DMA buffers, huge pages).
     freed: Option<PhysFrame>,
+    /// How many frames are handed out now.
+    used: u64,
 }
 
 /// Ends the `freed` stack. Not 0, because frame 0 can be usable memory.
@@ -466,15 +468,22 @@ impl BootInfoFrameAllocator {
     /// requirement is that all frames that are marked as `USABLE` in it are
     /// really unused.
     pub unsafe fn init(memory_map: &'static MemoryRegions) -> Self {
-        BootInfoFrameAllocator { memory_map, region: 0, next: 0, freed: None }
+        BootInfoFrameAllocator { memory_map, region: 0, next: 0, freed: None, used: 0 }
     }
-}
 
-unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
-    /// Reuses the most recently freed frame if there is one. Otherwise picks up
-    /// where the last call stopped, so handing out n frames costs O(n) rather
-    /// than walking the whole map from the start every time.
-    fn allocate_frame(&mut self) -> Option<PhysFrame> {
+    /// The bytes of memory there are to hand out, and of those the bytes
+    /// not handed out now.
+    pub fn memory(&self) -> (u64, u64) {
+        let usable =
+            self.memory_map.iter().filter(|region| region.kind == MemoryRegionKind::Usable);
+        let frames: u64 = usable
+            .map(|region| (region.end / 4096).saturating_sub(region.start.div_ceil(4096)))
+            .sum();
+        (frames * 4096, (frames - self.used) * 4096)
+    }
+
+    /// The most recently freed frame, or else the next never handed out.
+    fn take(&mut self) -> Option<PhysFrame> {
         if let Some(frame) = self.freed {
             // Safety: a freed frame is ours until handed out, which is now.
             let below = unsafe { link(frame).read() };
@@ -495,6 +504,17 @@ unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
     }
 }
 
+unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
+    /// Reuses the most recently freed frame if there is one. Otherwise picks up
+    /// where the last call stopped, so handing out n frames costs O(n) rather
+    /// than walking the whole map from the start every time.
+    fn allocate_frame(&mut self) -> Option<PhysFrame> {
+        let frame = self.take();
+        self.used += u64::from(frame.is_some());
+        frame
+    }
+}
+
 impl FrameDeallocator<Size4KiB> for BootInfoFrameAllocator {
     /// # Safety
     ///
@@ -505,6 +525,7 @@ impl FrameDeallocator<Size4KiB> for BootInfoFrameAllocator {
         // Safety: the caller has given the frame up, so it is ours to write.
         unsafe { link(frame).write(below) };
         self.freed = Some(frame);
+        self.used -= 1;
     }
 }
 

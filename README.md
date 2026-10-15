@@ -145,7 +145,9 @@ A program can start others as on Linux: `fork`, `vfork` and `clone` (as C
 libraries use it for them) copy it, `execve` replaces it with an ELF program
 from the disk, closing the descriptors marked close-on-exec, and `wait4`
 waits for its copies and tells how each ended; `getpid` and `getppid` say
-who's who. So Rust's `std::process::Command` works: its `spawn`, `status`,
+who's who. `execve` runs a script through what its first line names
+(`#!/bin/sh -e` and the like), as Linux does, with the line's one argument
+and the script's path; that can be a script too, five deep. So Rust's `std::process::Command` works: its `spawn`, `status`,
 `output` and `exec`. `cargo run`'s
 disk has the user program as `/bin/probe` (a `disk.img` made before this
 doesn't: delete it), so in the shell, `run spawn /bin/probe hello` has it
@@ -153,14 +155,18 @@ run itself again.
 
 A program can ask what it runs on: `uname` says Linux, the interface it's
 talking to, with simplos as the host and in the version; `sched_getaffinity`
-gives it the one CPU; it runs as root (`getuid` and the like say 0); and
-`getrlimit`, `setrlimit` and `prlimit64` keep its limits, which its copies
-inherit. `readv` and `writev` move several buffers in one call, as musl's
+gives it the one CPU; `sysinfo` how long it's been up, how much memory there
+is and is free, and how many processes; it runs as root (`getuid` and the
+like say 0), in no other groups (`getgroups`); `getpriority` and
+`setpriority` keep how nice it is; and `getrlimit`, `setrlimit` and
+`prlimit64` keep its limits, which its copies inherit. `readv` and `writev` move several buffers in one call, as musl's
 `printf` and the like do. For now:
 
 - every id is 0, and can't be set to another, as there are no other users;
-- limits are kept and reported, not enforced: a program has the 1024
-  descriptors and 256 KiB of stack there are, whatever it sets;
+  what `setgroups` sets is forgotten;
+- limits and niceness are kept and reported, not enforced: a program has the
+  1024 descriptors and 256 KiB of stack there are, whatever it sets, and the
+  same turns at the CPU as any other;
 
 - `fork` copies all of a program's memory at once, rather than sharing it
   until either side writes to it;
@@ -169,8 +175,7 @@ inherit. `readv` and `writev` move several buffers in one call, as musl's
   parent back;
 - a program that ended keeps its memory until it's waited for, and those
   never waited for go with their parent rather than to an init;
-- `execve` takes ELF programs of up to 4 MiB, which it reads whole, and not
-  scripts: shells run those themselves when told `ENOEXEC`.
+- `execve` takes ELF programs of up to 4 MiB, which it reads whole.
 
 ## Terminal
 

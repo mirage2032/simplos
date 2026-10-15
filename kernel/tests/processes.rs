@@ -107,11 +107,12 @@ fn execve_refuses_what_isnt_a_program() {
     let refused = |path, error| (path, failed(path, error));
     for (path, expected) in [
         refused("/missing", "No such file or directory (os error 2)"),
-        // Not executable, a directory, and executable but not ELF.
+        // Not executable, a directory, and a script whose interpreter,
+        // /bin/sh, isn't there.
         refused("/hello.txt", "Permission denied (os error 13)"),
         refused("/dir", "Permission denied (os error 13)"),
         refused("/dev/null", "Permission denied (os error 13)"),
-        refused("/bin/script", "Exec format error (os error 8)"),
+        refused("/bin/script", "No such file or directory (os error 2)"),
     ] {
         assert_eq!(run(&["exec", path]), expected, "{path}");
     }
@@ -158,4 +159,26 @@ fn a_program_learns_about_the_system_and_itself() {
         env!("CARGO_PKG_VERSION")
     );
     assert_eq!(run(&["system"]), ok(&expected));
+}
+
+#[test_case]
+fn a_script_runs_through_what_its_first_line_names() {
+    // With the line's argument, the script's path as it was given, and its
+    // own arguments; through a script naming another; and a loop (ELOOP),
+    // no interpreter, a missing one, and no #! at all.
+    let expected = r#"["env", "/script", "a"] | ["env", "/spaced", "a"] | ["env", "/script", "/outer", "a"] | 40 | 8 | 2 | 8 | ["env", "./script", "a"]"#;
+    assert_eq!(run(&["scripts"]), ok(&(String::from(expected) + "\n")));
+}
+
+#[test_case]
+fn a_program_learns_about_the_machine_and_how_nice_it_is() {
+    // sysinfo's uptime, memory, processes and unit; no groups besides its
+    // own, getgroups refusing a negative count; nice set by process and by
+    // group, kept within -20 to 19, inherited, and refused for no such
+    // `which` (EINVAL) and no such process (ESRCH); sched_yield.
+    assert_eq!(
+        run(&["machine"]),
+        ok("0 [true, true, true, true] [0, 0, -22] [20, 0, 15, 0, 23, 0, 1, -22, -3] \
+            exit status: 15 0\n")
+    );
 }
