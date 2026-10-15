@@ -4,8 +4,9 @@
 //! report a result except to the machine they are running on. So cargo cannot
 //! run them directly, and this stands in as its `runner` (wired up in
 //! `kernel/.cargo/config.toml`). It wraps the ELF in a BIOS and a UEFI disk
-//! image, boots each under QEMU, and turns how the guest shut itself down back
-//! into an exit code cargo understands: a pass only if both runs passed.
+//! image, boots both at once under QEMU, and turns how the guest shut itself
+//! down back into an exit code cargo understands: a pass only if both runs
+//! passed. `SIMPLOS_FIRMWARE=bios` (or `uefi`) boots just the one.
 //!
 //! The guest's half of that conversation is `isa-debug-exit`: a device whose
 //! only function is that writing to its port makes QEMU exit with a status
@@ -13,9 +14,10 @@
 //! it at the end of a passing run.
 
 use std::error::Error;
-use std::io;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::{Command, ExitCode, Stdio};
+use std::sync::mpsc::{self, Sender};
 use std::time::{Duration, Instant};
 
 /// Long enough for a slow interpreted boot on a loaded CI runner, short enough
@@ -57,25 +59,60 @@ fn main() -> ExitCode {
     };
 
     // Both, even when the first fails: which firmware a failure shows up
-    // under is half of the diagnosis.
-    let mut passed = true;
-    for firmware in [Firmware::Bios, Firmware::Uefi] {
-        println!("boot-test: {} under {}", kernel.display(), firmware.name());
-        passed &= run(&kernel, firmware).unwrap_or_else(|error| {
-            eprintln!("boot-test: {} ({}): {error}", kernel.display(), firmware.name());
-            false
-        });
-    }
+    // under is half of the diagnosis. Unless asked for just one, as when
+    // checking that a change to the kernel fails a test.
+    let firmwares = match std::env::var("SIMPLOS_FIRMWARE").map(|name| name.to_lowercase()) {
+        Err(_) => vec![Firmware::Bios, Firmware::Uefi],
+        Ok(name) if name == "bios" => vec![Firmware::Bios],
+        Ok(name) if name == "uefi" => vec![Firmware::Uefi],
+        Ok(name) => {
+            eprintln!("boot-test: SIMPLOS_FIRMWARE is bios or uefi, not {name}");
+            return ExitCode::from(2);
+        }
+    };
+    // At once, as each is a QEMU of its own; what each says is shown in turn,
+    // the first's as it comes and the next's once the first is done.
+    let kernel = &kernel;
+    let passed = std::thread::scope(|scope| {
+        let runs: Vec<_> = firmwares
+            .into_iter()
+            .map(|firmware| {
+                let (output, said) = mpsc::channel();
+                (firmware, said, scope.spawn(move || run(kernel, firmware, output)))
+            })
+            .collect();
+        let mut passed = true;
+        for (firmware, said, run) in runs {
+            println!("boot-test: {} under {}", kernel.display(), firmware.name());
+            for bytes in said {
+                let mut stdout = io::stdout().lock();
+                let _ = stdout.write_all(&bytes).and_then(|()| stdout.flush());
+            }
+            if let Err(why) = run.join().expect("a run doesn't panic") {
+                eprintln!("boot-test: {} ({}): {why}", kernel.display(), firmware.name());
+                passed = false;
+            }
+        }
+        passed
+    });
     if passed { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }
 
-/// One boot of `kernel` under `firmware`: whether the guest reported a pass.
-fn run(kernel: &Path, firmware: Firmware) -> Result<bool, Box<dyn Error>> {
+/// One boot of `kernel` under `firmware`, what it writes to its serial port
+/// sent to `output` as it comes: whether the guest reported a pass, and if
+/// not, why.
+fn run(
+    kernel: &Path,
+    firmware: Firmware,
+    output: Sender<Vec<u8>>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let name = firmware.name();
     // Beside the ELF, inside cargo's target directory: writable, cleaned up by
     // `cargo clean`, and left in place afterwards so a failing test can be
-    // booted by hand with the exact image that failed.
-    let image = kernel.with_extension(format!("{}.img", name.to_lowercase()));
+    // booted by hand with the exact image that failed. Each firmware's own, as
+    // both run at once.
+    let file = |what: &str| kernel.with_extension(format!("{}.{what}", name.to_lowercase()));
+    let image = file("img");
     let probe = PathBuf::from(env!("CARGO_BIN_FILE_PROBE_probe"));
     match firmware {
         Firmware::Bios => {
@@ -88,14 +125,14 @@ fn run(kernel: &Path, firmware: Firmware) -> Result<bool, Box<dyn Error>> {
     // Blank scratch disks for tests/disk.rs to write to, one per controller
     // kind, sized differently so the test can tell which is which. Recreated
     // each run, so nothing a test wrote survives into the next.
-    let ata_scratch = kernel.with_extension("ata.img");
-    let ahci_scratch = kernel.with_extension("ahci.img");
+    let ata_scratch = file("ata.img");
+    let ahci_scratch = file("ahci.img");
     for (path, size) in [(&ata_scratch, 1 << 20), (&ahci_scratch, 2 << 20)] {
         std::fs::File::create(path)?.set_len(size)?;
     }
     // And an ext4 one, made by Linux's own mke2fs and checked afterwards by
     // its e2fsck, for what the kernel's file system code does to it.
-    let ext4_scratch = kernel.with_extension("ext4.img");
+    let ext4_scratch = file("ext4.img");
     make_ext4(&ext4_scratch)?;
 
     let mut qemu = Command::new("qemu-system-x86_64");
@@ -120,22 +157,32 @@ fn run(kernel: &Path, firmware: Firmware) -> Result<bool, Box<dyn Error>> {
         // one we meant rather than quietly testing the same path twice.
         .arg("-fw_cfg")
         .arg(format!("name=opt/simplos/firmware,string={name}"))
-        // Test output is `serial_println!`, and cargo shows it for a test that
-        // fails.
+        // Test output is `serial_println!`, passed on as it comes.
         .args(["-serial", "stdio"])
         .args(["-display", "none"])
         // Never KVM: these run on CI, and a test that only passes with hardware
         // virtualisation is worse than no test.
         .args(["-accel", "tcg", "-cpu", "qemu64", "-m", "128M"])
         // A triple fault should end the run, not restart it into a loop.
-        .arg("-no-reboot");
+        .arg("-no-reboot")
+        // No network card: the kernel has no driver for one, and both
+        // firmwares spend seconds starting the boot ROM QEMU gives it.
+        .args(["-nic", "none"]);
 
-    let mut child = qemu.spawn().map_err(|error| {
+    // Nothing to read from stdin: two at once mustn't both take the terminal.
+    let mut child = qemu.stdin(Stdio::null()).stdout(Stdio::piped()).spawn().map_err(|error| {
         io::Error::new(
             error.kind(),
             format!("couldn't start qemu-system-x86_64 ({error}); is QEMU installed?"),
         )
     })?;
+    let mut serial = child.stdout.take().expect("piped");
+    std::thread::spawn(move || {
+        let mut chunk = [0; 4096];
+        while let Ok(read @ 1..) = serial.read(&mut chunk) {
+            let _ = output.send(chunk[..read].to_vec());
+        }
+    });
 
     let started = Instant::now();
     let status = loop {
@@ -145,40 +192,20 @@ fn run(kernel: &Path, firmware: Firmware) -> Result<bool, Box<dyn Error>> {
         if started.elapsed() > TIMEOUT {
             child.kill()?;
             child.wait()?;
-            eprintln!(
-                "boot-test: {} ({name}) did not finish within {}s",
-                kernel.display(),
-                TIMEOUT.as_secs()
-            );
-            return Ok(false);
+            return Err(format!("did not finish within {}s", TIMEOUT.as_secs()).into());
         }
         std::thread::sleep(Duration::from_millis(50));
     };
 
-    Ok(match status.code() {
+    match status.code() {
         Some(GUEST_SUCCESS) => check_ext4(&ext4_scratch)
-            .map_err(|problems| {
-                eprintln!("boot-test: {} ({name}), its ext4 disk:\n{problems}", kernel.display())
-            })
-            .is_ok(),
-        Some(GUEST_FAILED) => {
-            eprintln!("boot-test: {} ({name}) reported a failure", kernel.display());
-            false
-        }
+            .map_err(|problems| format!("its ext4 disk:\n{problems}").into()),
+        Some(GUEST_FAILED) => Err("reported a failure".into()),
         // Anything else is the guest dying on its own terms — a triple fault, a
         // QEMU error, or a kill signal — none of which is a pass.
-        other => {
-            eprintln!(
-                "boot-test: {} ({name}) exited unexpectedly ({})",
-                kernel.display(),
-                match other {
-                    Some(code) => format!("status {code}"),
-                    None => "killed by a signal".to_owned(),
-                }
-            );
-            false
-        }
-    })
+        Some(code) => Err(format!("exited unexpectedly (status {code})").into()),
+        None => Err("exited unexpectedly (killed by a signal)".into()),
+    }
 }
 
 /// e2fsprogs lives in /sbin, which isn't on every user's PATH.
@@ -194,7 +221,7 @@ const EXT4_TREE: &[(&str, &str)] =
 /// A 16 MiB ext4 file system holding `EXT4_TREE`, as Linux makes them, and in
 /// /bin, user/probe for programs to run, and a file marked executable that
 /// isn't a program.
-fn make_ext4(image: &Path) -> Result<(), Box<dyn Error>> {
+fn make_ext4(image: &Path) -> Result<(), Box<dyn Error + Send + Sync>> {
     use std::os::unix::fs::PermissionsExt;
     let tree = image.with_extension("tree");
     let _ = std::fs::remove_dir_all(&tree);

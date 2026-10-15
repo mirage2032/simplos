@@ -31,7 +31,7 @@ use bootloader_api::BootInfo;
 use bootloader_api::config::{BootloaderConfig, Mapping};
 use bootloader_api::info::{MemoryRegionKind, MemoryRegions};
 use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use io::utils::qemu::{QemuExitCode, exit_qemu};
 use x86_64::VirtAddr;
 
@@ -209,8 +209,30 @@ where
 {
     fn run(&self) {
         serial_print!("{}...\t", core::any::type_name::<T>());
+        let limit = TEST_LIMIT_SECONDS * u64::from(io::interrupts::pit::TIMER_HZ);
+        TEST_DEADLINE.store(thread::ticks() + limit, Ordering::Relaxed);
         self();
+        TEST_DEADLINE.store(0, Ordering::Relaxed);
         serial_println!("[ok]");
+    }
+}
+
+/// How long one test may take before it's taken to hang. The slowest takes
+/// under 5 s under emulation; much past that, it's waiting for what won't
+/// come.
+const TEST_LIMIT_SECONDS: u64 = 30;
+
+/// The tick the test running has to be done by; 0 between tests.
+static TEST_DEADLINE: AtomicU64 = AtomicU64::new(0);
+
+/// Called as the timer ticks: a test past its deadline fails there and then,
+/// rather than hanging until boot-test gives up on its kernel.
+pub fn check_test_deadline(now: u64) {
+    let deadline = TEST_DEADLINE.load(Ordering::Relaxed);
+    if deadline != 0 && now >= deadline {
+        serial_println!("[failed]\n");
+        serial_println!("Error: not done after {} s\n", TEST_LIMIT_SECONDS);
+        exit_qemu(QemuExitCode::Failed);
     }
 }
 
