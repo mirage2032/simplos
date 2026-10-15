@@ -12,6 +12,11 @@
 //! only function is that writing to its port makes QEMU exit with a status
 //! derived from the value written. `simplos::io::utils::qemu::exit_qemu` writes
 //! it at the end of a passing run.
+//!
+//! A kernel whose file name starts with `shells` (`tests/shells.rs`) gets the
+//! userland on its ext4 disk too, busybox and zsh, which `scripts/userland.sh`
+//! builds the first time; the others' tests list that disk and expect only
+//! what's theirs.
 
 use std::error::Error;
 use std::io::{self, Read, Write};
@@ -70,15 +75,24 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let userland =
+        kernel.file_name().is_some_and(|name| name.to_string_lossy().starts_with("shells"));
+    let userland = match userland.then(build_userland).transpose() {
+        Ok(userland) => userland,
+        Err(why) => {
+            eprintln!("boot-test: {}: the userland: {why}", kernel.display());
+            return ExitCode::FAILURE;
+        }
+    };
     // At once, as each is a QEMU of its own; what each says is shown in turn,
     // the first's as it comes and the next's once the first is done.
-    let kernel = &kernel;
+    let (kernel, userland) = (&kernel, userland.as_deref());
     let passed = std::thread::scope(|scope| {
         let runs: Vec<_> = firmwares
             .into_iter()
             .map(|firmware| {
                 let (output, said) = mpsc::channel();
-                (firmware, said, scope.spawn(move || run(kernel, firmware, output)))
+                (firmware, said, scope.spawn(move || run(kernel, userland, firmware, output)))
             })
             .collect();
         let mut passed = true;
@@ -98,11 +112,24 @@ fn main() -> ExitCode {
     if passed { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }
 
-/// One boot of `kernel` under `firmware`, what it writes to its serial port
-/// sent to `output` as it comes: whether the guest reported a pass, and if
-/// not, why.
+/// The tree `scripts/userland.sh` builds, built if it isn't yet.
+fn build_userland() -> Result<PathBuf, String> {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let status = Command::new(repository.join("scripts/userland.sh"))
+        .status()
+        .map_err(|error| format!("couldn't run scripts/userland.sh: {error}"))?;
+    match status.success() {
+        true => Ok(repository.join("target/userland/root")),
+        false => Err(format!("scripts/userland.sh failed ({status})")),
+    }
+}
+
+/// One boot of `kernel` under `firmware`, with `userland` on its ext4 disk
+/// if given, what it writes to its serial port sent to `output` as it comes:
+/// whether the guest reported a pass, and if not, why.
 fn run(
     kernel: &Path,
+    userland: Option<&Path>,
     firmware: Firmware,
     output: Sender<Vec<u8>>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -133,7 +160,7 @@ fn run(
     // And an ext4 one, made by Linux's own mke2fs and checked afterwards by
     // its e2fsck, for what the kernel's file system code does to it.
     let ext4_scratch = file("ext4.img");
-    make_ext4(&ext4_scratch)?;
+    make_ext4(&ext4_scratch, userland)?;
 
     let mut qemu = Command::new("qemu-system-x86_64");
     if let Firmware::Uefi = firmware {
@@ -223,9 +250,9 @@ const EXT4_TREE: &[(&str, &str)] =
     &[("hello.txt", "hello from ext4\n"), ("dir/nested/deep.txt", "deep\n")];
 
 /// A 16 MiB ext4 file system holding `EXT4_TREE`, as Linux makes them, and in
-/// /bin, user/probe for programs to run, and a file marked executable that
-/// isn't a program.
-fn make_ext4(image: &Path) -> Result<(), Box<dyn Error + Send + Sync>> {
+/// /bin, user/probe for programs to run, and a script whose interpreter isn't
+/// there. With `userland`'s tree too, 64 MiB, and /bin/sh is.
+fn make_ext4(image: &Path, userland: Option<&Path>) -> Result<(), Box<dyn Error + Send + Sync>> {
     use std::os::unix::fs::PermissionsExt;
     let tree = image.with_extension("tree");
     let _ = std::fs::remove_dir_all(&tree);
@@ -239,11 +266,18 @@ fn make_ext4(image: &Path) -> Result<(), Box<dyn Error + Send + Sync>> {
     let script = tree.join("bin/script");
     std::fs::write(&script, "#!/bin/sh\necho a script\n")?;
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+    if let Some(userland) = userland {
+        // Links and modes as they are.
+        let copied = Command::new("cp").arg("-a").arg(userland.join(".")).arg(&tree).status()?;
+        if !copied.success() {
+            return Err(format!("couldn't copy {} ({copied})", userland.display()).into());
+        }
+    }
     let output = e2fsprogs("mke2fs")
         .args(["-q", "-F", "-t", "ext4", "-d"])
         .arg(&tree)
         .arg(image)
-        .arg("16M")
+        .arg(if userland.is_some() { "64M" } else { "16M" })
         .output()
         .map_err(|error| format!("couldn't run mke2fs ({error}); is e2fsprogs installed?"))?;
     if !output.status.success() {

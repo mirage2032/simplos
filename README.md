@@ -288,7 +288,33 @@ cargo run -- -fw_cfg name=opt/simplos/init,string="/bin/probe colors"
 
 When there's none, or once it ends, which on Linux would stop everything,
 the kernel's own shell runs instead, and its `run /PATH ARGS` runs a program
-from the disk.
+from the disk. With the userland below on the disk, the first program is
+busybox's `/bin/sh`.
+
+## Userland
+
+`scripts/userland.sh` builds the programs that make a disk a system to use:
+busybox 1.38.0, with a link for each of its applets where Linux keeps them
+(`/bin/sh`, `/bin/ls`, `/usr/bin/awk` and the rest), and zsh 5.9.2 with its
+shell functions, on ncurses 6.6 with the terminals it knows built in; and
+`/etc/passwd`, `/etc/group` and `/etc/shells`, which make zsh root's shell.
+They're static programs for x86-64 Linux, linked with musl by zig cc 0.17.0,
+from the sources the script pins and checks by their SHA-256, into
+`target/userland/root`. The first build takes a few minutes and needs the
+network; after that it's done, until the script changes. It builds on x86-64
+Linux only.
+
+`cargo run`'s disk gets them as it's made: delete `fullkernel/disk.img` for
+one that has them. Then `zsh` at busybox's prompt runs zsh. For now:
+
+- busybox is built without `init`, which the kernel would run first, and
+  which wants a console and an `inittab` there aren't; and without `tc`;
+- there's no `/proc`, so `ps`, `top`, `df` and `mount` have nothing to say,
+  nor `/dev/fd`, which zsh's `<(...)` needs.
+
+busybox is GPL-2.0, as simplos is; zsh and ncurses are MIT-style. A disk
+made with them holds their programs, built from the upstream releases the
+script names, unchanged, configured as it says.
 
 ## Tests
 
@@ -310,7 +336,9 @@ the user program as `/bin/probe`, which `tests/processes.rs` has it start
 copies of and run again; `tests/tty.rs` types into a terminal for it to read;
 `tests/signals.rs` has it send signals to itself and its copies;
 `tests/time.rs` has it read the clocks, count CPU time and set alarms.
-After a run that passes, e2fsck must find nothing wrong with it, and it must have been
+`tests/shells.rs` runs busybox's sh and zsh, as commands and typed at on a
+terminal: its disk is 64 MiB and holds the userland too, which the runner
+builds with `scripts/userland.sh` the first time. After a run that passes, e2fsck must find nothing wrong with it, and it must have been
 unmounted, so the tests need e2fsprogs installed.
 
 Each test boots twice, under BIOS and UEFI at once, and passes only if it
@@ -357,7 +385,7 @@ the right firmware and the right framebuffer mode.
 | `vendor/ps2/` | the `ps2` crate, with its `x86_64` dependency bumped. |
 | `fs/ext4/` | ext4 (and ext3 and ext2) file systems, read and written with a journal: a Rust interface over the vendored lwext4, tested on the host against e2fsprogs. |
 | `vendor/lwext4/` | [lwext4](https://github.com/gkostka/lwext4), the C library `fs/ext4` uses for now. |
-| `scripts/` | `build-images.sh`, `smoke-test.sh`, `boot-test.sh`. |
+| `scripts/` | `build-images.sh`, `smoke-test.sh`, `boot-test.sh`, `mutants.sh`, and `userland.sh`, which builds busybox and zsh for the disk. |
 
 There is no cargo workspace: `kernel` builds for `x86_64-unknown-none` with
 `build-std`, the host tools and `fs/ext4`'s tests build for the host, `user/probe` builds for

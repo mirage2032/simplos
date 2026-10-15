@@ -220,7 +220,7 @@ fn call(frame: &Frame) -> i64 {
         20 => files::writev(&process, a0, a1, a2),
         2 => files::open(&process, files::AT_FDCWD, a0, a1, a2),
         3 => files::close(&process, a0),
-        // stat and lstat: the same, as no symbolic link is followed yet.
+        // stat, and lstat, which doesn't follow a link at the end.
         4 => files::newfstatat(&process, files::AT_FDCWD, a0, a1, 0),
         6 => files::newfstatat(&process, files::AT_FDCWD, a0, a1, files::AT_SYMLINK_NOFOLLOW),
         5 => files::fstat(&process, a0, a1),
