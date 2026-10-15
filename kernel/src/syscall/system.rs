@@ -3,6 +3,7 @@
 //! and groups, which CPUs, how nice, and its resource limits.
 
 use super::files::{Result, ret};
+use super::signals::other;
 use super::{EFAULT, EINVAL, EPERM};
 use crate::process::{self, Process};
 use crate::{memory, time};
@@ -115,14 +116,6 @@ pub fn sched_getaffinity(process: &Process, pid: u64, len: u64, mask: u64) -> i6
         process.memory.lock().space.write(mask, &1u64.to_le_bytes()).ok_or(EFAULT)?;
         Ok(8)
     })())
-}
-
-/// The process `pid` names: `None` for the caller.
-fn other(pid: u64) -> Result<Option<Arc<Process>>> {
-    match pid {
-        0 => Ok(None),
-        pid => process::find(pid).map(Some).ok_or(ESRCH),
-    }
 }
 
 /// How many resources `RLIMIT_*` numbers.

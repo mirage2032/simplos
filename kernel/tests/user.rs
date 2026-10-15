@@ -87,6 +87,20 @@ fn bad_system_calls_are_refused() {
 }
 
 #[test_case]
+fn memory_calls_keep_to_the_program_s_half_and_give_back_what_they_fail_to_get() {
+    // The last page of the lower half, which munmap, mprotect and mmap
+    // refuse, as Linux's do, and the kernel's half: the end of that page
+    // isn't an address, and making it one stopped the kernel. Then a
+    // gigabyte, more than the test machine has, which mmap and brk refuse
+    // without keeping a page of what they took; and a megabyte, which
+    // there still is.
+    assert_eq!(
+        run(&["memory-edges"]),
+        (0, String::from("[-22, -22, -22, -22] -12 0 true 0 true\n"))
+    );
+}
+
+#[test_case]
 fn programs_keep_their_registers_to_themselves() {
     // Two at once, each preempted many times with its sum in SSE registers
     // and Rust's thread-locals behind `fs`: unless every switch puts both

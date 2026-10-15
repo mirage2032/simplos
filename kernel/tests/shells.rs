@@ -280,6 +280,31 @@ fn busybox_sh_is_typed_at() {
 }
 
 #[test_case]
+fn busybox_sh_s_read_ends_for_a_signal() {
+    // ^C, and a signal it traps, end `read` waiting for a line, as on
+    // Linux, though busybox blocks every signal but while it waits, in
+    // ppoll.
+    let (status, screen) = session(
+        &["/bin/sh", "-i"],
+        &[
+            Shown("~ # "),
+            Typed("echo waiting; read x; echo read $?\r"),
+            Shown("\r\nwaiting\r\n"),
+            Typed("\x03"),
+            Shown("~ # "),
+            Typed("echo status $?\r"),
+            Shown("status 130"),
+            Shown("~ # "),
+            Typed("trap 'echo trapped' USR1; (sleep 0.2; kill -USR1 $$) & read x; echo read $?\r"),
+            Shown("\r\ntrapped\r\nread 1\r\n"),
+            Shown("~ # "),
+            Typed("exit\r"),
+        ],
+    );
+    assert_eq!(status, 0, "{screen}");
+}
+
+#[test_case]
 fn the_first_program_is_root_s_zsh() {
     // /sbin/init, a script, logs root in to zsh, which reads /etc/zshrc:
     // its prompt; root's home; a command and a file name completed; one

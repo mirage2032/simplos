@@ -48,7 +48,7 @@ fn alarms() {
                 let mut alarm = program.alarm.lock();
                 let due = alarm.due != 0 && alarm.due <= now;
                 if due {
-                    alarm.due = if alarm.every == 0 { 0 } else { now + alarm.every };
+                    alarm.due = if alarm.every == 0 { 0 } else { now.saturating_add(alarm.every) };
                 }
                 due
             };

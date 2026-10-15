@@ -107,3 +107,20 @@ fn process_groups_and_sessions() {
 fn a_handler_runs_on_the_alternate_stack() {
     assert_eq!(run(&["altstack"]), ok("0 true 1 0\n"));
 }
+
+#[test_case]
+fn ppoll_lets_signals_through_only_while_it_waits() {
+    // As busybox's shells wait in `read`, every signal blocked: SIGALRM ends
+    // the wait, EINTR, and its handler's frame and then the program have
+    // every signal blocked again; input ready, the same; and a mask of the
+    // wrong size, EINVAL.
+    assert_eq!(run(&["ppoll"]), ok("-4 1 true true 1 true -22\n"));
+}
+
+#[test_case]
+fn a_signal_whose_stack_is_past_the_end_of_memory_ends_the_program() {
+    // Its handler's alternate stack ends past the last address there is:
+    // no frame fits, so SIGSEGV, as on Linux, and not the kernel stopped
+    // on adding its size up.
+    assert_eq!(run(&["far-altstack"]), ok("signal: 11\n"));
+}

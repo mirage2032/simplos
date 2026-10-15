@@ -54,6 +54,17 @@ pub const AT_REMOVEDIR: u64 = 0x200;
 /// as it may, and can't empty the kernel's heap.
 const MOST: usize = 1 << 20;
 
+/// The most a write to `fd` moves: `MOST`, but into a pipe what it holds. A
+/// writer waits there for as long as the reader likes, with what it writes
+/// in the kernel's heap meanwhile, and a few of them at `MOST` would empty
+/// it.
+fn most_written(process: &Process, fd: u64) -> usize {
+    match handle(process, fd).as_deref() {
+        Ok(Handle::Pipe { .. }) => pipe::CAPACITY,
+        _ => MOST,
+    }
+}
+
 /// Descriptors a program can have open at once.
 pub(super) const MOST_FILES: usize = 1024;
 
@@ -288,9 +299,10 @@ pub fn readv(process: &Process, fd: u64, iov: u64, count: u64) -> i64 {
 /// takes it whole or not at all, as for `write`.
 pub fn writev(process: &Process, fd: u64, iov: u64, count: u64) -> i64 {
     ret((|| {
+        let most = most_written(process, fd);
         let mut data = Vec::new();
         for (base, len) in iovecs(process, iov, count)? {
-            let len = (len as usize).min(MOST - data.len());
+            let len = (len as usize).min(most - data.len());
             let start = data.len();
             data.resize(start + len, 0);
             process.memory.lock().space.read(base, &mut data[start..]).ok_or(EFAULT)?;
@@ -396,7 +408,7 @@ fn read_data(process: &Process, fd: u64, count: u64, at: Option<u64>) -> Result<
 
 /// Write at `at`, or else at the descriptor's place, and move it on.
 fn write_at(process: &Process, fd: u64, buf: u64, count: u64, at: Option<u64>) -> Result<i64> {
-    let mut data = vec![0; (count as usize).min(MOST)];
+    let mut data = vec![0; (count as usize).min(most_written(process, fd))];
     process.memory.lock().space.read(buf, &mut data).ok_or(EFAULT)?;
     write_data(process, fd, &data, at)
 }
@@ -908,9 +920,10 @@ pub fn fsync(process: &Process, fd: u64) -> i64 {
     ret(handle(process, fd).and_then(|_| fs::lock().sync().map(|()| 0).map_err(fs::errno)))
 }
 
-/// As `fsync`, which can't fail.
+/// As `fsync`, which can't fail: what it couldn't write, the next `fsync`
+/// is told.
 pub fn sync() -> i64 {
-    let _ = fs::lock().sync();
+    fs::lock().flush();
     0
 }
 
@@ -1095,7 +1108,8 @@ pub fn sendfile(process: &Process, out_fd: u64, in_fd: u64, offset: u64, count: 
                 Some(at(u64::from_le_bytes(place))?)
             }
         };
-        let data = read_data(process, in_fd, count, at)?;
+        let most = most_written(process, out_fd) as u64;
+        let data = read_data(process, in_fd, count.min(most), at)?;
         let written = write_data(process, out_fd, &data, None);
         let sent = *written.as_ref().unwrap_or(&0) as u64;
         match at {

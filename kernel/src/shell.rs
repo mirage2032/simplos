@@ -24,7 +24,7 @@ commands:
   echo TEXT     print TEXT
   boot          firmware we booted from
   cpu           processor brand and vendor
-  time          RTC time (unix seconds)
+  time          the time of day (unix seconds)
   uptime        timer ticks and HPET time since boot
   disks         disks found at boot
   ls [PATH]     list a directory: the ext4 disk's, or /dev
@@ -150,7 +150,7 @@ fn cpu() -> String {
 }
 
 fn time() -> String {
-    format!("RTC: {}", x86_rtc::Rtc::new().get_unix_timestamp())
+    format!("Time: {}", crate::time::now() / crate::time::NANOS)
 }
 
 fn uptime() -> String {

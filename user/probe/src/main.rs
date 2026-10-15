@@ -56,6 +56,27 @@ fn main() {
             let closed = syscall(3, 1000, 0, 0);
             println!("{bad_path} {bad_buf} {small} {read_dir} {closed}");
         }
+        // Memory at the edges: the last page of the lower half, which
+        // nothing may map, unmap or protect, and the kernel's half; then a
+        // gigabyte, more than there is, from mmap and from brk, which give
+        // back what they took in failing; and a megabyte, which there is.
+        Some("memory-edges") => {
+            let top = 0x7FFF_FFFF_F000;
+            let edges = [
+                syscall(11, top, 4096, 0),
+                syscall(10, top, 4096, 1),
+                syscall5(9, [top, 4096, 3, 0x32, 0]),
+                syscall5(9, [0xFFFF_8000_0000_0000, 4096, 3, 0x32, 0]),
+            ];
+            let before = rss();
+            let mapped = syscall5(9, [0, 1 << 30, 3, 0x22, 0]);
+            let kept = rss() - before;
+            let heap = syscall(12, 0, 0, 0);
+            let refused = syscall(12, heap as usize + (1 << 30), 0, 0) == heap;
+            let kept_by_brk = rss() - before;
+            let megabyte = syscall5(9, [0, 1 << 20, 3, 0x22, 0]) > 0;
+            println!("{edges:?} {mapped} {kept} {refused} {kept_by_brk} {megabyte}");
+        }
         Some("exit") => std::process::exit(arg(2).parse().unwrap_or(0)),
         Some("mkdir") => or_fail(&arg(2), fs::create_dir(arg(2))),
         Some("mkdir-p") => or_fail(&arg(2), fs::create_dir_all(arg(2))),
@@ -112,6 +133,32 @@ fn main() {
             let mut fds = [0i32; 2];
             let unknown = syscall(293, fds.as_mut_ptr() as usize, 0o1, 0);
             println!("{closed} {far} {kernel} {unknown}");
+        }
+        // COUNT copies writing a megabyte each into a pipe that's full and
+        // that no one reads, waiting, until they're killed: how many were.
+        Some("pipe-writers") => {
+            let count: usize = arg(2).parse().unwrap_or(16);
+            let (_reader, writer) = or_fail("pipe", io::pipe());
+            or_fail("pipe", (&writer).write_all(&[0; 64 << 10]));
+            let (mut ready, ready_writer) = or_fail("pipe", io::pipe());
+            let children: Vec<isize> = (0..count)
+                .map(|_| {
+                    let child = syscall(57, 0, 0, 0);
+                    if child == 0 {
+                        let megabyte = vec![1u8; 1 << 20];
+                        or_fail("pipe", (&ready_writer).write_all(b"r"));
+                        let fd = writer.as_raw_fd() as usize;
+                        syscall(1, fd, megabyte.as_ptr() as usize, megabyte.len());
+                        std::process::exit(0);
+                    }
+                    child
+                })
+                .collect();
+            or_fail("pipe", ready.read_exact(&mut vec![0; count]));
+            std::thread::sleep(Duration::from_millis(200));
+            children.iter().for_each(|&child| _ = kill(child, SIGKILL));
+            let killed = children.iter().filter(|&&child| wait(child).1 == "signal: 9").count();
+            println!("{killed}");
         }
         // O_NONBLOCK: an empty pipe read, a pipe written until it's full,
         // F_GETFL of its writing end; then standard input made not to wait,
@@ -595,6 +642,46 @@ fn main() {
             let on_it = range.contains(&WHERE.load(Ordering::SeqCst));
             println!("{set} {on_it} {} {}", ALT_FLAGS.load(Ordering::SeqCst), after[1]);
         }
+        // An alternate stack at the very end of memory, where no frame fits:
+        // a copy sent a signal for a handler there ends with SIGSEGV.
+        Some("far-altstack") => {
+            let child = syscall(57, 0, 0, 0);
+            if child == 0 {
+                let given = [u64::MAX - 0xFFF, 0, 0x10000];
+                let set = syscall(131, given.as_ptr() as usize, 0, 0);
+                sigaction(SIGUSR1, record, SA_SIGINFO | SA_ONSTACK);
+                kill(getpid(), SIGUSR1);
+                std::process::exit(if set == 0 { 0 } else { 1 });
+            }
+            println!("{}", wait(child).1);
+        }
+        // ppoll as busybox's shells wait in `read`: with every signal
+        // blocked but while it waits, so one that comes then ends it, with
+        // EINTR, and the mask from before back once its handler's done. One
+        // that finds input ready puts it back too; and a mask of the wrong
+        // size is refused.
+        Some("ppoll") => {
+            sigaction(SIGALRM, record, SA_SIGINFO);
+            let (reader, mut writer) = or_fail("pipe", io::pipe());
+            sigprocmask(SIG_BLOCK, !0);
+            let all = sigprocmask(SIG_BLOCK, 0);
+            let none = 0u64;
+            let mut entry = [reader.as_raw_fd(), 1];
+            let ppoll = |entry: &mut [i32; 2], size: usize| {
+                let mask = &raw const none as usize;
+                syscall5(271, [entry.as_mut_ptr() as usize, 1, 0, mask, size])
+            };
+            syscall(38, 0, [0u64, 0, 0, 50_000].as_ptr() as usize, 0);
+            let waited = ppoll(&mut entry, 8);
+            let caught = CAUGHT.load(Ordering::SeqCst);
+            let restored = sigprocmask(SIG_BLOCK, 0) == all;
+            let saved = MASK.load(Ordering::SeqCst) == all;
+            or_fail("pipe", writer.write_all(b"x"));
+            let ready = ppoll(&mut entry, 8);
+            let kept = sigprocmask(SIG_BLOCK, 0) == all;
+            let wrong_size = ppoll(&mut entry, 4);
+            println!("{waited} {caught} {restored} {saved} {ready} {kept} {wrong_size}");
+        }
         // Wait for SIGINT or SIGQUIT, from a terminal: which came, and
         // whether from the kernel.
         Some("catch") => {
@@ -941,6 +1028,24 @@ fn main() {
                 (9..=10).contains(&left[2])
             );
         }
+        // Alarms too far off to count to: one that never comes, and is
+        // still far off a while later; and one that comes once, then
+        // repeats as far apart.
+        Some("far-alarms") => {
+            sigaction(SIGALRM, record, SA_SIGINFO);
+            let never = [0u64, 0, i64::MAX as u64, 0];
+            let set = syscall(38, 0, never.as_ptr() as usize, 0);
+            std::thread::sleep(Duration::from_millis(50));
+            let none = CAUGHT.load(Ordering::SeqCst);
+            let mut left = [0u64; 4];
+            syscall(36, 0, left.as_mut_ptr() as usize, 0);
+            let once = [i64::MAX as u64, 0, 0, 10_000];
+            syscall(38, 0, once.as_ptr() as usize, 0);
+            std::thread::sleep(Duration::from_millis(100));
+            let one = CAUGHT.load(Ordering::SeqCst);
+            syscall(38, 0, [0u64; 4].as_ptr() as usize, 0);
+            println!("{set} {none} {} {one}", left[2] > 1 << 32);
+        }
         // Symbolic links: made and read back, followed, and lstat'd as
         // themselves; through a directory, after which `..` is the
         // directory's parent, not the link's; one that leads nowhere, which
@@ -1170,16 +1275,6 @@ fn main() {
         // unmaps it again, and its name; and statfs and fstatfs of the
         // disk, which agree.
         Some("proc") => {
-            let rss = || {
-                let stat = or_fail("/proc/self/stat", fs::read_to_string("/proc/self/stat"));
-                // The 24th field, the 22nd after the name.
-                let after = stat.rsplit(')').next().unwrap_or_default();
-                after
-                    .split_whitespace()
-                    .nth(21)
-                    .and_then(|rss| rss.parse::<i64>().ok())
-                    .unwrap_or(-1)
-            };
             let before = rss();
             let addr = syscall5(9, [0, 1 << 20, 3, 0x22, 0]);
             let mapped = rss() - before;
@@ -1226,6 +1321,14 @@ fn raw_mode() -> [u8; 60] {
     (termios[17 + 6], termios[17 + 5]) = (1, 0);
     syscall(16, 0, TCSETS, termios.as_ptr() as usize);
     saved
+}
+
+/// The pages it has, as /proc/self/stat says.
+fn rss() -> i64 {
+    let stat = or_fail("/proc/self/stat", fs::read_to_string("/proc/self/stat"));
+    // The 24th field, the 22nd after the name.
+    let after = stat.rsplit(')').next().unwrap_or_default();
+    after.split_whitespace().nth(21).and_then(|rss| rss.parse().ok()).unwrap_or(-1)
 }
 
 /// What `result` holds, or else say what went wrong with `path`, and stop.

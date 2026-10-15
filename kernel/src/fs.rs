@@ -48,16 +48,15 @@ impl BlockDevice for Disk {
 pub fn init() {
     ext4::set_clock(|| (crate::time::now() / crate::time::NANOS) as u32);
     // Small writes wait in memory to be made as one (see `ext4`): a second
-    // at most, so the power going loses no more. Once, however often the
-    // disk is mounted again.
+    // at most, so the power going loses no more. If they can't be made, the
+    // program's next fsync is told. Once, however often the disk is mounted
+    // again.
     static WRITER: spin::Once = spin::Once::new();
     WRITER.call_once(|| {
         thread::spawn(|| {
             loop {
                 thread::sleep(1000);
-                if let Err(error) = lock().sync() {
-                    serial_println!("simplos: writing to the disk: {:?}", error);
-                }
+                lock().flush();
             }
         })
         .expect("memory for the disk's writer");
@@ -285,9 +284,18 @@ pub struct Tree<'a> {
 
 impl Tree<'_> {
     /// Write what waits in memory: once this returns, every change is on
-    /// the disk.
+    /// the disk; an error if any that waited couldn't be written, since the
+    /// last time this said.
     pub fn sync(&self) -> Result<(), Error> {
         self.disk.as_ref().map_or(Ok(()), Ext4::sync)
+    }
+
+    /// Write what waits in memory, as `sync` does, leaving telling whether
+    /// it could be to it.
+    pub fn flush(&self) {
+        if let Some(disk) = self.disk.as_ref() {
+            disk.flush();
+        }
     }
 
     /// What's at `path`, a path from the root.
@@ -530,7 +538,11 @@ pub fn read_program(path: &str) -> Result<Vec<u8>, i64> {
         return Err(ENOMEM);
     }
     let file = tree.disk(path).map_err(errno)?.open(path).map_err(errno)?;
-    let mut elf = alloc::vec![0; metadata.size as usize];
+    // As much as it may be, the heap may not have it to spare: then the
+    // program can't start, rather than the kernel stopping.
+    let mut elf = Vec::new();
+    elf.try_reserve_exact(metadata.size as usize).map_err(|_| ENOMEM)?;
+    elf.resize(metadata.size as usize, 0);
     let mut done = 0;
     while done < elf.len() {
         match file.read_at(done as u64, &mut elf[done..]).map_err(errno)? {

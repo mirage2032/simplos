@@ -38,9 +38,6 @@ pub fn clone(process: &Arc<Process>, mut child: Registers, flags: u64, stack: u6
 /// Replace the program with the one at `path`, given the `argv` and `envp`
 /// arrays: the registers to enter it with. Its descriptors stay open, but
 /// for those marked close-on-exec.
-///
-/// shortcut: ELF programs only; a script's `#!` line isn't followed, and
-/// shells run scripts themselves when told ENOEXEC.
 pub fn execve(process: &Process, path: u64, argv: u64, envp: u64) -> Result<Registers> {
     // What the strings and their pointers may take of the new stack.
     let mut room = 128 * 1024;
