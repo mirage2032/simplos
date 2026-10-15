@@ -99,7 +99,12 @@ cargo run -- -drive format=raw,file=disk.img
 ```
 
 Nothing unmounts it when QEMU is closed, which to the disk is a power cut:
-the next boot replays the journal, as Linux would. The work is done by
+the next boot replays the journal, as Linux would. Small writes to a file,
+one after another, wait in memory to be written as one, as each write
+costs the disk a handful of its own however little it writes: until
+anything else is done on the disk, the file is closed, a program calls
+`fsync`, `fdatasync`, `syncfs` or `sync`, or a second has passed, so the
+power going loses that second's at most. The work is done by
 `fs/ext4` (see below), behind a lock that sleeps whoever waits for it
 (`thread::SleepLock`), since a call can wait on the disk for a long time.
 The disk is trusted: lwext4 is C, parsing it in ring 0, and isn't fuzzed yet.
@@ -119,7 +124,8 @@ is free. In the shell, `run cat /hello.txt` has the user program read it, and
 
 `/proc` is made as it's read (`proc.rs`), with the files Linux has there
 that busybox's `free`, `ps`, `top`, `df` and `mount` read: `meminfo`,
-`uptime`, `loadavg`, `stat`, `mounts` and `version`; `self`, a link to the
+`uptime`, `loadavg`, `stat`, `mounts` and `version`; `diskstats`, each
+disk's reads and writes since boot; `self`, a link to the
 reader's own directory; and in each process's, its `stat`, `status`,
 `cmdline` and `comm`, and `fd`.
 
@@ -332,7 +338,8 @@ needs no new build:
 
 What the completion system knows of its 998 functions it keeps in
 `~/.zcompdump`, which the build makes for root, by running the same zsh:
-written on simplos, a line at a time, it took a minute.
+made on simplos, it takes half a minute, most of it reading the functions
+a byte at a time, each byte from the disk.
 
 `cargo run`'s disk gets all of it as it's made: delete `fullkernel/disk.img`
 for one that has it. Then zsh is what you type at, and once it ends, the
@@ -342,8 +349,9 @@ kernel's own shell. For now:
   which wants a console and an `inittab` there aren't; and without `tc`;
 - the disk's files belong to whoever made it, as `mke2fs -d` copies owners,
   which is why `/etc/zshrc` has `compinit -u`;
-- every write is a transaction of its own, on the disk before the call
-  returns, so a program writing a little at a time is slow.
+- what's read a little at a time is read from the disk each time, as
+  lwext4 keeps no file's data in memory, so zsh's `read`, which reads a
+  byte at a time, is slow.
 
 busybox is GPL-2.0, as simplos is; zsh and ncurses are MIT-style. A disk
 made with them holds their programs, built from the upstream releases the
@@ -492,8 +500,12 @@ transaction (it's two), remove a file over 16 MiB in one transaction, keep a
 file that's open once its last name is gone (it would free it under whoever
 has it open: `fs/ext4` gives it another name first), or leave a hole in a
 file (writing past the end fills the gap with zeros). A new file's permissions and times are
-set just after it's made, in a transaction of their own. Every change is on the device before the call
-returns, in the journal if there is one, which is simple and slow.
+set just after it's made, in a transaction of their own. Every call is a
+transaction of its own, in the journal before the call returns, where
+there's one: lwext4's cache then writes the blocks to their places in its
+own time (its write-back mode), or as the file system is unmounted. Without
+a journal, it writes them through. So `fs/ext4` holds a stream of small
+writes to a file, and makes them in one call.
 
 Building and running `fs/ext4`'s tests needs e2fsprogs (`mke2fs`, `e2fsck`,
 `debugfs`) and `gzip`. Every test that writes ends with `e2fsck -fn` on the

@@ -205,3 +205,13 @@ int simplos_ext4_read_only(const char *mount_point)
 		return 1;
 	return (ext4_get32(sb, features_read_only) & ~CONFIG_SUPPORTED_FRO_COM) != 0;
 }
+
+/* Whether the file system has a journal, which then holds every change
+ * before it's made where it goes. */
+int simplos_ext4_journaled(const char *mount_point)
+{
+	struct ext4_sblock *sb;
+	if (ext4_get_sblock(mount_point, &sb) != EOK)
+		return 0;
+	return ext4_sb_feature_com(sb, EXT4_FCOM_HAS_JOURNAL) ? 1 : 0;
+}

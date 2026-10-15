@@ -354,6 +354,7 @@ fn call(frame: &Frame) -> i64 {
         292 => files::dup3(&process, a0, a1, a2, false),
         293 => files::pipe2(&process, a0, a1),
         302 => system::prlimit(&process, a0, a1, a2, a3),
+        // syncfs.
         306 => files::fsync(&process, a0),
         316 => files::renameat2(&process, a0, a1, a2, a3, a4),
         439 => files::faccessat(&process, a0, a1, a2, a3),

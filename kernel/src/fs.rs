@@ -8,7 +8,7 @@
 use crate::io::disk;
 use crate::proc;
 use crate::serial_println;
-use crate::thread::{SleepLock, SleepLockGuard};
+use crate::thread::{self, SleepLock, SleepLockGuard};
 use crate::tty::Tty;
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
@@ -47,6 +47,21 @@ impl BlockDevice for Disk {
 /// mounting reads their superblock, and gives up there.
 pub fn init() {
     ext4::set_clock(|| (crate::time::now() / crate::time::NANOS) as u32);
+    // Small writes wait in memory to be made as one (see `ext4`): a second
+    // at most, so the power going loses no more. Once, however often the
+    // disk is mounted again.
+    static WRITER: spin::Once = spin::Once::new();
+    WRITER.call_once(|| {
+        thread::spawn(|| {
+            loop {
+                thread::sleep(1000);
+                if let Err(error) = lock().sync() {
+                    serial_println!("simplos: writing to the disk: {:?}", error);
+                }
+            }
+        })
+        .expect("memory for the disk's writer");
+    });
     for (index, info) in disk::list().into_iter().enumerate() {
         if let Ok(fs) = Ext4::mount_writable(Box::new(Disk { index, sectors: info.sectors })) {
             serial_println!("simplos: ext4 on disk {}", index);
@@ -255,6 +270,12 @@ pub struct Tree<'a> {
 }
 
 impl Tree<'_> {
+    /// Write what waits in memory: once this returns, every change is on
+    /// the disk.
+    pub fn sync(&self) -> Result<(), Error> {
+        self.disk.as_ref().map_or(Ok(()), Ext4::sync)
+    }
+
     /// What's at `path`, a path from the root.
     pub fn metadata(&self, path: &str) -> Result<Metadata, Error> {
         if let Some(handle) = descriptor(path) {

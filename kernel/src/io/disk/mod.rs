@@ -18,12 +18,17 @@ use spin::Mutex;
 
 pub const SECTOR: usize = 512;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct DiskInfo {
     /// `"ata"` or `"ahci"`.
     pub kind: &'static str,
     pub model: String,
     pub sectors: u64,
+    /// The reads and writes made since boot, and their sectors.
+    pub reads: u64,
+    pub sectors_read: u64,
+    pub writes: u64,
+    pub sectors_written: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,7 +111,10 @@ pub fn read(disk: usize, lba: u64, buf: &mut [u8]) -> Result<(), DiskError> {
     match disk {
         Disk::Ata(drive) => drive.read(lba, buf),
         Disk::Ahci(port) => port.read(lba, buf),
-    }
+    }?;
+    info.reads += 1;
+    info.sectors_read += (buf.len() / SECTOR) as u64;
+    Ok(())
 }
 
 /// Write `buf.len() / 512` sectors starting at `lba`, and flush the disk's
@@ -118,7 +126,10 @@ pub fn write(disk: usize, lba: u64, buf: &[u8]) -> Result<(), DiskError> {
     match disk {
         Disk::Ata(drive) => drive.write(lba, buf),
         Disk::Ahci(port) => port.write(lba, buf),
-    }
+    }?;
+    info.writes += 1;
+    info.sectors_written += (buf.len() / SECTOR) as u64;
+    Ok(())
 }
 
 fn check(info: &DiskInfo, lba: u64, len: usize) -> Result<(), DiskError> {

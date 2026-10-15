@@ -124,6 +124,23 @@ pub fn fsck(image: &Path) -> Result<(), String> {
     }
 }
 
+/// Apply what the journal of the file system in the file `image` holds, as
+/// Linux would in mounting it: for looking at one that's still mounted,
+/// whose latest changes can be in its journal alone. What e2fsck says, if
+/// it can't.
+pub fn replay(image: &Path) -> Result<(), String> {
+    let output = e2fsprogs("e2fsck").args(["-y", "-E", "journal_only"]).arg(image).output();
+    let output = output.expect("e2fsck, from e2fsprogs");
+    match output.status.success() {
+        true => Ok(()),
+        false => Err(format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )),
+    }
+}
+
 /// What e2fsprogs' debugfs prints for `request` on the file `image`.
 pub fn debugfs(image: &Path, request: &str) -> Vec<u8> {
     let output = e2fsprogs("debugfs")

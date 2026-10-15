@@ -183,9 +183,8 @@ pub fn probe() -> Vec<(DiskInfo, Drive)> {
             let drive = Drive { base, control, slave };
             let Some(id) = drive.identify() else { continue };
             match parse_identify(&id) {
-                Some((model, sectors)) => {
-                    found.push((DiskInfo { kind: "ata", model, sectors }, drive))
-                }
+                Some((model, sectors)) => found
+                    .push((DiskInfo { kind: "ata", model, sectors, ..DiskInfo::default() }, drive)),
                 None => {
                     serial_println!("simplos: skipping ATA disk without 512-byte sectors");
                 }

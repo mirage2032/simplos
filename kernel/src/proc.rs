@@ -6,6 +6,7 @@
 //! shortcut: no /proc/PID/maps, environ or the like; add them as programs
 //! ask for them.
 
+use crate::io::disk;
 use crate::process::{self, CPU_TIME, Process};
 use crate::time::{self, NANOS, TICK};
 use crate::{memory, thread};
@@ -70,6 +71,7 @@ pub fn node(path: &str, disk: Option<&Ext4>) -> Option<Node> {
         ("loadavg", "") => file(loadavg()),
         ("stat", "") => file(stat()),
         ("mounts", "") => file(mounts(disk)),
+        ("diskstats", "") => file(diskstats()),
         ("version", "") => file(format!("Linux version {}\n", crate::syscall::RELEASE)),
         (id, rest) => {
             let process = process::find(id.parse().ok()?)?;
@@ -115,7 +117,7 @@ fn entry(name: &str, kind: Kind, path: &str) -> DirEntry {
 /// /proc itself: the machine's files, and a directory for each process.
 fn root() -> Vec<DirEntry> {
     let mut entries = Vec::from([entry("self", Kind::Symlink, "self")]);
-    for name in ["loadavg", "meminfo", "mounts", "stat", "uptime", "version"] {
+    for name in ["diskstats", "loadavg", "meminfo", "mounts", "stat", "uptime", "version"] {
         entries.push(entry(name, Kind::File, name));
     }
     for process in process::all() {
@@ -183,6 +185,23 @@ fn mounts(disk: Option<&Ext4>) -> String {
         None => "rootfs / rootfs ro 0 0\n",
     };
     format!("{root}devtmpfs /dev devtmpfs rw 0 0\nproc /proc proc rw 0 0\n")
+}
+
+/// Each disk's reads and writes since boot, and their sectors, by the
+/// names Linux gives disks, sda and on, in the order they were found. No
+/// times: none are kept.
+fn diskstats() -> String {
+    let line = |(index, disk): (usize, &disk::DiskInfo)| {
+        let name = char::from(b'a' + index as u8);
+        let (reads, read, writes, written) =
+            (disk.reads, disk.sectors_read, disk.writes, disk.sectors_written);
+        format!(
+            "{:>4} {:>7} sd{name} {reads} 0 {read} 0 {writes} 0 {written} 0 0 0 0 0 0 0 0 0 0\n",
+            8,
+            index * 16
+        )
+    };
+    disk::list().iter().enumerate().map(line).collect()
 }
 
 /// Its state, as `ps` shows it: running, sleeping, stopped or ended, and
@@ -307,6 +326,11 @@ mod tests {
         assert!(text("meminfo").contains("\nMemAvailable:   "));
         assert_eq!(text("mounts").lines().next(), Some("rootfs / rootfs ro 0 0"));
         assert!(text("stat").starts_with("cpu  "));
+        // The disk booted from, at least: read from since, looking for ext4.
+        let diskstats = text("diskstats");
+        assert!(diskstats.starts_with("   8       0 sda "), "{diskstats}");
+        let reads: u64 = diskstats.split_whitespace().nth(3).unwrap().parse().unwrap();
+        assert!(reads > 0, "{diskstats}");
         assert_eq!(text("loadavg").split(' ').count(), 5);
         // Nothing runs this as a program: there's no self.
         assert!(node("self", None).is_none());

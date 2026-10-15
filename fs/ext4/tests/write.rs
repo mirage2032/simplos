@@ -326,6 +326,7 @@ fn open_files_stay_until_closed() {
     let cut = Image::new(image.bytes());
     let before = dir.join("before.img");
     cut.save(&before);
+    replay(&before).unwrap();
     assert_eq!(debugfs_ls(&before, "lost+found"), [format!(".open-{hello}")]);
     drop(Ext4::mount_writable(Box::new(cut.clone())).unwrap());
     drop((old, fs));
@@ -353,9 +354,11 @@ fn files_keep_their_file_system_mounted() {
     write_all(&file, 0, b"after the mount's owner let go\n");
     assert_eq!(listing.metadata().unwrap().kind, Kind::Directory);
     drop(file);
-    // Still mounted: what's on the image isn't finished yet.
+    // Still mounted: what's on the image isn't finished yet, but what the
+    // journal holds of it is.
     let saved = dir.join("written.img");
     image.save(&saved);
+    replay(&saved).unwrap();
     assert!(debugfs_ls(&saved, "/").contains(&String::from("late")));
     drop(listing);
     // Unmounted now, cleanly, and the slot given back.
@@ -363,6 +366,139 @@ fn files_keep_their_file_system_mounted() {
     fsck(&saved).unwrap();
     assert_eq!(debugfs(&saved, "cat late"), b"after the mount's owner let go\n");
     Ext4::mount(Box::new(image)).unwrap();
+}
+
+/// Small writes, one after another, are held and made as one: a thousand
+/// take the device a handful of writes, not thousands. Whatever else is
+/// done on the file system writes them first, so nothing sees the file
+/// without them; and once `sync` returns, they're on the device.
+#[test]
+fn makes_small_writes_as_one() {
+    let _serial = serial();
+    let dir = workspace("small");
+    let root = dir.join("tree");
+    make_tree(&root);
+    let image = image(&dir, &root, &["-t", "ext4"], "64M");
+    let fs = Ext4::mount_writable(Box::new(image.clone())).unwrap();
+    let writes = || image.writes.lock().unwrap().len();
+    let file = fs.create("lines").unwrap();
+    let mut lines = Vec::new();
+    let start = writes();
+    for i in 0..1000 {
+        // Where it ends, as appending asks before each write: with what's
+        // held.
+        assert_eq!(file.size().unwrap(), lines.len() as u64);
+        let line = format!("line {i}\n");
+        write_all(&file, lines.len() as u64, line.as_bytes());
+        lines.extend_from_slice(line.as_bytes());
+    }
+    assert_eq!(read_all(&fs, "lines"), lines);
+    let written = writes() - start;
+    assert!(written < 20, "{written} of the device's writes for 1000 small ones");
+
+    let other = fs.open("lines").unwrap();
+    let anything_else: [(&str, &dyn Fn()); 6] = [
+        ("metadata", &|| assert!(fs.metadata("lines").is_ok())),
+        ("read_dir", &|| assert!(fs.read_dir("/").is_ok())),
+        ("usage", &|| assert!(fs.usage().is_ok())),
+        ("sync", &|| assert!(fs.sync().is_ok())),
+        ("a read through another handle", &|| assert!(other.read_at(0, &mut [0]).is_ok())),
+        ("the file's metadata", &|| assert!(file.metadata().is_ok())),
+    ];
+    for (what, call) in anything_else {
+        write_all(&file, lines.len() as u64, b"x\n");
+        lines.extend_from_slice(b"x\n");
+        let before = writes();
+        call();
+        assert!(writes() > before, "{what} left what was held unwritten");
+    }
+    // Closing it writes what's held for it.
+    write_all(&file, lines.len() as u64, b"closed\n");
+    lines.extend_from_slice(b"closed\n");
+    let before = writes();
+    drop(file);
+    assert!(writes() > before, "closing it left what was held unwritten");
+    // Synced: the power going now loses none of it.
+    let file = fs.open_writable("lines").unwrap();
+    write_all(&file, lines.len() as u64, b"synced\n");
+    lines.extend_from_slice(b"synced\n");
+    fs.sync().unwrap();
+    let cut = Ext4::mount_writable(Box::new(Image::new(image.bytes()))).unwrap();
+    assert_eq!(read_all(&cut, "lines"), lines);
+    drop((cut, other, file, fs));
+
+    let saved = dir.join("written.img");
+    image.save(&saved);
+    fsck(&saved).unwrap();
+    assert_eq!(debugfs(&saved, "cat lines"), lines);
+}
+
+/// What's held is written before anything else is, so writes through other
+/// handles, to other files and elsewhere in the file land as they would
+/// have.
+#[test]
+fn holds_writes_in_order() {
+    let _serial = serial();
+    let dir = workspace("order");
+    let root = dir.join("tree");
+    make_tree(&root);
+    let image = image(&dir, &root, &["-t", "ext4"], "64M");
+    let fs = Ext4::mount_writable(Box::new(image.clone())).unwrap();
+    let (f, g) = (fs.create("f").unwrap(), fs.create("g").unwrap());
+    let also = fs.open_writable("f").unwrap();
+    write_all(&g, 0, b"gggg");
+    write_all(&f, 0, b"ffff");
+    // Where what's held for f ends, but in g.
+    write_all(&g, 4, b"G");
+    // Over what's held, through another handle; then after both, by where
+    // the first says f ends.
+    write_all(&f, 0, b"ffff");
+    write_all(&also, 2, b"AA");
+    assert_eq!(f.size().unwrap(), 4);
+    write_all(&f, 4, b"ffXX");
+    // Cut short, which leaves what was past the end in its block, as
+    // lwext4 cuts; then written past the end, with zeros in between and
+    // not that; then on from there, and back at the start.
+    f.set_len(6).unwrap();
+    write_all(&f, 8, b"z");
+    write_all(&f, 9, b"!");
+    write_all(&f, 0, b"F");
+    assert_eq!(read_all(&fs, "f"), b"FfAAff\0\0z!");
+    assert_eq!(read_all(&fs, "g"), b"ggggG");
+    drop((f, g, also, fs));
+
+    let saved = dir.join("written.img");
+    image.save(&saved);
+    fsck(&saved).unwrap();
+}
+
+/// What a transaction changes waits in lwext4's cache to be written in
+/// place, as it's in the journal: a directory's block, changed by a hundred
+/// files made in it, is written in its place once, as it's unmounted.
+#[test]
+fn writes_blocks_in_place_once() {
+    let _serial = serial();
+    let dir = workspace("in_place");
+    let root = dir.join("tree");
+    make_tree(&root);
+    let image = image(&dir, &root, &["-t", "ext4"], "64M");
+    let blocks = String::from_utf8(debugfs(&dir.join("fs.img"), "blocks /")).unwrap();
+    let sector = blocks.trim().parse::<u64>().unwrap() * 4096 / ext4::SECTOR as u64;
+    let fs = Ext4::mount_writable(Box::new(image.clone())).unwrap();
+    for i in 0..100 {
+        fs.create(&format!("f{i}")).unwrap();
+    }
+    drop(fs);
+    let writes = image.writes.lock().unwrap().clone();
+    let covers = |(start, data): &&Write| {
+        (*start..start + (data.len() / ext4::SECTOR) as u64).contains(&sector)
+    };
+    let in_place = writes.iter().filter(covers).count();
+    assert_eq!(in_place, 1, "the root directory's block was written {in_place} times");
+    let saved = dir.join("written.img");
+    image.save(&saved);
+    fsck(&saved).unwrap();
+    assert_eq!(debugfs_ls(&saved, "/").len(), 106);
 }
 
 #[test]

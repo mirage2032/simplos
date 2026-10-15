@@ -20,7 +20,8 @@ use bootloader_api::{BootInfo, entry_point};
 use core::panic::PanicInfo;
 use ext4::{Ext4, File, Kind};
 use simplos::fs::{self, ROOT};
-use simplos::thread::{spawn, yield_now};
+use simplos::io::disk;
+use simplos::thread::{self, spawn, yield_now};
 
 entry_point!(main, config = &simplos::BOOTLOADER_CONFIG);
 
@@ -138,4 +139,22 @@ fn threads_take_turns_with_it() {
         let contents = format!("thread {thread}, round 4\n").repeat(100);
         assert_eq!(read_all(fs, &format!("thread-{thread}")), contents.as_bytes());
     }
+}
+
+#[test_case]
+fn small_writes_reach_the_disk_within_a_second() {
+    // Held in memory to be made with what follows it; with nothing else
+    // done, made a second later all the same.
+    let writes = || disk::list().iter().map(|disk| disk.writes).sum::<u64>();
+    let file = {
+        let root = ROOT.lock();
+        let file = root.as_ref().expect("the ext4 disk, mounted").create("held.txt").unwrap();
+        file.write_at(0, b"held").unwrap();
+        file
+    };
+    let before = writes();
+    thread::sleep(1500);
+    assert!(writes() > before, "a small write still held after 1.5 s");
+    drop(file);
+    ROOT.lock().as_ref().unwrap().remove_file("held.txt").unwrap();
 }

@@ -248,9 +248,8 @@ pub fn probe() -> Vec<(DiskInfo, Port)> {
             // Safety: IDENTIFY finished, so the bounce buffer holds its 512 bytes.
             let id = words(unsafe { core::slice::from_raw_parts(port.bounce(), SECTOR) });
             match parse_identify(&id) {
-                Some((model, sectors)) => {
-                    found.push((DiskInfo { kind: "ahci", model, sectors }, port))
-                }
+                Some((model, sectors)) => found
+                    .push((DiskInfo { kind: "ahci", model, sectors, ..DiskInfo::default() }, port)),
                 None => {
                     serial_println!("simplos: skipping AHCI disk without 512-byte sectors");
                 }

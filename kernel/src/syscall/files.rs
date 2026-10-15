@@ -900,13 +900,17 @@ pub fn dup3(process: &Process, fd: u64, to: u64, flags: u64, dup2: bool) -> i64 
     })())
 }
 
-/// Every change is on the disk by the time the call that made it returns.
+/// Write what `fs/ext4` holds in memory, small writes waiting to be made
+/// as one: then every change is on the disk. For `fd`'s file (`fsync`,
+/// `fdatasync`), the file system it's on (`syncfs`), or everything
+/// (`sync`): all one here.
 pub fn fsync(process: &Process, fd: u64) -> i64 {
-    ret(handle(process, fd).map(|_| 0))
+    ret(handle(process, fd).and_then(|_| fs::lock().sync().map(|()| 0).map_err(fs::errno)))
 }
 
-/// Everything written is on the disk already, as `fs/ext4` writes through.
+/// As `fsync`, which can't fail.
 pub fn sync() -> i64 {
+    let _ = fs::lock().sync();
     0
 }
 

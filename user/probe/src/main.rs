@@ -687,6 +687,28 @@ fn main() {
             let file = OpenOptions::new().append(true).create(true).open(arg(2));
             or_fail(&arg(2), or_fail(&arg(2), file).write_all(arg(3).as_bytes()));
         }
+        // A small write, which the kernel holds in memory to make with what
+        // follows, made by fsync, or sync: the disks' writes, by
+        // /proc/diskstats, go up. Thrice, in case the kernel's own writing,
+        // once a second, comes in between.
+        Some(call @ ("fsync" | "sync")) => {
+            let writes = || {
+                let stats = or_fail("/proc/diskstats", fs::read_to_string("/proc/diskstats"));
+                let lines = stats.lines();
+                lines.filter_map(|line| line.split_whitespace().nth(7)?.parse::<u64>().ok()).sum()
+            };
+            let mut file = or_fail(&arg(2), fs::File::create(arg(2)));
+            let synced = (0..3).any(|_| {
+                or_fail(&arg(2), file.write_all(b"x"));
+                let before: u64 = writes();
+                match call {
+                    "fsync" => or_fail(&arg(2), file.sync_all()),
+                    _ => drop(syscall(162, 0, 0, 0)),
+                }
+                writes() > before
+            });
+            println!("{}", if synced { "synced" } else { "still held" });
+        }
         // What stat says, then what fstat says of it open.
         Some("stat") => {
             let open = or_fail(&arg(2), fs::File::open(arg(2)));

@@ -457,3 +457,13 @@ fn a_program_reads_of_itself_in_proc() {
     // ext4's type and block size by path and by descriptor, alike; its name.
     assert_eq!(run(&["proc"]), ok("256 0 0xef53 true 4096 probe\n"));
 }
+
+#[test_case]
+fn fsync_writes_what_waits_in_memory() {
+    // A small write waits to be made with what follows it; fsync makes it,
+    // and sync, as /proc/diskstats shows.
+    for call in ["fsync", "sync"] {
+        assert_eq!(run(&[call, "/synced.txt"]), ok("synced\n"), "{call}");
+    }
+    ROOT.lock().as_ref().unwrap().remove_file("synced.txt").unwrap();
+}
