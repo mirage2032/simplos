@@ -83,7 +83,11 @@ fn disk() -> Option<PathBuf> {
     if image.exists() {
         return Some(image);
     }
+    // Afresh: what an earlier one left would be copied over, and through
+    // its links, as vim's xxd went through busybox's /usr/bin/xxd onto
+    // busybox itself.
     let tree = here.join("target/disk-tree");
+    let _ = std::fs::remove_dir_all(&tree);
     std::fs::create_dir_all(&tree).ok()?;
     std::fs::write(tree.join("hello.txt"), "hello from the ext4 disk\n").ok()?;
     std::fs::create_dir_all(tree.join("bin")).ok()?;
