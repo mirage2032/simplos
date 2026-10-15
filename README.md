@@ -117,8 +117,8 @@ Programs use it through Linux's system calls, so Rust's `std::fs` (or C's
 stdio) works as it does on Linux: `open`, `openat`, `close`, `read`, `write`,
 `pread64`, `pwrite64`, `lseek`, `stat`, `lstat`, `fstat`, `newfstatat`,
 `getdents64`, `fcntl`, `fsync`, `mkdir`, `mkdirat`, `rmdir`, `unlink`,
-`unlinkat`, `rename`, `renameat`, `renameat2`, `chdir`, `getcwd` and `umask`;
-and for what isn't a file, `pipe`, `pipe2`, `dup`, `dup2` and `dup3`, and
+`unlinkat`, `rename`, `renameat`, `renameat2`, `chdir`, `fchdir`, `getcwd`
+and `umask`; and for what isn't a file, `pipe`, `pipe2`, `dup`, `dup2` and `dup3`, and
 `/dev/null`, `/dev/zero` and `/dev/tty`. `/dev/fd/N`, and `/proc/PID/fd/N`
 for any process's, is descriptor N, which opening it duplicates, as FreeBSD's
 `/dev/fd` does it, and `/dev/stdin` and the others link to `fd/0` and the
@@ -233,11 +233,12 @@ Linux console too: light grey on black, and bold text bright, as the
 console draws it. The keys send what the console's do. In the shell, `run
 colors` shows the colours.
 
-`poll` and `ppoll` wait for pipes and terminals, as long as they're asked
-to, `ppoll` with the signals it's given blocked meanwhile, as busybox's
-shells wait in `read`; and `O_NONBLOCK` (from `open`, `pipe2`, `fcntl` or
-`FIONBIO`) makes what would wait fail with `EAGAIN` instead. In the shell,
-`run cat` copies what's typed until ^D. For now:
+`poll`, `ppoll`, `select` and `pselect6` wait for pipes and terminals, as
+long as they're asked to, `ppoll` and `pselect6` with the signals they're
+given blocked meanwhile, as busybox's shells wait in `read`; and
+`O_NONBLOCK` (from `open`, `pipe2`, `fcntl` or `FIONBIO`) makes what would
+wait fail with `EAGAIN` instead. In the shell, `run cat` copies what's typed
+until ^D. For now:
 
 - of the escape sequences, no line-drawing characters, tab stops but every
   eighth column, insert mode or application cursor keys, none of which the
@@ -329,8 +330,10 @@ its `/sbin/init`, a script that logs root in to zsh.
 
 `scripts/userland.sh` builds the programs that make a disk a system to use:
 busybox 1.38.0, with a link for each of its applets where Linux keeps them
-(`/bin/sh`, `/bin/ls`, `/usr/bin/awk` and the rest), and zsh 5.9.2 with its
-shell functions, on ncurses 6.6 with the terminals it knows built in.
+(`/bin/sh`, `/bin/ls`, `/usr/bin/awk` and the rest), zsh 5.9.2 with its
+shell functions, and vim 9.2.1202 with its runtime files, its help and
+syntax highlighting among them, on ncurses 6.6 with the terminals it knows
+built in.
 They're static programs for x86-64 Linux, linked with musl by zig cc 0.17.0,
 from the sources the script pins and checks by their SHA-256, into
 `target/userland/root`. The first build takes a few minutes and needs the
@@ -363,11 +366,17 @@ kernel's own shell. For now:
   which is why `/etc/zshrc` has `compinit -u`;
 - what's read a little at a time is read from the disk each time, as
   lwext4 keeps no file's data in memory, so zsh's `read`, which reads a
-  byte at a time, is slow.
+  byte at a time, is slow, and vim takes a few seconds to start under
+  emulation, reading its scripts;
+- vim is built without `timer_create`, whose `SIGEV_THREAD` takes a thread,
+  so it times what it times out (a regexp, `'redrawtime'`) with `setitimer`;
+  and the `flock` it puts on its temporary directory, against cleaners
+  that there aren't, isn't there.
 
-busybox is GPL-2.0, as simplos is; zsh and ncurses are MIT-style. A disk
-made with them holds their programs, built from the upstream releases the
-script names, unchanged, configured as it says.
+busybox is GPL-2.0, as simplos is; zsh and ncurses are MIT-style; vim is
+under the Vim license, which is GPL-compatible. A disk made with them holds
+their programs, built from the upstream releases the script names (vim's,
+from its tag), unchanged, configured as it says.
 
 ## Tests
 
@@ -390,7 +399,7 @@ copies of and run again; `tests/tty.rs` types into a terminal for it to read;
 `tests/signals.rs` has it send signals to itself and its copies;
 `tests/time.rs` has it read the clocks, count CPU time and set alarms.
 `tests/shells.rs` runs busybox's sh and zsh, as commands and typed at on a
-terminal: its disk is 64 MiB and holds the userland too, which the runner
+terminal: its disk is 128 MiB and holds the userland too, which the runner
 builds with `scripts/userland.sh` the first time. After a run that passes, e2fsck must find nothing wrong with it, and it must have been
 unmounted, so the tests need e2fsprogs installed.
 

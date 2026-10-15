@@ -298,6 +298,12 @@ fn a_program_has_a_working_directory() {
 }
 
 #[test_case]
+fn fchdir_moves_to_the_directory_open() {
+    // And not to a file, ENOTDIR, nor a descriptor not open, EBADF.
+    assert_eq!(run(&["fchdir", "/dir", "/hello.txt"]), ok("0 /dir (-20, -9)\n"));
+}
+
+#[test_case]
 fn a_program_pipes_to_itself() {
     // Out the other end, then the end once the writer's gone; then nothing
     // reads, and writing says so.
