@@ -10,11 +10,12 @@
 //!
 //!   0x0040_0000          the program (a PIE is loaded here), then its heap (`brk`)
 //!   0x1000_0000_0000     `mmap`, growing up
+//!   0x7FFF_FBFF_0000     where the stack can grow down to, as it's used
 //!   0x7FFF_FFFF_0000     the top of the stack, which grows down. The 64 KiB above
 //!                        it are never mapped, so no `syscall` can sit at the very
 //!                        end of the lower half (see `syscall.rs`).
 
-use crate::elf::{self, Elf};
+use crate::elf::{self, Elf, Source};
 use crate::fs;
 use crate::io::interrupts::gdt;
 use crate::memory::{AddressSpace, USER_END};
@@ -45,11 +46,13 @@ const PIE_BASE: u64 = 0x40_0000;
 pub const LOWEST: u64 = 0x1_0000;
 pub const MMAP_START: u64 = 0x0000_1000_0000_0000;
 const STACK_TOP: u64 = 0x0000_7FFF_FFFF_0000;
-/// shortcut: a fixed 256 KiB, mapped up front; grow it on page faults when a
-/// program needs more.
-pub const STACK_SIZE: u64 = 256 * 1024;
-/// Where `mmap` stops: a gap below the stack.
-pub const MMAP_END: u64 = STACK_TOP - STACK_SIZE - 0x10_0000;
+/// The stack mapped as a program starts, which its arguments go on.
+const STACK_SIZE: u64 = 256 * 1024;
+/// The most the stack grows to, mapped a page at a time as the program
+/// reaches it: as GCC's does, compiling.
+pub const STACK_MOST: u64 = 64 << 20;
+/// Where `mmap` stops: a gap below where the stack can grow to.
+pub const MMAP_END: u64 = STACK_TOP - STACK_MOST - 0x10_0000;
 
 /// What `status` holds until the program ends.
 const RUNNING: i32 = i32::MIN;
@@ -312,7 +315,7 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 /// Its standard input, output and error are a terminal no one types on,
 /// whose output goes to `output` as it's written (`Tty::capture`).
 pub fn spawn(
-    elf: &[u8],
+    elf: &(impl Source + ?Sized),
     args: &[&str],
     output: impl FnMut(&[u8]) + Send + 'static,
 ) -> Result<Arc<Process>, &'static str> {
@@ -324,7 +327,7 @@ pub fn spawn(
 /// descriptors to start with, by number: what its standard input, output
 /// and error are, for one.
 pub fn spawn_with(
-    elf: &[u8],
+    elf: &(impl Source + ?Sized),
     args: &[&str],
     env: &[&str],
     files: Vec<Option<Arc<fs::Handle>>>,
@@ -405,16 +408,20 @@ pub fn spawn_program(
 /// argument if it has one and the script's path, in place of the first of
 /// `args`, as Linux runs them. That can be a script too, up to where Linux
 /// gives up (ELOOP).
-pub fn program_for(cwd: &str, path: &str, args: &mut Vec<Vec<u8>>) -> Result<Vec<u8>, i64> {
+pub fn program_for(cwd: &str, path: &str, args: &mut Vec<Vec<u8>>) -> Result<fs::Program, i64> {
     const ENOENT: i64 = 2;
+    const EIO: i64 = 5;
     const ELOOP: i64 = 40;
     if path.is_empty() {
         return Err(ENOENT);
     }
     let mut path = String::from(path);
-    let mut elf = fs::read_program(&fs::lookup(cwd, &path, true)?)?;
+    let mut elf = fs::open_program(&fs::lookup(cwd, &path, true)?)?;
     for depth in 0.. {
-        let Some((interpreter, argument)) = interpreter(&elf) else { break };
+        // As much of its first line as `interpreter` looks at.
+        let mut head = vec![0; elf.size().min(LONGEST_LINE as u64) as usize];
+        elf.read_at(0, &mut head).ok_or(EIO)?;
+        let Some((interpreter, argument)) = interpreter(&head) else { break };
         if depth == 5 {
             return Err(ELOOP);
         }
@@ -423,19 +430,22 @@ pub fn program_for(cwd: &str, path: &str, args: &mut Vec<Vec<u8>>) -> Result<Vec
         first.extend(argument.map(<[u8]>::to_vec));
         first.push(path.into_bytes());
         args.splice(..args.len().min(1), first);
-        elf = fs::read_program(&fs::lookup(cwd, &interpreter, true)?)?;
+        elf = fs::open_program(&fs::lookup(cwd, &interpreter, true)?)?;
         path = interpreter;
     }
     Ok(elf)
 }
 
+/// How much of a script's first line Linux reads.
+const LONGEST_LINE: usize = 256;
+
 /// What runs the script `program`, as Linux reads its first line: `#!`, then
 /// the interpreter's path, then what's left of the line as one argument if
 /// anything is, past spaces and tabs. Within the first 256 bytes, where a
-/// line that goes on past them must at least have the path whole. `None` if
-/// it isn't a script, or names nothing.
+/// line that goes on past them must at least have the path whole: all of
+/// `program` that's needed. `None` if it isn't a script, or names nothing.
 fn interpreter(program: &[u8]) -> Option<(&[u8], Option<&[u8]>)> {
-    const LONGEST: usize = 256;
+    const LONGEST: usize = LONGEST_LINE;
     let blank = |byte: &u8| matches!(byte, b' ' | b'\t');
     let head = program.strip_prefix(b"#!")?;
     let head = &head[..head.len().min(LONGEST - 2)];
@@ -463,17 +473,24 @@ pub fn load_errno(error: &str) -> i64 {
     const E2BIG: i64 = 7;
     const ENOEXEC: i64 = 8;
     const ENOMEM: i64 = 12;
+    const EIO: i64 = 5;
     match error {
         NO_MEMORY => ENOMEM,
         TOO_LONG => E2BIG,
+        elf::UNREADABLE => EIO,
         _ => ENOEXEC,
     }
 }
 
 /// `elf` loaded into a new address space, with `args` and `env` on its
 /// stack, and the registers to start it with.
-fn program(elf: &[u8], args: &[&[u8]], env: &[&[u8]]) -> Result<(Memory, Registers), &'static str> {
+fn program(
+    elf: &(impl Source + ?Sized),
+    args: &[&[u8]],
+    env: &[&[u8]],
+) -> Result<(Memory, Registers), &'static str> {
     let mut space = AddressSpace::new().ok_or(NO_MEMORY)?;
+    space.grow_stack(STACK_TOP - STACK_MOST..STACK_TOP);
     let image = load(&mut space, elf)?;
     let rsp = build_stack(&mut space, args, env, &image)?;
     let memory = Memory { space, brk_start: image.end, brk: image.end, mmap_next: MMAP_START };
@@ -525,7 +542,7 @@ pub fn fork(parent: &Arc<Process>, registers: Registers) -> Option<u64> {
 /// to enter it with; or why it couldn't be loaded, and nothing has changed.
 pub fn exec(
     process: &Process,
-    elf: &[u8],
+    elf: &(impl Source + ?Sized),
     args: &[&[u8]],
     env: &[&[u8]],
 ) -> Result<Registers, &'static str> {
@@ -537,6 +554,16 @@ pub fn exec(
     drop(old);
     process.signals.exec();
     Ok(start)
+}
+
+/// From a page fault in ring 3 at `addr`, not mapped: map it if it's where
+/// the current thread's program's stack grows to. Whether it did, and the
+/// instruction can run again.
+pub fn grow_stack(addr: u64) -> bool {
+    // As a system call runs: the locks this takes are taken with them on.
+    interrupts::enable();
+    let Some(process) = thread::current_process() else { return false };
+    process.memory.lock().space.grow(addr)
 }
 
 /// End the current thread's program as `exit` does, with `code`, from one of
@@ -847,12 +874,15 @@ struct Image {
     end: u64,
 }
 
-fn load(space: &mut AddressSpace, file: &[u8]) -> Result<Image, &'static str> {
+fn load(space: &mut AddressSpace, file: &(impl Source + ?Sized)) -> Result<Image, &'static str> {
     let elf = Elf::parse(file)?;
     let base = if elf.pie { PIE_BASE } else { 0 };
     let outside = "a segment outside the program's area";
     let mut end = 0;
     let mut phdr = None;
+    // What's copied from the file, a piece at a time: a program can be
+    // bigger than the kernel's heap.
+    let mut piece = vec![0; 64 << 10];
     for segment in elf.segments() {
         match segment.kind {
             elf::PT_LOAD => {
@@ -869,7 +899,13 @@ fn load(space: &mut AddressSpace, file: &[u8]) -> Result<Image, &'static str> {
                     flags |= PageTableFlags::NO_EXECUTE;
                 }
                 space.map(pages(start, stop), flags).ok_or(NO_MEMORY)?;
-                space.load(start, elf.contents(&segment)).ok_or(outside)?;
+                let mut done = 0;
+                while done < segment.filesz {
+                    let piece = &mut piece[..(segment.filesz - done).min(64 << 10) as usize];
+                    file.read_at(segment.offset + done, piece).ok_or(elf::UNREADABLE)?;
+                    space.load(start + done, piece).ok_or(outside)?;
+                    done += piece.len() as u64;
+                }
                 end = end.max(stop);
                 // Without a PT_PHDR, the headers are in the segment that
                 // starts at the beginning of the file, if any is.

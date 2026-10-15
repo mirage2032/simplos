@@ -102,6 +102,22 @@ fn memory_calls_keep_to_the_program_s_half_and_give_back_what_they_fail_to_get()
 }
 
 #[test_case]
+fn the_stack_grows_as_it_s_used() {
+    // What Linux says, from the same program: 4 MiB of calls deep, 16 KiB
+    // each; written 4 MiB below, and read(2) into 6 MiB below, where it
+    // hadn't been; and SIGSEGV for 100 MiB below, past where it can grow.
+    assert_eq!(run(&["deep-stack"]), (0, String::from("32640 true 4 true signal: 11\n")));
+}
+
+#[test_case]
+fn madvise_zeroes_what_isn_t_needed() {
+    // What Linux says, from the same program: MADV_DONTNEED zeroes; and
+    // EINVAL, ENOMEM and EINVAL for an address not a page's, memory not
+    // mapped, and advice there isn't.
+    assert_eq!(run(&["madvise"]), (0, String::from("0 true 0 [-22, -12, -22] 0\n")));
+}
+
+#[test_case]
 fn mremap_grows_moves_and_shrinks_mappings() {
     // What Linux says, from the same program, but for the last: there,
     // where nothing's been mapped after it, it grows where it is.

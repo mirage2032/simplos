@@ -1,6 +1,9 @@
 //! The parts of an ELF64 executable a loader needs: its header and program
-//! headers. Every offset and size is checked before it is used: the file
-//! comes from outside the kernel.
+//! headers, read from wherever the program is (`Source`). Every offset and
+//! size is checked before it is used: the file comes from outside the kernel.
+
+use alloc::vec;
+use alloc::vec::Vec;
 
 pub const PT_LOAD: u32 = 1;
 pub const PT_PHDR: u32 = 6;
@@ -10,8 +13,38 @@ pub const PF_W: u32 = 2;
 /// Size of one program header in an ELF64 file.
 pub const PHENT_SIZE: u64 = 56;
 
-pub struct Elf<'a> {
-    file: &'a [u8],
+/// The most program headers take, as Linux takes them.
+const MOST_HEADERS: u64 = 64 << 10;
+
+/// Why a program couldn't be loaded, when it was its file.
+pub const UNREADABLE: &str = "the program couldn't be read";
+
+/// Where a program is read from: its file on the disk, or memory, as the
+/// ramdisk's is. A piece at a time, as a program can be bigger than the
+/// kernel's heap.
+pub trait Source {
+    /// How long it is, in bytes.
+    fn size(&self) -> u64;
+    /// Fill `buf` from `offset` on: `None` if that's past the end, or it
+    /// can't be read.
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Option<()>;
+}
+
+impl Source for [u8] {
+    fn size(&self) -> u64 {
+        self.len() as u64
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Option<()> {
+        let start = usize::try_from(offset).ok()?;
+        buf.copy_from_slice(self.get(start..start.checked_add(buf.len())?)?);
+        Some(())
+    }
+}
+
+pub struct Elf {
+    /// The program headers, as the file has them.
+    headers: Vec<u8>,
     /// Position-independent (`ET_DYN`), to be loaded at a base of the
     /// loader's choosing, rather than at the addresses in its headers.
     pub pie: bool,
@@ -30,42 +63,46 @@ pub struct Segment {
     pub memsz: u64,
 }
 
-impl<'a> Elf<'a> {
-    pub fn parse(file: &'a [u8]) -> Result<Elf<'a>, &'static str> {
-        if file.get(..4) != Some(b"\x7fELF") {
+impl Elf {
+    pub fn parse(file: &(impl Source + ?Sized)) -> Result<Elf, &'static str> {
+        // The ELF header, or as much of it as there is.
+        let mut header = [0u8; 64];
+        let header = &mut header[..file.size().min(64) as usize];
+        file.read_at(0, header).ok_or("not an ELF file")?;
+        let header = &*header;
+        if header.get(..4) != Some(b"\x7fELF") {
             return Err("not an ELF file");
         }
         // Class 64-bit, little-endian, ELF version 1.
-        if file.get(4..7) != Some(&[2, 1, 1]) {
+        if header.get(4..7) != Some(&[2, 1, 1]) {
             return Err("not a 64-bit little-endian ELF file");
         }
-        let pie = match u16_at(file, 16)? {
+        let pie = match u16_at(header, 16)? {
             2 => false,
             3 => true,
             _ => return Err("not an executable"),
         };
-        if u16_at(file, 18)? != 62 {
+        if u16_at(header, 18)? != 62 {
             return Err("not an x86-64 program");
         }
-        if u64::from(u16_at(file, 54)?) != PHENT_SIZE {
+        if u64::from(u16_at(header, 54)?) != PHENT_SIZE {
             return Err("unexpected program header size");
         }
-        let elf = Elf {
-            file,
-            pie,
-            entry: u64_at(file, 24)?,
-            phoff: u64_at(file, 32)?,
-            phnum: u16_at(file, 56)?,
-        };
-        let table_end = elf.phoff.checked_add(u64::from(elf.phnum) * PHENT_SIZE);
-        if table_end.is_none_or(|end| end > file.len() as u64) {
+        let (phoff, phnum) = (u64_at(header, 32)?, u16_at(header, 56)?);
+        let size = u64::from(phnum) * PHENT_SIZE;
+        if size > MOST_HEADERS {
+            return Err("too many program headers");
+        }
+        if phoff.checked_add(size).is_none_or(|end| end > file.size()) {
             return Err("program headers past the end of the file");
         }
+        let mut headers = vec![0; size as usize];
+        file.read_at(phoff, &mut headers).ok_or(UNREADABLE)?;
+        let elf = Elf { headers, pie, entry: u64_at(header, 24)?, phoff, phnum };
         for segment in elf.segments() {
             let in_file = segment.offset.checked_add(segment.filesz);
             if segment.kind == PT_LOAD
-                && (segment.filesz > segment.memsz
-                    || in_file.is_none_or(|end| end > file.len() as u64))
+                && (segment.filesz > segment.memsz || in_file.is_none_or(|end| end > file.size()))
             {
                 return Err("a segment past the end of the file");
             }
@@ -74,25 +111,15 @@ impl<'a> Elf<'a> {
     }
 
     pub fn segments(&self) -> impl Iterator<Item = Segment> + '_ {
-        (0..u64::from(self.phnum)).map(|i| {
-            // In bounds: `parse` checked the whole table is in the file.
-            let at = (self.phoff + i * PHENT_SIZE) as usize;
-            let header = &self.file[at..at + PHENT_SIZE as usize];
-            Segment {
-                kind: u32_at(header, 0).unwrap(),
-                flags: u32_at(header, 4).unwrap(),
-                offset: u64_at(header, 8).unwrap(),
-                vaddr: u64_at(header, 16).unwrap(),
-                filesz: u64_at(header, 32).unwrap(),
-                memsz: u64_at(header, 40).unwrap(),
-            }
+        self.headers.as_chunks::<{ PHENT_SIZE as usize }>().0.iter().map(|header| Segment {
+            // In bounds: each is a whole program header.
+            kind: u32_at(header, 0).unwrap(),
+            flags: u32_at(header, 4).unwrap(),
+            offset: u64_at(header, 8).unwrap(),
+            vaddr: u64_at(header, 16).unwrap(),
+            filesz: u64_at(header, 32).unwrap(),
+            memsz: u64_at(header, 40).unwrap(),
         })
-    }
-
-    /// What a loadable segment copies from the file.
-    pub fn contents(&self, segment: &Segment) -> &'a [u8] {
-        // In bounds for every PT_LOAD: `parse` checked.
-        &self.file[segment.offset as usize..(segment.offset + segment.filesz) as usize]
     }
 }
 
@@ -119,7 +146,7 @@ fn probe() -> alloc::vec::Vec<u8> {
 #[test_case]
 fn reads_the_probe_programs_headers() {
     let file = probe();
-    let elf = Elf::parse(&file).expect("probe parses");
+    let elf = Elf::parse(&file[..]).expect("probe parses");
     assert!(elf.pie, "probe is built as a static PIE");
     let loads = elf.segments().filter(|s| s.kind == PT_LOAD).count();
     assert!(loads >= 2, "{loads} loadable segments");
@@ -129,21 +156,22 @@ fn reads_the_probe_programs_headers() {
 fn refuses_broken_files() {
     let file = probe();
     assert_eq!(Elf::parse(&file[..40]).err(), Some("truncated ELF file"));
+    assert_eq!(Elf::parse(&file[..2]).err(), Some("not an ELF file"));
 
     let mut bad = file.clone();
     bad[0] = 0;
-    assert_eq!(Elf::parse(&bad).err(), Some("not an ELF file"));
+    assert_eq!(Elf::parse(&bad[..]).err(), Some("not an ELF file"));
 
     // Program headers said to start near the end of the file.
     let mut bad = file.clone();
     bad[32..40].copy_from_slice(&(file.len() as u64 - 8).to_le_bytes());
-    assert_eq!(Elf::parse(&bad).err(), Some("program headers past the end of the file"));
+    assert_eq!(Elf::parse(&bad[..]).err(), Some("program headers past the end of the file"));
 
     // The first loadable segment claims more of the file than there is.
     let mut bad = file.clone();
-    let elf = Elf::parse(&file).unwrap();
+    let elf = Elf::parse(&file[..]).unwrap();
     let index = elf.segments().position(|s| s.kind == PT_LOAD).unwrap() as u64;
     let filesz_at = (elf.phoff + index * PHENT_SIZE + 32) as usize;
     bad[filesz_at..filesz_at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
-    assert_eq!(Elf::parse(&bad).err(), Some("a segment past the end of the file"));
+    assert_eq!(Elf::parse(&bad[..]).err(), Some("a segment past the end of the file"));
 }

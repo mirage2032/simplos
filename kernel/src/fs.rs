@@ -5,6 +5,7 @@
 //! Every call into them, through a path or through an open file, holds
 //! [`ROOT`]'s lock ([`lock`]), and whoever waits for it sleeps.
 
+use crate::elf;
 use crate::io::disk;
 use crate::proc;
 use crate::serial_println;
@@ -520,38 +521,56 @@ pub fn resolve(base: &str, path: &str) -> String {
     parts.join("/")
 }
 
-/// All of the program file at `path`, a path from the root, for `execve` and
-/// the kernel to start: or the errno saying why not.
-pub fn read_program(path: &str) -> Result<Vec<u8>, i64> {
-    const ENOMEM: i64 = 12;
+/// The program file at `path`, a path from the root, open for `execve` and
+/// the kernel to start, which read it a piece at a time: or the errno
+/// saying why not.
+pub fn open_program(path: &str) -> Result<Program, i64> {
     const EACCES: i64 = 13;
-    // shortcut: read whole into the kernel's heap, so no bigger than this;
-    // load segments straight from the file when programs get bigger.
-    const MOST: u64 = 4 << 20;
     let tree = lock();
     let metadata = tree.metadata(path).map_err(errno)?;
     // shortcut: anyone's execute bit will do, as there's one user.
     if metadata.kind != Kind::File || metadata.permissions & 0o111 == 0 {
         return Err(EACCES);
     }
-    if metadata.size > MOST {
-        return Err(ENOMEM);
-    }
     let file = tree.disk(path).map_err(errno)?.open(path).map_err(errno)?;
-    // As much as it may be, the heap may not have it to spare: then the
-    // program can't start, rather than the kernel stopping.
-    let mut elf = Vec::new();
-    elf.try_reserve_exact(metadata.size as usize).map_err(|_| ENOMEM)?;
-    elf.resize(metadata.size as usize, 0);
-    let mut done = 0;
-    while done < elf.len() {
-        match file.read_at(done as u64, &mut elf[done..]).map_err(errno)? {
-            0 => break,
-            read => done += read,
-        }
+    // Before the program is made: dropping that takes the tree.
+    drop(tree);
+    Ok(Program { file: Some(file), size: metadata.size })
+}
+
+/// A program's file, open, for its segments to be read from as it's
+/// loaded.
+pub struct Program {
+    /// Always there but as it's dropped, which takes the tree.
+    file: Option<ext4::File>,
+    size: u64,
+}
+
+impl elf::Source for Program {
+    fn size(&self) -> u64 {
+        self.size
     }
-    elf.truncate(done);
-    Ok(elf)
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Option<()> {
+        let _tree = lock();
+        let file = self.file.as_ref()?;
+        let mut done = 0;
+        while done < buf.len() {
+            match file.read_at(offset + done as u64, &mut buf[done..]).ok()? {
+                0 => return None,
+                read => done += read,
+            }
+        }
+        Some(())
+    }
+}
+
+impl Drop for Program {
+    fn drop(&mut self) {
+        // Closing a file is a call into the file system.
+        let _tree = lock();
+        drop(self.file.take());
+    }
 }
 
 /// Linux's errno for `error`.

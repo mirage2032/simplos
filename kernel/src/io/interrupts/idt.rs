@@ -273,13 +273,19 @@ fn fault(frame: &InterruptStackFrame, what: fmt::Arguments, signal: usize) -> ! 
     crate::hlt_loop();
 }
 
-/// Nothing grows a mapping on demand yet, so every page fault is fatal: to a
-/// user program, or to the kernel.
+/// A program's stack, reaching a page it hasn't yet, gets it, and goes on.
+/// Any other page fault is fatal: to a user program, or to the kernel.
 extern "x86-interrupt" fn page_fault_handler(
     stack_frame: InterruptStackFrame,
     error_code: PageFaultErrorCode,
 ) {
     let address = x86_64::registers::control::Cr2::read_raw();
+    if stack_frame.code_segment.rpl() == PrivilegeLevel::Ring3
+        && !error_code.contains(PageFaultErrorCode::PROTECTION_VIOLATION)
+        && process::grow_stack(address)
+    {
+        return;
+    }
     let what = format_args!("page fault at {address:#x} ({error_code:?})");
     fault(&stack_frame, what, SIGSEGV)
 }
