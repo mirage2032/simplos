@@ -142,6 +142,17 @@ pub struct Metadata {
     pub changed: u32,
 }
 
+/// How big a file system is and how much of it is free, as `statfs` tells
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Usage {
+    pub block_size: u32,
+    pub blocks: u64,
+    pub free_blocks: u64,
+    pub inodes: u32,
+    pub free_inodes: u32,
+}
+
 /// What to change of a file, each `None` left as it is. Its change time is
 /// set too, as Linux sets it.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -540,6 +551,21 @@ impl Ext4 {
         check(unsafe { ffi::ext4_fsymlink(target.as_ptr(), at.as_ptr()) })?;
         drop(lwext4);
         self.stamp(path)
+    }
+
+    /// How big it is and how much of it is free.
+    pub fn usage(&self) -> Result<Usage, Error> {
+        let mut stats = ffi::MountStats::default();
+        let _lwext4 = LWEXT4.lock();
+        // Safety: the mount point is NUL-terminated and mounted.
+        check(unsafe { ffi::ext4_mount_point_stats(self.mount.mount_point.as_ptr(), &mut stats) })?;
+        Ok(Usage {
+            block_size: stats.block_size,
+            blocks: stats.blocks_count,
+            free_blocks: stats.free_blocks_count,
+            inodes: stats.inodes_count,
+            free_inodes: stats.free_inodes_count,
+        })
     }
 
     /// Where the symbolic link at `path` points, as it was given.
@@ -971,7 +997,23 @@ mod ffi {
         pub changed: u32,
     }
 
+    /// lwext4's `struct ext4_mount_stats`.
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct MountStats {
+        pub inodes_count: u32,
+        pub free_inodes_count: u32,
+        pub blocks_count: u64,
+        pub free_blocks_count: u64,
+        pub block_size: u32,
+        pub block_group_count: u32,
+        pub blocks_per_group: u32,
+        pub inodes_per_group: u32,
+        pub volume_name: [u8; 16],
+    }
+
     unsafe extern "C" {
+        pub fn ext4_mount_point_stats(mount_point: *const c_char, stats: *mut MountStats) -> c_int;
         pub fn simplos_ext4_device_new(device: *mut c_void, sectors: u64) -> *mut BlockDev;
         pub fn simplos_ext4_device_free(device: *mut BlockDev);
         pub fn simplos_ext4_needs_recovery(mount_point: *const c_char) -> c_int;

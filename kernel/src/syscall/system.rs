@@ -12,6 +12,9 @@ use core::sync::atomic::Ordering::Relaxed;
 
 const ESRCH: i64 = 3;
 
+/// The Linux release simplos says it is, by its system calls.
+pub const RELEASE: &str = "6.1.0";
+
 /// `uname`'s `struct utsname`: six strings of 65 bytes. Linux's system call
 /// interface, so programs that ask which system they're on are told Linux,
 /// with the version giving simplos away.
@@ -19,7 +22,7 @@ pub fn uname(process: &Process, buf: u64) -> i64 {
     let fields = [
         "Linux",
         "simplos",
-        "6.1.0",
+        RELEASE,
         concat!("simplos ", env!("CARGO_PKG_VERSION")),
         "x86_64",
         "(none)",

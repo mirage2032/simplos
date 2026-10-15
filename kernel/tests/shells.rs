@@ -327,3 +327,37 @@ fn the_first_program_is_root_s_zsh() {
     let history = String::from_utf8_lossy(&history);
     assert!(history.contains("cat /etc/passwd\n"), "{history}");
 }
+
+#[test_case]
+fn the_system_shows_itself_in_proc() {
+    // free and top, from /proc/meminfo and /proc/stat; ps, the processes
+    // there are and what they're doing, the shell, a job of its and ps
+    // itself; df, from /proc/mounts and statfs, and stat's of it; mount;
+    // and what a process reads of itself.
+    let script = "free | awk 'NR == 2 { print $1, ($2 > 0), ($4 > 0) }'; \
+                  top -b -n 1 | awk 'NR == 1 { print $1, ($2 + 0 > 0), ($4 + 0 > 0) } \
+                                     NR == 2 || NR == 3 { print $1 }'; \
+                  sleep 10 & listed=$(ps -o stat,comm); kill $!; echo \"$listed\" | tail -n +2; \
+                  df / | awk 'NR == 2 { print $1, $2, ($3 > 0), $6 }'; stat -f -c '%T %b' /; \
+                  mount; cat /proc/self/cmdline | tr '\\0' ' '; echo; \
+                  readlink /proc/self | grep -c '^[0-9][0-9]*$'";
+    assert_eq!(
+        run(&["/bin/sh", "-c", script]),
+        ok("Mem: 1 1\nMem: 1 1\nCPU:\nLoad\nS    sh\nS    sleep\nR    ps\n/dev/root 65536 1 /\n\
+            ext2/ext3 16384\n/dev/root on / type ext4 (rw,relatime)\n\
+            devtmpfs on /dev type devtmpfs (rw)\nproc on /proc type proc (rw)\n\
+            cat /proc/self/cmdline \n1\n")
+    );
+}
+
+#[test_case]
+fn descriptors_can_be_opened_by_name() {
+    // /dev/stderr, /dev/fd/N and /proc/self/fd/N: what they're open on.
+    // And zsh's <(...), a pipe it names /proc/self/fd/N, beside =(...), a
+    // file it removes after.
+    let script = "echo to stderr > /dev/stderr; exec 3< /hello.txt; cat /dev/fd/3; \
+                  [ -e /proc/self/fd/0 ] && echo there";
+    assert_eq!(run(&["/bin/sh", "-c", script]), ok("to stderr\nhello from ext4\nthere\n"));
+    let script = "cat <(print from a pipe) =(print from a file)";
+    assert_eq!(run(&["/bin/zsh", "-f", "-c", script]), ok("from a pipe\nfrom a file\n"));
+}

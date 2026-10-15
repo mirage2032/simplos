@@ -4,7 +4,7 @@
 mod common;
 
 use common::*;
-use ext4::{Changes, Error, Ext4, Kind};
+use ext4::{Changes, Error, Ext4, Kind, Usage};
 use std::os::unix::fs::MetadataExt;
 
 /// Unlike `big`'s, and a few bytes into its last block.
@@ -488,4 +488,36 @@ fn keeps_times_owners_and_sizes() {
     let stat = String::from_utf8(debugfs(&saved, "stat new.txt")).unwrap();
     assert!(stat.contains("User:  1000   Group:   100") && stat.contains("Size: 8192"), "{stat}");
     assert!(debugfs(&saved, "cat new.txt") == longer, "new.txt reads back different");
+}
+
+#[test]
+fn tells_how_much_is_used() {
+    let _serial = serial();
+    let dir = workspace("usage");
+    let root = dir.join("tree");
+    make_tree(&root);
+    let image = image(&dir, &root, &["-t", "ext4"], "64M");
+    let fs = Ext4::mount_writable(Box::new(image.clone())).unwrap();
+    let before = fs.usage().unwrap();
+    // As e2fsprogs counts them.
+    let stats = String::from_utf8(debugfs(&dir.join("fs.img"), "stats")).unwrap();
+    let count = |name: &str| {
+        let line = stats.lines().find(|line| line.starts_with(name)).unwrap();
+        line.rsplit(' ').next().unwrap().parse::<u64>().unwrap()
+    };
+    assert_eq!(
+        before,
+        Usage {
+            block_size: 4096,
+            blocks: 16384,
+            free_blocks: count("Free blocks:"),
+            inodes: count("Inode count:") as u32,
+            free_inodes: count("Free inodes:") as u32,
+        }
+    );
+    // A file of 1 MiB more takes its 256 blocks, and an inode.
+    write_all(&fs.create("more").unwrap(), 0, &vec![7; 1 << 20]);
+    let after = fs.usage().unwrap();
+    assert!(before.free_blocks - after.free_blocks >= 256, "{before:?} {after:?}");
+    assert_eq!(after.free_inodes, before.free_inodes - 1);
 }

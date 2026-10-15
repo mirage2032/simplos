@@ -83,8 +83,9 @@ The kernel mounts the first disk holding an ext4 (or ext3, or ext2) file
 system to read and write, replaying its journal first if it wasn't unmounted
 cleanly, as the root of every path; with no such disk, the root is an empty
 directory that can't be written. Either way, `/dev` holds `null`, `zero` and
-`tty`, mounted over whatever the disk has there, as on Linux. The shell's `ls`
-and `cat` show what's there.
+`tty`, `fd` and `stdin`, `stdout` and `stderr`, and `/proc` what the kernel
+knows of the machine and its processes, both over whatever the disk has
+there, as on Linux. The shell's `ls` and `cat` show what's there.
 
 `cargo run` attaches `fullkernel/disk.img`, which it makes the first time
 with e2fsprogs' `mke2fs` and keeps, so what's written to it is there next
@@ -109,8 +110,18 @@ stdio) works as it does on Linux: `open`, `openat`, `close`, `read`, `write`,
 `getdents64`, `fcntl`, `fsync`, `mkdir`, `mkdirat`, `rmdir`, `unlink`,
 `unlinkat`, `rename`, `renameat`, `renameat2`, `chdir`, `getcwd` and `umask`;
 and for what isn't a file, `pipe`, `pipe2`, `dup`, `dup2` and `dup3`, and
-`/dev/null`, `/dev/zero` and `/dev/tty`. In the shell, `run cat /hello.txt`
-has the user program read it, and `run` lists its other modes.
+`/dev/null`, `/dev/zero` and `/dev/tty`. `/dev/fd/N`, and `/proc/PID/fd/N`
+for any process's, is descriptor N, which opening it duplicates, as FreeBSD's
+`/dev/fd` does it, and `/dev/stdin` and the others link to `fd/0` and the
+rest. `statfs` and `fstatfs` say how big a file system is and how much of it
+is free. In the shell, `run cat /hello.txt` has the user program read it, and
+`run` lists its other modes.
+
+`/proc` is made as it's read (`proc.rs`), with the files Linux has there
+that busybox's `free`, `ps`, `top`, `df` and `mount` read: `meminfo`,
+`uptime`, `loadavg`, `stat`, `mounts` and `version`; `self`, a link to the
+reader's own directory; and in each process's, its `stat`, `status`,
+`cmdline` and `comm`, and `fd`.
 
 Symbolic links (`symlink`, `symlinkat`, `readlink`, `readlinkat`) are
 followed wherever a path goes through one, as Linux follows them
@@ -133,7 +144,10 @@ what anyone may. `sendfile` copies from one descriptor to another. For now:
   keeps it on ext4's orphan list, which lwext4 doesn't know; the disk's next
   mount takes out any the power went before closing. And a directory that's
   open can't be removed (`EBUSY`);
-- `/dev` holds just those three, and can't be written;
+- `/dev` holds just those devices, and can't be written; and opening
+  `/dev/fd/N` shares N's place in the file, where Linux opens the file anew;
+- `/proc` has none of `maps`, `environ` and the rest, nor load averages, and
+  every process's terminal reads as `tty1`;
 - times are kept to the second, as lwext4 sets none of ext4's nanoseconds;
   reading doesn't set when a file was read, as if mounted `noatime`; and a
   stream of writes through one descriptor sets when it was modified once a
@@ -326,8 +340,6 @@ kernel's own shell. For now:
 
 - busybox is built without `init`, which the kernel would run first, and
   which wants a console and an `inittab` there aren't; and without `tc`;
-- there's no `/proc`, so `ps`, `top`, `df` and `mount` have nothing to say,
-  nor `/dev/fd`, which zsh's `<(...)` needs;
 - the disk's files belong to whoever made it, as `mke2fs -d` copies owners,
   which is why `/etc/zshrc` has `compinit -u`;
 - every write is a transaction of its own, on the disk before the call

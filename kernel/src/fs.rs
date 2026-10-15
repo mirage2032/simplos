@@ -6,6 +6,7 @@
 //! [`ROOT`]'s lock ([`lock`]), and whoever waits for it sleeps.
 
 use crate::io::disk;
+use crate::proc;
 use crate::serial_println;
 use crate::thread::{SleepLock, SleepLockGuard};
 use crate::tty::Tty;
@@ -86,6 +87,13 @@ pub enum Handle {
         append: bool,
         offset: AtomicU64,
     },
+    /// A file in /proc, as it was when it was opened.
+    Proc {
+        /// From the root.
+        path: String,
+        data: Vec<u8>,
+        offset: AtomicU64,
+    },
     Dir {
         /// The disk's handle on it, if it's on the disk.
         dir: Option<ext4::Dir>,
@@ -133,6 +141,34 @@ pub enum Device {
     Tty,
 }
 
+/// /dev's links to /dev/fd's, as Linux has them to /proc/self/fd's.
+fn dev_link(name: &str) -> Option<&'static str> {
+    match name {
+        "stdin" => Some("fd/0"),
+        "stdout" => Some("fd/1"),
+        "stderr" => Some("fd/2"),
+        _ => None,
+    }
+}
+
+/// What the descriptor at `path` is open on, if it's open: /dev/fd/N, the
+/// calling program's descriptor N, or /proc/PID/fd/N, process PID's.
+/// Opening it is `dup`'s, as FreeBSD's fdescfs has it, where Linux opens the
+/// file anew, with a place of its own in it.
+pub fn descriptor(path: &str) -> Option<Arc<Handle>> {
+    let (process, fd) = match on(path) {
+        On::Devices(name) => (crate::thread::current_process()?, name.strip_prefix("fd/")?),
+        On::Proc(within) => {
+            let (id, fd) = within.split_once("/fd/")?;
+            (crate::process::find(id.parse().ok()?)?, fd)
+        }
+        On::Disk => return None,
+    };
+    let fd: usize = fd.parse().ok()?;
+    let files = process.files.lock();
+    files.get(fd)?.as_ref().map(|fd| fd.handle.clone())
+}
+
 /// The device at `path`, a path from the root, if it's one.
 pub fn device(path: &str) -> Option<Device> {
     match on(path) {
@@ -161,7 +197,7 @@ pub fn special(handle: &Handle) -> Option<Metadata> {
         Handle::Zero => Some(device_metadata(Device::Zero)),
         // A FIFO.
         Handle::Pipe { .. } => Some(special_metadata(0, 0o010600)),
-        Handle::File { .. } | Handle::Dir { .. } => None,
+        Handle::File { .. } | Handle::Dir { .. } | Handle::Proc { .. } => None,
     }
 }
 
@@ -188,18 +224,23 @@ fn directory(inode: u32, permissions: u32) -> Metadata {
     }
 }
 
-/// Which file system a path from the root is on: the devices, with the
-/// name within /dev ("" for /dev itself), or else the disk.
+/// Which file system a path from the root is on: the devices or /proc,
+/// with the path within (`""` for /dev or /proc itself), or else the disk.
 enum On<'p> {
     Devices(&'p str),
+    Proc(&'p str),
     Disk,
 }
 
 fn on(path: &str) -> On<'_> {
-    match path.strip_prefix("dev") {
-        Some("") => On::Devices(""),
-        Some(rest) => rest.strip_prefix('/').map_or(On::Disk, On::Devices),
-        None => On::Disk,
+    let within = |name: &str| match path.strip_prefix(name)? {
+        "" => Some(""),
+        rest => rest.strip_prefix('/'),
+    };
+    match (within("dev"), within("proc")) {
+        (Some(rest), _) => On::Devices(rest),
+        (_, Some(rest)) => On::Proc(rest),
+        _ => On::Disk,
     }
 }
 
@@ -216,9 +257,20 @@ pub struct Tree<'a> {
 impl Tree<'_> {
     /// What's at `path`, a path from the root.
     pub fn metadata(&self, path: &str) -> Result<Metadata, Error> {
+        if let Some(handle) = descriptor(path) {
+            return self.handle_metadata(&handle);
+        }
         match on(path) {
             On::Devices("") => Ok(directory(DEV_INODE, 0o755)),
+            On::Devices("fd") => Ok(directory(proc::inode(path), 0o555)),
+            On::Devices(name) if let Some(target) = dev_link(name) => {
+                Ok(proc::Node::Link(target.into()).metadata(path))
+            }
             On::Devices(_) => device(path).map(device_metadata).ok_or(Error::NotFound),
+            On::Proc(within) => {
+                let node = proc::node(within, self.disk.as_ref()).ok_or(Error::NotFound)?;
+                Ok(node.metadata(path))
+            }
             On::Disk => match self.disk.as_ref() {
                 Some(disk) => disk.metadata(path),
                 // The empty root, with ext4's root's inode number.
@@ -238,11 +290,30 @@ impl Tree<'_> {
                     kind: Kind::Other,
                     inode,
                 };
-                (None, DEVICES.into_iter().map(entry).collect())
+                let mut entries: Vec<DirEntry> = DEVICES.into_iter().map(entry).collect();
+                let named = |name: &str, kind| DirEntry {
+                    name: name.into(),
+                    kind,
+                    inode: proc::inode(&alloc::format!("dev/{name}")),
+                };
+                entries.push(named("fd", Kind::Directory));
+                for name in ["stdin", "stdout", "stderr"] {
+                    entries.push(named(name, Kind::Symlink));
+                }
+                (None, entries)
             }
+            On::Devices("fd") => match crate::thread::current_process() {
+                Some(process) => (None, proc::descriptors(&process, path)),
+                None => (None, Vec::new()),
+            },
             On::Devices(_) => {
                 return Err(self.metadata(path).err().unwrap_or(Error::NotADirectory));
             }
+            On::Proc(within) => match proc::node(within, self.disk.as_ref()) {
+                Some(proc::Node::Dir(entries)) => (None, entries),
+                Some(_) => return Err(Error::NotADirectory),
+                None => return Err(Error::NotFound),
+            },
             On::Disk => match self.disk.as_ref() {
                 Some(disk) => {
                     let dir = disk.open_dir(path)?;
@@ -253,17 +324,77 @@ impl Tree<'_> {
                 None => return Err(Error::NotFound),
             },
         };
-        if path.is_empty() && !entries.iter().any(|entry| entry.name == "dev") {
+        if path.is_empty() {
+            entries.retain(|entry| entry.name != "dev" && entry.name != "proc");
             entries.push(DirEntry { name: "dev".into(), kind: Kind::Directory, inode: DEV_INODE });
+            let inode = proc::inode("proc");
+            entries.push(DirEntry { name: "proc".into(), kind: Kind::Directory, inode });
         }
         Ok((dir, entries))
+    }
+
+    /// What `fstat` tells of the file `handle` is open on.
+    pub fn handle_metadata(&self, handle: &Handle) -> Result<Metadata, Error> {
+        match handle {
+            Handle::File { file, .. } => file.metadata(),
+            Handle::Dir { dir: Some(dir), .. } => dir.metadata(),
+            Handle::Dir { path, .. } => self.metadata(path),
+            Handle::Proc { path, .. } => Ok(proc::Node::File(Vec::new()).metadata(path)),
+            special => Ok(self::special(special).expect("not on the disk")),
+        }
+    }
+
+    /// Where the symbolic link at `path` points, as it was given.
+    pub fn read_link(&self, path: &str) -> Result<Vec<u8>, Error> {
+        match on(path) {
+            On::Devices(name) => dev_link(name)
+                .map(|target| target.as_bytes().to_vec())
+                .ok_or(Error::InvalidArgument),
+            On::Proc(within) => match proc::node(within, self.disk.as_ref()) {
+                Some(proc::Node::Link(target)) => Ok(target),
+                Some(_) => Err(Error::InvalidArgument),
+                None => Err(Error::NotFound),
+            },
+            On::Disk => self.disk(path)?.read_link(path),
+        }
+    }
+
+    /// What `statfs` tells of the file system `path` is on: its type, by
+    /// Linux's number for it, and how big it is and how much is free: none
+    /// of it, for those that are only in memory.
+    pub fn statfs(&self, path: &str) -> Result<(u64, ext4::Usage), Error> {
+        const EXT4_SUPER_MAGIC: u64 = 0xEF53;
+        const PROC_SUPER_MAGIC: u64 = 0x9FA0;
+        const TMPFS_MAGIC: u64 = 0x0102_1994;
+        const RAMFS_MAGIC: u64 = 0x8584_58F6;
+        let none =
+            ext4::Usage { block_size: 4096, blocks: 0, free_blocks: 0, inodes: 0, free_inodes: 0 };
+        match on(path) {
+            On::Devices(_) => Ok((TMPFS_MAGIC, none)),
+            On::Proc(_) => Ok((PROC_SUPER_MAGIC, none)),
+            On::Disk => match self.disk.as_ref() {
+                Some(disk) => Ok((EXT4_SUPER_MAGIC, disk.usage()?)),
+                None => Ok((RAMFS_MAGIC, none)),
+            },
+        }
+    }
+
+    /// The file in /proc at `path`, as it is now: none if it isn't one.
+    pub fn proc_file(&self, path: &str) -> Option<Vec<u8>> {
+        match on(path) {
+            On::Proc(within) => match proc::node(within, self.disk.as_ref())? {
+                proc::Node::File(data) => Some(data),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     /// The disk, for what only it can do: making, changing and removing
     /// files. Neither /dev nor the root without a disk can be written.
     pub fn disk(&self, path: &str) -> Result<&Ext4, Error> {
         match on(path) {
-            On::Devices(_) => Err(Error::ReadOnly),
+            On::Devices(_) | On::Proc(_) => Err(Error::ReadOnly),
             On::Disk => self.disk.as_ref().ok_or(Error::ReadOnly),
         }
     }
@@ -309,7 +440,7 @@ pub fn lookup(base: &str, path: &str, follow_last: bool) -> Result<String, i64> 
                 if links > 40 {
                     return Err(ELOOP);
                 }
-                let target = tree.disk(&at).and_then(|disk| disk.read_link(&at)).map_err(errno)?;
+                let target = tree.read_link(&at).map_err(errno)?;
                 here.pop();
                 if target.starts_with(b"/") {
                     here.clear();

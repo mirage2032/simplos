@@ -247,6 +247,11 @@ impl Signals {
         self.pending.load(Ordering::Acquire) & !self.blocked.load(Ordering::Relaxed) != 0
     }
 
+    /// Whether it's stopped, by SIGSTOP or the like.
+    pub fn stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
+
     pub fn pending(&self) -> u64 {
         self.pending.load(Ordering::Acquire)
     }

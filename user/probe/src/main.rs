@@ -1144,6 +1144,38 @@ fn main() {
             ]);
             println!("{told} {machine:?} {groups:?} {nice:?} {inherited} {}", syscall(24, 0, 0, 0));
         }
+        // What /proc says of it: its memory, as it maps a megabyte and
+        // unmaps it again, and its name; and statfs and fstatfs of the
+        // disk, which agree.
+        Some("proc") => {
+            let rss = || {
+                let stat = or_fail("/proc/self/stat", fs::read_to_string("/proc/self/stat"));
+                // The 24th field, the 22nd after the name.
+                let after = stat.rsplit(')').next().unwrap_or_default();
+                after
+                    .split_whitespace()
+                    .nth(21)
+                    .and_then(|rss| rss.parse::<i64>().ok())
+                    .unwrap_or(-1)
+            };
+            let before = rss();
+            let addr = syscall5(9, [0, 1 << 20, 3, 0x22, 0]);
+            let mapped = rss() - before;
+            syscall(11, addr as usize, 1 << 20, 0);
+            let unmapped = rss() - before;
+            let (mut by_path, mut by_fd) = ([0u64; 15], [0u64; 15]);
+            syscall(137, c"/".as_ptr() as usize, by_path.as_mut_ptr() as usize, 0);
+            let file = or_fail("/hello.txt", fs::File::open("/hello.txt"));
+            syscall(138, file.as_raw_fd() as usize, by_fd.as_mut_ptr() as usize, 0);
+            let name = or_fail("/proc/self/comm", fs::read_to_string("/proc/self/comm"));
+            println!(
+                "{mapped} {unmapped} {:#x} {} {} {}",
+                by_path[0],
+                by_path == by_fd,
+                by_path[1],
+                name.trim_end()
+            );
+        }
         Some(other) => {
             eprintln!("probe: unknown mode {other:?}");
             std::process::exit(2);

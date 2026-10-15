@@ -100,6 +100,10 @@ pub struct Process {
     pub alarm: Mutex<time::Alarm>,
     /// The program it's a copy of; none for one the kernel started.
     parent: Weak<Process>,
+    /// What it runs, as /proc tells it. Taken with interrupts on.
+    pub command: Mutex<Command>,
+    /// When it started, in nanoseconds since boot.
+    pub started: u64,
     /// The copies it made that it hasn't waited for, ended or not. Taken only
     /// with interrupts off, as `wait4` looks at them from
     /// `WaitQueue::wait_until`.
@@ -110,6 +114,37 @@ pub struct Process {
     /// Woken as each of them ends.
     pub child_exited: WaitQueue,
 }
+
+/// What a process runs: its program's name, as Linux's `comm` is, the last
+/// part of the path it was run by, at most 15 bytes; and its arguments,
+/// each ending in a NUL, as /proc/PID/cmdline has them.
+#[derive(Clone, Default)]
+pub struct Command {
+    pub name: String,
+    pub args: Vec<u8>,
+}
+
+impl Command {
+    pub fn new(path: &[u8], args: &[&[u8]]) -> Command {
+        let name = path.rsplit(|&byte| byte == b'/').next().unwrap_or_default();
+        let name = String::from_utf8_lossy(&name[..name.len().min(15)]).into_owned();
+        Command {
+            name,
+            args: args.iter().flat_map(|arg| arg.iter().chain(&[0])).copied().collect(),
+        }
+    }
+}
+
+/// The CPU's time, in timer ticks, as /proc/stat counts it: running
+/// programs, in the kernel for them, and neither.
+pub struct CpuTime {
+    pub user: AtomicU64,
+    pub system: AtomicU64,
+    pub idle: AtomicU64,
+}
+
+pub static CPU_TIME: CpuTime =
+    CpuTime { user: AtomicU64::new(0), system: AtomicU64::new(0), idle: AtomicU64::new(0) };
 
 /// CPU time, in timer ticks: a program's own, running and in the kernel for
 /// it; and that of the children it has waited for, theirs and their own
@@ -137,11 +172,18 @@ impl Times {
 /// From the timer interrupt: the tick that's ending is the running program's,
 /// its own (`user`) or the kernel's for it. Nothing for the kernel's threads.
 pub fn charge_tick(user: bool) {
-    thread::with_current_user(|current| {
+    let charged = thread::with_current_user(|current| {
         let times = &current.process.times;
         let count = if user { &times.user } else { &times.system };
         count.fetch_add(1, Ordering::Relaxed);
     });
+    // The machine's: with no program's thread running, it was idle.
+    let count = match (charged, user) {
+        (None, _) => &CPU_TIME.idle,
+        (Some(()), true) => &CPU_TIME.user,
+        (Some(()), false) => &CPU_TIME.system,
+    };
+    count.fetch_add(1, Ordering::Relaxed);
 }
 
 /// A file descriptor: what it refers to, shared with its copies, and whether
@@ -321,6 +363,8 @@ pub fn spawn_with(
         parent: Weak::new(),
         children: Mutex::new(Vec::new()),
         child_exited: WaitQueue::new(),
+        command: Mutex::new(Command::new(args.first().copied().unwrap_or_default(), &args)),
+        started: time::since_boot(),
     });
     register(&process);
     let user = UserState {
@@ -346,9 +390,13 @@ pub fn spawn_program(
 ) -> Result<Arc<Process>, i64> {
     let mut args: Vec<Vec<u8>> = args.iter().map(|arg| arg.as_bytes().to_vec()).collect();
     let elf = program_for("", path, &mut args)?;
+    let command =
+        Command::new(path.as_bytes(), &args.iter().map(Vec::as_slice).collect::<Vec<_>>());
     let args: Vec<String> = args.iter().map(|arg| String::from_utf8_lossy(arg).into()).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    spawn_with(&elf, &args, env, files).map_err(load_errno)
+    let process = spawn_with(&elf, &args, env, files).map_err(load_errno)?;
+    *process.command.lock() = command;
+    Ok(process)
 }
 
 /// The ELF program that runs for `path`, from the directory `cwd` (a path
@@ -460,6 +508,8 @@ pub fn fork(parent: &Arc<Process>, registers: Registers) -> Option<u64> {
         parent: Arc::downgrade(parent),
         children: Mutex::new(Vec::new()),
         child_exited: WaitQueue::new(),
+        command: Mutex::new(parent.command.lock().clone()),
+        started: time::since_boot(),
     });
     register(&child);
     let user = thread::with_current_user(|user| user.fork(child.clone(), pml4, registers))?;

@@ -118,7 +118,7 @@ fn failed(path: &str, error: &str) -> (i32, String) {
 #[test_case]
 fn a_program_reads_files_and_lists_directories() {
     assert_eq!(run(&["cat", "/hello.txt", "/dir/nested/deep.txt"]), ok("hello from ext4\ndeep\n"));
-    assert_eq!(run(&["ls", "/"]), ok("bin/\ndev/\ndir/\nhello.txt\nlost+found/\n"));
+    assert_eq!(run(&["ls", "/"]), ok("bin/\ndev/\ndir/\nhello.txt\nlost+found/\nproc/\n"));
     assert_eq!(run(&["ls", "/dir/nested"]), ok("deep.txt\n"));
     // Relative to the working directory, the root; and the long way round.
     assert_eq!(run(&["cat", "hello.txt"]), ok("hello from ext4\n"));
@@ -249,7 +249,7 @@ fn a_program_makes_and_removes_directories() {
     // unlinkat, each relative to the directory above.
     assert_eq!(run(&["write", "/made/a/b/again.txt", "x"]), ok(""));
     assert_eq!(run(&["rm-r", "/made"]), ok(""));
-    assert_eq!(run(&["ls", "/"]), ok("bin/\ndev/\ndir/\nhello.txt\nlost+found/\n"));
+    assert_eq!(run(&["ls", "/"]), ok("bin/\ndev/\ndir/\nhello.txt\nlost+found/\nproc/\n"));
 }
 
 #[test_case]
@@ -369,7 +369,7 @@ fn bad_pipe_calls_are_refused() {
 #[test_case]
 fn the_devices_are_in_dev() {
     // Wherever the disk has it or not: mounted over it, as on Linux.
-    assert_eq!(run(&["ls", "/dev"]), ok("null\ntty\nzero\n"));
+    assert_eq!(run(&["ls", "/dev"]), ok("fd/\nnull\nstderr\nstdin\nstdout\ntty\nzero\n"));
     assert_eq!(run(&["stat", "/dev"]), ok("0 dir 755\n0 dir 755\n"));
     assert_eq!(run(&["cd", "/dev", "null"]), ok("/dev\n"));
     assert_eq!(run(&["cd", "/dev/..", "hello.txt"]), ok("/\nhello from ext4\n"));
@@ -396,7 +396,7 @@ fn without_a_disk_there_is_still_a_root() {
     assert_eq!(
         seen,
         [
-            ok("dev/\n"),
+            ok("dev/\nproc/\n"),
             ok("0 dir 755\n0 dir 755\n"),
             ok(""),
             failed("/hello.txt", "No such file or directory (os error 2)"),
@@ -449,4 +449,11 @@ fn a_file_removed_or_replaced_while_open_stays_until_closed() {
     assert_eq!(run(&["unlinked"]), ok("true \"here\\n\" \"old\\n\" \"new\\n\"\n"));
     let root = ROOT.lock();
     assert!(root.as_ref().unwrap().read_dir("lost+found").unwrap().is_empty());
+}
+
+#[test_case]
+fn a_program_reads_of_itself_in_proc() {
+    // Its pages, 256 more as it maps a megabyte and none once it unmaps it;
+    // ext4's type and block size by path and by descriptor, alike; its name.
+    assert_eq!(run(&["proc"]), ok("256 0 0xef53 true 4096 probe\n"));
 }

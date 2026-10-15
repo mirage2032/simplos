@@ -17,6 +17,7 @@ use ext4::{Kind, Metadata};
 const ENOENT: i64 = 2;
 const ENXIO: i64 = 6;
 const EAGAIN: i64 = 11;
+const EACCES: i64 = 13;
 const EEXIST: i64 = 17;
 const ENOTDIR: i64 = 20;
 const EISDIR: i64 = 21;
@@ -169,6 +170,9 @@ pub fn open(process: &Process, dirfd: u64, path: u64, flags: u64, mode: u64) -> 
         let follow = flags & O_NOFOLLOW == 0 && flags & (O_CREAT | O_EXCL) != O_CREAT | O_EXCL;
         let path = lookup_with(process, dirfd, &path_at(process, path)?, follow)?;
         let cloexec = flags & O_CLOEXEC != 0;
+        if let Some(handle) = fs::descriptor(&path) {
+            return install_from(process, handle, 0, cloexec);
+        }
         if let Some(device) = fs::device(&path) {
             let handle = match device {
                 Device::Null => Handle::Null,
@@ -190,6 +194,12 @@ pub fn open(process: &Process, dirfd: u64, path: u64, flags: u64, mode: u64) -> 
             Ok(_) if flags & O_CREAT != 0 && flags & O_EXCL != 0 => return Err(EEXIST),
             Ok(Metadata { kind: Kind::Symlink, .. }) => return Err(ELOOP),
             Ok(_) if flags & O_DIRECTORY != 0 => return Err(ENOTDIR),
+            Ok(_) if let Some(data) = tree.proc_file(&path) => {
+                if access != O_RDONLY {
+                    return Err(EACCES);
+                }
+                Handle::Proc { path, data, offset: 0.into() }
+            }
             Err(ext4::Error::NotFound) if flags & O_CREAT != 0 => {
                 let disk = tree.disk(&path).map_err(fs::errno)?;
                 let file = disk.create(&path).map_err(fs::errno)?;
@@ -360,6 +370,15 @@ fn read_data(process: &Process, fd: u64, count: u64, at: Option<u64>) -> Result<
             end.read(count, !nonblocking.load(Relaxed)).map_err(read_errno)
         }
         Handle::Dir { .. } => Err(EISDIR),
+        Handle::Proc { data, offset, .. } => {
+            let from = at.unwrap_or_else(|| offset.load(Relaxed));
+            let start = (from as usize).min(data.len());
+            let read = data[start..(start + count).min(data.len())].to_vec();
+            if at.is_none() {
+                offset.store((start + read.len()) as u64, Relaxed);
+            }
+            Ok(read)
+        }
         Handle::File { read: false, .. } => Err(EBADF),
         Handle::File { file, offset, .. } => {
             let _tree = fs::lock();
@@ -403,7 +422,7 @@ fn write_data(process: &Process, fd: u64, data: &[u8], at: Option<u64>) -> Resul
             Err(WriteError::Full) => Err(EAGAIN),
             Err(WriteError::Interrupted) => Err(ERESTARTSYS),
         },
-        Handle::Dir { .. } | Handle::File { write: false, .. } => Err(EBADF),
+        Handle::Dir { .. } | Handle::Proc { .. } | Handle::File { write: false, .. } => Err(EBADF),
         Handle::File { file, append, offset, .. } => {
             let _tree = fs::lock();
             // At the end for a file opened to append, even with `pwrite`, as
@@ -432,7 +451,7 @@ pub fn readlinkat(process: &Process, dirfd: u64, path: u64, buf: u64, size: u64)
         let path = lookup_with(process, dirfd, &path_at(process, path)?, false)?;
         let tree = fs::lock();
         let target = match tree.metadata(&path).map_err(fs::errno)?.kind {
-            Kind::Symlink => tree.disk(&path).and_then(|disk| disk.read_link(&path)),
+            Kind::Symlink => tree.read_link(&path),
             _ => return Err(EINVAL),
         };
         let target = target.map_err(fs::errno)?;
@@ -492,12 +511,13 @@ pub fn lseek(process: &Process, fd: u64, offset: u64, whence: u64) -> i64 {
         match &*handle(process, fd)? {
             Handle::Tty { .. } | Handle::Pipe { .. } => Err(ESPIPE),
             Handle::Null | Handle::Zero => Ok(0),
-            Handle::File { file, offset: place, .. } => {
+            handle @ (Handle::File { offset: place, .. } | Handle::Proc { offset: place, .. }) => {
                 let _tree = fs::lock();
-                let from = match whence {
-                    SEEK_SET => 0,
-                    SEEK_CUR => place.load(Relaxed),
-                    SEEK_END => file.size().map_err(fs::errno)?,
+                let from = match (whence, handle) {
+                    (SEEK_SET, _) => 0,
+                    (SEEK_CUR, _) => place.load(Relaxed),
+                    (SEEK_END, Handle::File { file, .. }) => file.size().map_err(fs::errno)?,
+                    (SEEK_END, Handle::Proc { data, .. }) => data.len() as u64,
                     _ => return Err(EINVAL),
                 };
                 let to = (from as i64).checked_add(offset).filter(|to| *to >= 0).ok_or(EINVAL)?;
@@ -520,13 +540,7 @@ pub fn lseek(process: &Process, fd: u64, offset: u64, whence: u64) -> i64 {
 
 /// The descriptor's file's metadata.
 fn metadata(handle: &Handle) -> Result<Metadata> {
-    let tree = fs::lock();
-    match handle {
-        Handle::File { file, .. } => file.metadata().map_err(fs::errno),
-        Handle::Dir { dir: Some(dir), .. } => dir.metadata().map_err(fs::errno),
-        Handle::Dir { path, .. } => tree.metadata(path).map_err(fs::errno),
-        special => Ok(fs::special(special).expect("not on the disk")),
-    }
+    fs::lock().handle_metadata(handle).map_err(fs::errno)
 }
 
 /// Linux's `struct stat` for x86-64, from `metadata`.
@@ -567,8 +581,8 @@ pub fn fstat(process: &Process, fd: u64, buf: u64) -> i64 {
     ret(handle(process, fd).and_then(|handle| put_stat(process, &metadata(&handle)?, buf)))
 }
 
-/// `stat`, `lstat` and `fstatat`, which are all the same: no symbolic link
-/// is followed yet.
+/// `stat`, `lstat` and `fstatat`: a symbolic link at the end followed,
+/// unless `AT_SYMLINK_NOFOLLOW` asks for the link itself.
 pub fn newfstatat(process: &Process, dirfd: u64, path: u64, buf: u64, flags: u64) -> i64 {
     ret((|| {
         let path = path_at(process, path)?;
@@ -583,6 +597,57 @@ pub fn newfstatat(process: &Process, dirfd: u64, path: u64, buf: u64, flags: u64
         let metadata = fs::lock().metadata(&path).map_err(fs::errno)?;
         put_stat(process, &metadata, buf)
     })())
+}
+
+/// `statfs`: how big the file system the file at `path` is on is, and how
+/// much of it is free.
+pub fn statfs(process: &Process, path: u64, buf: u64) -> i64 {
+    ret((|| {
+        let path = lookup(process, AT_FDCWD, &path_at(process, path)?)?;
+        let tree = fs::lock();
+        tree.metadata(&path).map_err(fs::errno)?;
+        put_statfs(process, tree.statfs(&path).map_err(fs::errno)?, buf)
+    })())
+}
+
+/// `fstatfs`: `statfs` for the file `fd` is open on.
+pub fn fstatfs(process: &Process, fd: u64, buf: u64) -> i64 {
+    ret((|| {
+        let path = match &*handle(process, fd)? {
+            // Anywhere on the disk.
+            Handle::File { .. } => String::new(),
+            Handle::Dir { path, .. } | Handle::Proc { path, .. } => path.clone(),
+            _ => String::from("dev"),
+        };
+        put_statfs(process, fs::lock().statfs(&path).map_err(fs::errno)?, buf)
+    })())
+}
+
+/// Linux's `struct statfs` for x86-64.
+fn put_statfs(process: &Process, (kind, usage): (u64, ext4::Usage), buf: u64) -> Result<i64> {
+    let fields = [
+        kind,
+        u64::from(usage.block_size),
+        usage.blocks,
+        usage.free_blocks,
+        // Available, to those who aren't root: root may have it all.
+        usage.free_blocks,
+        u64::from(usage.inodes),
+        u64::from(usage.free_inodes),
+        // The ID, the longest name, the fragment size, the flags, and
+        // spares.
+        0,
+        255,
+        u64::from(usage.block_size),
+        0,
+        0,
+        0,
+        0,
+        0,
+    ];
+    let statfs: Vec<u8> = fields.iter().flat_map(|field| field.to_le_bytes()).collect();
+    process.memory.lock().space.write(buf, &statfs).ok_or(EFAULT)?;
+    Ok(0)
 }
 
 /// Hand out the directory's next entries, as many as fit in `count` bytes,
@@ -661,6 +726,7 @@ pub fn fcntl(process: &Process, fd: u64, command: u64, arg: u64) -> i64 {
                     end.write as i64 | nonblocking_flag(nonblocking)
                 }
                 Handle::Dir { .. } => (O_RDONLY | O_DIRECTORY) as i64,
+                Handle::Proc { .. } => O_RDONLY as i64,
                 Handle::File { read, write, append, .. } => {
                     let access = match (read, write) {
                         (true, false) => O_RDONLY,
@@ -985,7 +1051,6 @@ pub fn faccessat(process: &Process, dirfd: u64, path: u64, mode: u64, flags: u64
     const X_OK: u64 = 1;
     const W_OK: u64 = 2;
     const AT_EACCESS: u64 = 0x200;
-    const EACCES: i64 = 13;
     const EROFS: i64 = 30;
     ret((|| {
         if mode & !7 != 0 || flags & !(AT_EACCESS | AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {

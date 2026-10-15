@@ -184,13 +184,15 @@ pub fn alloc_dma_frame() -> Option<(PhysAddr, *mut u8)> {
 /// lower half.
 pub struct AddressSpace {
     pml4: PhysFrame,
+    /// How many pages the program has mapped, each with a frame.
+    pages: u64,
 }
 
 impl AddressSpace {
     /// `None` when memory runs out.
     pub fn new() -> Option<AddressSpace> {
         let pml4 = FRAMES.lock().as_mut()?.allocate_frame()?;
-        let space = AddressSpace { pml4 };
+        let space = AddressSpace { pml4, pages: 0 };
         let table = table(pml4);
         table.zero();
         let kernel = PAGE_TABLE.lock();
@@ -212,13 +214,19 @@ impl AddressSpace {
     /// shortcut: every page is copied at once; share them copy-on-write when
     /// forking big programs gets slow.
     pub fn duplicate(&self) -> Option<AddressSpace> {
-        let copy = AddressSpace::new()?;
+        let mut copy = AddressSpace::new()?;
+        copy.pages = self.pages;
         // Declared after `copy`, so released before a failed copy's `drop`
         // takes it again.
         let mut frames = FRAMES.lock();
         copy_tables(self.pml4, copy.pml4, 4, 256, frames.as_mut()?)?;
         drop(frames);
         Some(copy)
+    }
+
+    /// How many pages the program has mapped, each with a frame of its own.
+    pub fn pages(&self) -> u64 {
+        self.pages
     }
 
     /// What CR3 holds while the program runs.
@@ -240,30 +248,37 @@ impl AddressSpace {
         // The tables above must let ring 3 through too.
         let table_flags =
             PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
-        let mut frames = FRAMES.lock();
-        let frames = frames.as_mut()?;
-        let mut mapper = self.mapper();
-        for page in pages {
-            if let TranslateResult::Mapped { flags: old, .. } =
-                mapper.translate(page.start_address())
-            {
-                // Writable if either asks; no-execute only if both do.
-                let nx = PageTableFlags::NO_EXECUTE;
-                let union = ((old | flags) & !nx) | (old & flags & nx);
-                // Safety: the program's own page, keeping its frame.
-                unsafe { mapper.update_flags(page, union) }.ok()?.flush();
-                continue;
+        // Counted as they're mapped, even if memory runs out part way.
+        let mut mapped = 0;
+        let done = (|| {
+            let mut frames = FRAMES.lock();
+            let frames = frames.as_mut()?;
+            let mut mapper = self.mapper();
+            for page in pages {
+                if let TranslateResult::Mapped { flags: old, .. } =
+                    mapper.translate(page.start_address())
+                {
+                    // Writable if either asks; no-execute only if both do.
+                    let nx = PageTableFlags::NO_EXECUTE;
+                    let union = ((old | flags) & !nx) | (old & flags & nx);
+                    // Safety: the program's own page, keeping its frame.
+                    unsafe { mapper.update_flags(page, union) }.ok()?.flush();
+                    continue;
+                }
+                let frame = frames.allocate_frame()?;
+                // Zeroed: a frame comes back holding whatever was in it before.
+                // Safety: just allocated, so ours alone.
+                unsafe { phys_ptr(frame.start_address())?.write_bytes(0, 4096) };
+                // Safety: a lower-half page of this address space, unmapped until now.
+                unsafe { mapper.map_to_with_table_flags(page, frame, flags, table_flags, frames) }
+                    .ok()?
+                    .flush();
+                mapped += 1;
             }
-            let frame = frames.allocate_frame()?;
-            // Zeroed: a frame comes back holding whatever was in it before.
-            // Safety: just allocated, so ours alone.
-            unsafe { phys_ptr(frame.start_address())?.write_bytes(0, 4096) };
-            // Safety: a lower-half page of this address space, unmapped until now.
-            unsafe { mapper.map_to_with_table_flags(page, frame, flags, table_flags, frames) }
-                .ok()?
-                .flush();
-        }
-        Some(())
+            Some(())
+        })();
+        self.pages += mapped;
+        done
     }
 
     /// Unmap `pages` and free their frames. Pages that aren't mapped are skipped.
@@ -271,13 +286,16 @@ impl AddressSpace {
         let mut frames = FRAMES.lock();
         let Some(frames) = frames.as_mut() else { return };
         let mut mapper = self.mapper();
+        let mut unmapped = 0;
         for page in pages {
             if let Ok((frame, flush)) = mapper.unmap(page) {
                 flush.flush();
                 // Safety: unmapped from the only address space that had it.
                 unsafe { frames.deallocate_frame(frame) };
+                unmapped += 1;
             }
         }
+        self.pages -= unmapped;
     }
 
     /// Give the mapped pages among `pages` these flags, besides being present

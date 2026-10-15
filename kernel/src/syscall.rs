@@ -14,7 +14,7 @@ mod processes;
 mod signals;
 mod system;
 
-pub use system::{DEFAULT_LIMITS, LIMITS};
+pub use system::{DEFAULT_LIMITS, LIMITS, RELEASE};
 
 use crate::fs::Handle;
 use crate::io::interrupts::gdt;
@@ -319,6 +319,8 @@ fn call(frame: &Frame) -> i64 {
         76 => files::truncate(&process, a0, a1),
         77 => files::ftruncate(&process, a0, a1),
         131 => signals::sigaltstack(&process, a0, a1, frame.rsp),
+        137 => files::statfs(&process, a0, a1),
+        138 => files::fstatfs(&process, a0, a1),
         140 => system::getpriority(&process, a0, a1),
         141 => system::setpriority(&process, a0, a1, a2),
         158 => arch_prctl(&process, a0, a1),
