@@ -199,7 +199,7 @@ fn send_to(targets: &[Arc<Process>], signal: u64, info: Info) -> Result<i64> {
 }
 
 /// The process numbered `pid`; `None` for 0, which means the caller.
-fn other(pid: u64) -> Result<Option<Arc<Process>>> {
+pub(super) fn other(pid: u64) -> Result<Option<Arc<Process>>> {
     match pid {
         0 => Ok(None),
         pid => process::find(pid).map(Some).ok_or(ESRCH),

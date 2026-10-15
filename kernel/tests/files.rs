@@ -367,6 +367,14 @@ fn bad_pipe_calls_are_refused() {
 }
 
 #[test_case]
+fn programs_waiting_to_write_into_a_pipe_leave_the_kernel_room() {
+    // Sixteen copies each writing a megabyte into a full pipe that no one
+    // reads: each waits, with what it's writing in the kernel's heap, which
+    // has less room left than sixteen megabytes.
+    assert_eq!(run(&["pipe-writers", "16"]), ok("16\n"));
+}
+
+#[test_case]
 fn the_devices_are_in_dev() {
     // Wherever the disk has it or not: mounted over it, as on Linux.
     assert_eq!(run(&["ls", "/dev"]), ok("fd/\nnull\nstderr\nstdin\nstdout\ntty\nzero\n"));

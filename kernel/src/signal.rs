@@ -265,11 +265,18 @@ impl Signals {
         self.blocked.store(mask & !UNBLOCKABLE, Ordering::Relaxed);
     }
 
-    /// For `rt_sigsuspend`: block `mask` until a handler has run, then what
-    /// was blocked before.
+    /// For `rt_sigsuspend` and `ppoll`: block `mask` until a handler has
+    /// run, or `end_suspend`, then what was blocked before.
     pub fn suspend_with(&self, mask: u64) {
         *self.saved_mask.lock() = Some(self.blocked());
         self.set_blocked(mask);
+    }
+
+    /// Block again what `suspend_with` replaced, if no handler has yet.
+    pub fn end_suspend(&self) {
+        if let Some(mask) = self.saved_mask.lock().take() {
+            self.set_blocked(mask);
+        }
     }
 
     pub fn action(&self, signal: usize) -> Action {
@@ -465,9 +472,7 @@ pub fn deliver(process: Arc<Process>, registers: &mut Registers, mut syscall: Op
     if let Some(call) = syscall.filter(Syscall::interrupted) {
         restart(registers, call.number);
     }
-    if let Some(mask) = signals.saved_mask.lock().take() {
-        signals.set_blocked(mask);
-    }
+    signals.end_suspend();
 }
 
 /// Back to the `syscall` instruction, two bytes back, with its number again.
@@ -517,7 +522,9 @@ fn setup_frame(
     let altstack = process.signals.altstack();
     let on_altstack = altstack.holds(registers.rsp);
     let top = match action.flags & SA_ONSTACK != 0 && altstack.enabled && !on_altstack {
-        true => altstack.sp + altstack.size,
+        // An alternate stack past the end of memory is one nothing can be
+        // written to, as one that isn't mapped.
+        true => altstack.sp.checked_add(altstack.size)?,
         // Past the red zone the ABI gives code below its stack pointer.
         false => registers.rsp.checked_sub(128)?,
     };

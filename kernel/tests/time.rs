@@ -78,3 +78,11 @@ fn alarms_go_off() {
         ok("-4 true true 0 true 10 exit status: 0 signal: 14 Err(Some(4))\n")
     );
 }
+
+#[test_case]
+fn alarms_too_far_off_to_count_to_never_come() {
+    // One due in 2^63 seconds, which is more nanoseconds than there are:
+    // not now, nor in a while, and still far off; and one due now that
+    // repeats that far apart, once.
+    assert_eq!(run(&["far-alarms"]), ok("0 0 true 1\n"));
+}

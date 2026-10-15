@@ -4,9 +4,11 @@
 mod common;
 
 use common::*;
-use ext4::{Changes, Error, Ext4, Kind, Usage};
+use ext4::{BlockDevice, Changes, Error, Ext4, Kind, Usage};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Unlike `big`'s, and a few bytes into its last block.
 fn bigger() -> Vec<u8> {
@@ -455,6 +457,80 @@ fn makes_small_writes_as_one() {
     assert_eq!(debugfs(&saved, "cat lines"), lines);
 }
 
+/// A file made longer has zeros written into it many blocks at a time:
+/// each write is a transaction, which costs the device a handful of its own
+/// writes however little it holds, and its every write a flush in simplos.
+#[test]
+fn grows_a_file_in_few_writes() {
+    let _serial = serial();
+    let dir = workspace("grows");
+    let root = dir.join("tree");
+    make_tree(&root);
+    let image = image(&dir, &root, &["-t", "ext4", "-b", "4096"], "64M");
+    let fs = Ext4::mount_writable(Box::new(image.clone())).unwrap();
+    let writes = || image.writes.lock().unwrap().len();
+    let file = fs.create("grown").unwrap();
+    let start = writes();
+    file.set_len(4 << 20).unwrap();
+    fs.sync().unwrap();
+    let written = writes() - start;
+    assert!(written < 1000, "{written} of the device's writes for 4 MiB of zeros");
+    drop((file, fs));
+
+    let saved = dir.join("written.img");
+    image.save(&saved);
+    fsck(&saved).unwrap();
+    assert!(debugfs(&saved, "cat grown") == vec![0; 4 << 20], "not 4 MiB of zeros");
+}
+
+/// A device that fails every write while `failing` is set.
+struct Failing {
+    image: Image,
+    failing: Arc<AtomicBool>,
+}
+
+impl BlockDevice for Failing {
+    fn sectors(&self) -> u64 {
+        self.image.sectors()
+    }
+
+    fn read(&mut self, sector: u64, buf: &mut [u8]) -> Result<(), Error> {
+        self.image.read(sector, buf)
+    }
+
+    fn write(&mut self, sector: u64, buf: &[u8]) -> Result<(), Error> {
+        match self.failing.load(Ordering::SeqCst) {
+            true => Err(Error::Io),
+            false => self.image.write(sector, buf),
+        }
+    }
+}
+
+/// A held write the device won't take is told to the next `sync`, as Linux
+/// tells `fsync` what its writing back couldn't write: not lost because
+/// something else wrote what was held first, as simplos's writer does every
+/// second.
+#[test]
+fn a_held_write_that_fails_is_told_to_sync() {
+    let _serial = serial();
+    let dir = workspace("failed");
+    let root = dir.join("tree");
+    make_tree(&root);
+    let image = image(&dir, &root, &["-t", "ext4"], "64M");
+    let failing = Arc::new(AtomicBool::new(false));
+    let device = Failing { image, failing: failing.clone() };
+    let fs = Ext4::mount_writable(Box::new(device)).unwrap();
+    let file = fs.create("lost").unwrap();
+    write_all(&file, 0, b"held, then not written");
+    failing.store(true, Ordering::SeqCst);
+    fs.flush();
+    failing.store(false, Ordering::SeqCst);
+    // As whatever error lwext4 says, which loses why a write fell short.
+    assert!(fs.sync().is_err(), "sync says what couldn't be written was");
+    // Told once.
+    assert_eq!(fs.sync(), Ok(()));
+}
+
 /// What's held is written before anything else is, so writes through other
 /// handles, to other files and elsewhere in the file land as they would
 /// have.
@@ -503,7 +579,8 @@ fn writes_blocks_in_place_once() {
     let dir = workspace("in_place");
     let root = dir.join("tree");
     make_tree(&root);
-    let image = image(&dir, &root, &["-t", "ext4"], "64M");
+    // 4 KiB blocks, which it counts in: some mke2fs.conf say 1 KiB for this.
+    let image = image(&dir, &root, &["-t", "ext4", "-b", "4096"], "64M");
     let blocks = String::from_utf8(debugfs(&dir.join("fs.img"), "blocks /")).unwrap();
     let sector = blocks.trim().parse::<u64>().unwrap() * 4096 / ext4::SECTOR as u64;
     let fs = Ext4::mount_writable(Box::new(image.clone())).unwrap();

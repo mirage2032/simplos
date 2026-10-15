@@ -200,9 +200,10 @@ pub fn setitimer(process: &Process, which: u64, new: u64, old: u64) -> i64 {
             put(process, old, &itimerval(*alarm))?;
         }
         if new != 0 {
+            // One too far off to count to never comes, as on Linux.
             *alarm = match after {
                 0 => Alarm::default(),
-                after => Alarm { due: time::since_boot() + after, every },
+                after => Alarm { due: time::since_boot().saturating_add(after), every },
             };
         }
         Ok(0)
@@ -223,11 +224,14 @@ pub fn alarm(process: &Process, seconds: u64) -> i64 {
     let mut alarm = process.alarm.lock();
     let left = match alarm.due {
         0 => 0,
-        due => ((due.saturating_sub(time::since_boot()) + NANOS / 2) / NANOS).max(1),
+        due => (due.saturating_sub(time::since_boot()).saturating_add(NANOS / 2) / NANOS).max(1),
     };
     *alarm = match seconds {
         0 => Alarm::default(),
-        seconds => Alarm { due: time::since_boot() + seconds.saturating_mul(NANOS), every: 0 },
+        seconds => {
+            let due = time::since_boot().saturating_add(seconds.saturating_mul(NANOS));
+            Alarm { due, every: 0 }
+        }
     };
     left as i64
 }

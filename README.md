@@ -107,9 +107,10 @@ one after another, wait in memory to be written as one, as each write
 costs the disk a handful of its own however little it writes: until
 anything else is done on the disk, the file is closed, a program calls
 `fsync`, `fdatasync`, `syncfs` or `sync`, or a second has passed, so the
-power going loses that second's at most. The work is done by
-`fs/ext4` (see below), behind a lock that sleeps whoever waits for it
-(`thread::SleepLock`), since a call can wait on the disk for a long time.
+power going loses that second's at most; if the disk won't take them, the
+next `fsync` says so, as Linux's does of what it writes back. The work is
+done by `fs/ext4` (see below), behind a lock that sleeps whoever waits for
+it (`thread::SleepLock`), since a call can wait on the disk for a long time.
 The disk is trusted: lwext4 is C, parsing it in ring 0, and isn't fuzzed yet.
 
 Programs use it through Linux's system calls, so Rust's `std::fs` (or C's
@@ -226,9 +227,10 @@ console draws it. The keys send what the console's do. In the shell, `run
 colors` shows the colours.
 
 `poll` and `ppoll` wait for pipes and terminals, as long as they're asked
-to, and `O_NONBLOCK` (from `open`, `pipe2`, `fcntl` or `FIONBIO`) makes what
-would wait fail with `EAGAIN` instead. In the shell, `run cat` copies what's
-typed until ^D. For now:
+to, `ppoll` with the signals it's given blocked meanwhile, as busybox's
+shells wait in `read`; and `O_NONBLOCK` (from `open`, `pipe2`, `fcntl` or
+`FIONBIO`) makes what would wait fail with `EAGAIN` instead. In the shell,
+`run cat` copies what's typed until ^D. For now:
 
 - of the escape sequences, no line-drawing characters, tab stops but every
   eighth column, insert mode or application cursor keys, none of which the

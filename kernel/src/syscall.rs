@@ -349,7 +349,7 @@ fn call(frame: &Frame) -> i64 {
         267 => files::readlinkat(&process, a0, a1, a2, a3),
         268 => files::fchmodat(&process, a0, a1, a2),
         269 => files::faccessat(&process, a0, a1, a2, 0),
-        271 => ppoll(&process, a0, a1, a2),
+        271 => ppoll(&process, a0, a1, a2, a3, a4),
         280 => files::utimensat(&process, a0, a1, a2, a3),
         292 => files::dup3(&process, a0, a1, a2, false),
         293 => files::pipe2(&process, a0, a1),
@@ -440,17 +440,37 @@ fn poll(process: &Process, fds: u64, count: u64, timeout: Option<u64>) -> i64 {
     ready
 }
 
-/// `poll`, with its timeout a `struct timespec` at `timeout`, or none.
-///
-/// shortcut: the signal mask is taken and ignored, as there are no signals.
-fn ppoll(process: &Process, fds: u64, count: u64, timeout: u64) -> i64 {
-    if timeout == 0 {
-        return poll(process, fds, count, None);
+/// `poll`, with its timeout a `struct timespec` at `timeout`, or none; and
+/// while it waits, the signals in the set at `mask` blocked instead, if it's
+/// given, `size` bytes long. So a program can block a signal, check for it,
+/// then wait for it or for input without missing it, as busybox's shells
+/// do in `read`.
+fn ppoll(process: &Process, fds: u64, count: u64, timeout: u64, mask: u64, size: u64) -> i64 {
+    let ms = match timeout {
+        0 => None,
+        timeout => match timespec_ms(process, timeout) {
+            Ok(ms) => Some(ms),
+            Err(errno) => return -errno,
+        },
+    };
+    if mask == 0 {
+        return poll(process, fds, count, ms);
     }
-    match timespec_ms(process, timeout) {
-        Ok(ms) => poll(process, fds, count, Some(ms)),
-        Err(errno) => -errno,
+    if size != 8 {
+        return -EINVAL;
     }
+    let mut set = [0u8; 8];
+    if process.memory.lock().space.read(mask, &mut set).is_none() {
+        return -EFAULT;
+    }
+    process.signals.suspend_with(u64::from_le_bytes(set));
+    let ready = poll(process, fds, count, ms);
+    // Ended by a signal, `deliver` puts the mask back: after the handler,
+    // which its frame tells, or before starting the call again.
+    if ready != -ERESTARTNOHAND {
+        process.signals.end_suspend();
+    }
+    ready
 }
 
 const PROT_WRITE: u64 = 2;
@@ -470,9 +490,12 @@ fn page_flags(prot: u64) -> PageTableFlags {
 
 /// `start..start + len` as a page-aligned range a program may change: `None`
 /// if it isn't aligned, or reaches outside its part of the address space.
+/// That stops a page short of the lower half's end, as Linux's does: the
+/// last page is never mapped (see `dispatch`), and `USER_END` itself isn't
+/// an address at all, which `pages` would panic making.
 fn user_range(start: u64, len: u64) -> Option<(u64, u64)> {
     let end = start.checked_add(len)?.checked_next_multiple_of(4096)?;
-    (start.is_multiple_of(4096) && start >= LOWEST && end <= USER_END && len > 0)
+    (start.is_multiple_of(4096) && start >= LOWEST && end < USER_END && len > 0)
         .then_some((start, end))
 }
 
@@ -501,6 +524,9 @@ fn mmap(process: &Process, addr: u64, len: u64, prot: u64, flags: u64) -> i64 {
     memory.space.unmap(pages(start, end));
     // PROT_NONE: reserved, and left unmapped so any access faults.
     if prot != 0 && memory.space.map(pages(start, end), page_flags(prot)).is_none() {
+        // What memory there was goes back: the program, told it got none,
+        // has no address to unmap it by.
+        memory.space.unmap(pages(start, end));
         return -ENOMEM;
     }
     start as i64
@@ -536,6 +562,8 @@ fn brk(process: &Process, addr: u64) -> i64 {
     if new_end > old_end {
         let flags = PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
         if memory.space.map(pages(old_end, new_end), flags).is_none() {
+            // As for `mmap`: the heap stays where it was, and so does memory.
+            memory.space.unmap(pages(old_end, new_end));
             return memory.brk as i64;
         }
     } else {

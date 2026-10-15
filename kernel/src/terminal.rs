@@ -278,9 +278,11 @@ impl Terminal {
             Some(b'?' | b'>' | b'=' | b'<') => (true, &parameters[1..]),
             _ => (false, parameters),
         };
-        // Each parameter, 0 for one that's missing.
+        // Each parameter, 0 for one that's missing; none bigger than a
+        // screen could need, so moving by one can't overflow.
         let text = core::str::from_utf8(parameters).unwrap_or("");
-        let numbers: Vec<usize> = text.split(';').map(|n| n.parse().unwrap_or(0)).collect();
+        let number = |n: &str| n.parse().unwrap_or(0).min(usize::from(u16::MAX));
+        let numbers: Vec<usize> = text.split(';').map(number).collect();
         // A count or a position, which 0 or nothing make 1.
         let count = |at: usize| numbers.get(at).copied().filter(|&n| n != 0).unwrap_or(1);
         if private {
@@ -666,6 +668,17 @@ fn the_cursor_moves_as_asked_but_stays_on_the_screen() {
     terminal.write(b"\x1b[99;99Hh\x1b[99A\x1b[99Di");
     assert_eq!(terminal.line(0), "i b  c   g");
     assert_eq!(terminal.line(3), "         h");
+}
+
+#[test_case]
+fn numbers_too_big_for_any_screen_stop_at_its_edges() {
+    // The biggest a number can be, which added to a column or a row would
+    // overflow: right, erasing and down, each as far as there is.
+    let mut terminal = Terminal::new(3, 10);
+    let most = "18446744073709551615";
+    let moves = format!("ab\x1b[{most}Cc\r\n123\x1b[2;2H\x1b[{most}X\x1b[{most}Bd");
+    terminal.write(moves.as_bytes());
+    assert_eq!(terminal.lines(), ["ab       c", "1", " d"]);
 }
 
 #[test_case]

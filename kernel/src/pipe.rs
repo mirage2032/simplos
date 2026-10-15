@@ -9,7 +9,7 @@ use spin::Mutex;
 use x86_64::instructions::interrupts;
 
 /// What a pipe holds before its writers wait: Linux's default.
-const CAPACITY: usize = 64 * 1024;
+pub const CAPACITY: usize = 64 * 1024;
 
 struct Pipe {
     /// Taken only with interrupts off, as `WaitQueue::wait_until` checks it.
