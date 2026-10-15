@@ -8,7 +8,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{FileExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicIsize, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 fn main() {
@@ -549,8 +549,10 @@ fn main() {
             let nothing = 0u64;
             let suspended = syscall(130, &raw const nothing as usize, 8, 0);
             let blocked = sigprocmask(SIG_BLOCK, 0) & bit(SIGUSR1) != 0;
+            // The mask the handler's return puts back: the one from before.
+            let saved = MASK.load(Ordering::SeqCst) & bit(SIGUSR1) != 0;
             wait(child);
-            println!("{suspended} {} {blocked}", CAUGHT.load(Ordering::SeqCst));
+            println!("{suspended} {} {blocked} {saved}", CAUGHT.load(Ordering::SeqCst));
         }
         // Process groups: its own, leading its session; a copy in a group of
         // its own, signalled as a group; what setsid and setpgid refuse.
@@ -829,19 +831,22 @@ fn getpid() -> isize {
 }
 
 /// What `record` saw: how many signals, and of the last its number, its
-/// sender, its si_code.
+/// sender, its si_code, and the mask its return puts back.
 static CAUGHT: AtomicUsize = AtomicUsize::new(0);
 static LAST: AtomicUsize = AtomicUsize::new(0);
 static FROM: AtomicIsize = AtomicIsize::new(0);
 static CODE: AtomicIsize = AtomicIsize::new(0);
+static MASK: AtomicU64 = AtomicU64::new(0);
 
-extern "C" fn record(signal: i32, info: *const u8, _context: *const u8) {
+extern "C" fn record(signal: i32, info: *const u8, context: *const u8) {
     // Safety: the kernel passes a siginfo_t, whose si_code and si_pid are
-    // ints at 8 and 16.
+    // ints at 8 and 16, and a ucontext_t, whose uc_sigmask is at 296.
     let int = |at: usize| unsafe { info.add(at).cast::<i32>().read_unaligned() };
+    let mask = unsafe { context.add(296).cast::<u64>().read_unaligned() };
     LAST.store(signal as usize, Ordering::SeqCst);
     FROM.store(int(16) as isize, Ordering::SeqCst);
     CODE.store(int(8) as isize, Ordering::SeqCst);
+    MASK.store(mask, Ordering::SeqCst);
     CAUGHT.fetch_add(1, Ordering::SeqCst);
 }
 

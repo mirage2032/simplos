@@ -91,7 +91,8 @@ fn a_program_stops_and_continues() {
 
 #[test_case]
 fn sigsuspend_lets_a_blocked_signal_through_and_blocks_it_again() {
-    assert_eq!(run(&["suspend"]), ok("-4 1 true\n"));
+    // The handler's frame holds the mask from before sigsuspend, as Linux's.
+    assert_eq!(run(&["suspend"]), ok("-4 1 true true\n"));
 }
 
 #[test_case]
