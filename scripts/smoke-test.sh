@@ -47,6 +47,8 @@ readonly DEADLINE=120
 # What the kernel's panic and fault handlers print. They halt rather than exit,
 # so without looking for these a crash would wait out the whole deadline.
 readonly FAULTS="KERNEL PANIC\|EXCEPTION: DOUBLE FAULT\|EXCEPTION: PAGE FAULT"
+# A line a boot must also print after its banner, when set.
+also=""
 
 boot() {
     local mode=$1 image=$2
@@ -82,6 +84,13 @@ boot() {
         sleep 1
         waited=$((waited + 1))
     done
+    while [[ -n $banner && -n $also ]] && ((waited < DEADLINE)); do
+        grep -qa "$also" "$log" 2>/dev/null && break
+        grep -qa "$FAULTS" "$log" 2>/dev/null && break
+        kill -0 "$qemu" 2>/dev/null || break
+        sleep 1
+        waited=$((waited + 1))
+    done
     # Give the kernel a moment past the banner, so a fault immediately after it
     # still lands in the log before we pull the plug.
     [[ -n $banner ]] && sleep 2
@@ -105,6 +114,13 @@ boot() {
         echo "::error::$mode: expected fb=$expect, got: $banner"
         status=1
     fi
+    if [[ -n $also ]] && grep -qa "$also" "$log"; then
+        echo "    $also"
+    elif [[ -n $also ]]; then
+        echo "::error::$mode: the kernel never printed \"$also\" (waited ${waited}s)."
+        tail -20 "$log" | sed 's/^/    /'
+        status=1
+    fi
     # A panic prints a banner first, so the banner alone isn't enough.
     if grep -qa "$FAULTS" "$log"; then
         echo "::error::$mode: the kernel faulted after booting."
@@ -123,6 +139,15 @@ fi
 
 # No PS/2 controller, as on many modern PCs: no keyboard, but it must still boot.
 boot BIOS "$images/bios.img" -machine pc,i8042=off
+
+# The ext4 disk that ships beside the images: the kernel has to find it and
+# mount it. snapshot=on, so the boot's writes (its journal, at least) don't
+# change the file about to be released.
+if [[ -f $images/disk.qcow2 ]]; then
+    also="simplos: ext4 on disk 1"
+    boot BIOS "$images/bios.img" -drive "format=qcow2,file=$images/disk.qcow2,snapshot=on"
+    also=""
+fi
 
 # The point of the fw_cfg channel: the host asks for a smaller mode and gets it.
 expect=1024x768

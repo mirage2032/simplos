@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Builds the bootable disk images and copies them somewhere predictable.
+# Builds the bootable disk images and copies them somewhere predictable, with
+# the ext4 disk that goes with them: dist/bios.img, dist/uefi.img and
+# dist/disk.qcow2.
 #
 # `fullkernel`'s build script creates both images inside its OUT_DIR and tells
 # the crate where they are with UEFI_PATH / BIOS_PATH. OUT_DIR contains a cargo
@@ -61,17 +63,33 @@ for line in sys.stdin:
         continue
     found.update(dict(message.get("env") or []))
 
-for key in ("BIOS_PATH", "UEFI_PATH"):
+for key in ("BIOS_PATH", "UEFI_PATH", "PROBE_PATH"):
     if key not in found:
         sys.exit(f"{key} was not reported by {wanted}’s build script.")
     print(found[key])
 ' <<<"$messages"
 )
-read -r bios uefi <<<"$(tr '\n' ' ' <<<"$paths")"
+read -r bios uefi probe <<<"$(tr '\n' ' ' <<<"$paths")"
 
 mkdir -p "$root/$out"
 install -m 644 "$bios" "$root/$out/bios.img"
 install -m 644 "$uefi" "$root/$out/uefi.img"
 
+# The ext4 disk, made as `cargo run` makes its own (`disk` in
+# fullkernel/src/main.rs; keep the two in step): hello.txt, the user program
+# as /bin/probe, and the userland. Unlike `cargo run`, the userland has to
+# build: a release without busybox and zsh isn't one. 1 GiB to the guest, but
+# compressed qcow2 holds only what mke2fs wrote, so the file is a few
+# megabytes, and QEMU attaches it as it is: -drive format=qcow2,file=disk.qcow2.
+"$root/scripts/userland.sh"
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+mkdir -p "$work/tree/bin"
+echo "hello from the ext4 disk" >"$work/tree/hello.txt"
+cp "$probe" "$work/tree/bin/probe"
+cp -a "$root/target/userland/root/." "$work/tree/"
+PATH=$PATH:/usr/sbin:/sbin mke2fs -q -t ext4 -d "$work/tree" "$work/disk.img" 1G
+qemu-img convert -c -f raw -O qcow2 "$work/disk.img" "$root/$out/disk.qcow2"
+
 echo "Images in $out/:" >&2
-ls -l "$root/$out/bios.img" "$root/$out/uefi.img" >&2
+ls -l "$root/$out/bios.img" "$root/$out/uefi.img" "$root/$out/disk.qcow2" >&2

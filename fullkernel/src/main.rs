@@ -74,7 +74,9 @@ fn main() {
 }
 
 /// The ext4 disk to attach: `disk.img`, made with e2fsprogs' mke2fs if it
-/// isn't there yet. None, with a note, if it can't be.
+/// isn't there yet. None, with a note, if it can't be. A release's
+/// `disk.qcow2` is made from the same tree by `scripts/build-images.sh`:
+/// change one, change the other.
 fn disk() -> Option<PathBuf> {
     let here = Path::new(env!("CARGO_MANIFEST_DIR"));
     let image = here.join("disk.img");
