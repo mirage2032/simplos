@@ -48,6 +48,9 @@ fn main() {
         // `MOUNTS` in src/lib.rs: file systems mounted at once.
         .define("CONFIG_EXT4_MOUNTPOINTS_COUNT", "4")
         .define("CONFIG_EXT4_BLOCKDEVS_COUNT", "4")
+        // Blocks kept in memory, as they're used, per file system: upstream's
+        // 8 had every lookup in a big directory read it from the disk again.
+        .define("CONFIG_BLOCK_DEV_CACHE_SIZE", "512")
         // Upstream code with its own style: its warnings aren't ours to fix.
         .warnings(false)
         .compile("lwext4");

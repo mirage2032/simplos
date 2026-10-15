@@ -84,6 +84,21 @@ jobs:
             echo "::endgroup::"
           done
 
+      # busybox and zsh, for tests/shells.rs, from the sources the script pins,
+      # kept for as long as the script stays the same; and its downloads for
+      # longer. boot-test would build them anyway: here it's a step of its own.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            target/userland/root
+            target/userland/built
+            target/userland/downloads
+          key: userland-${{ hashFiles('scripts/userland.sh') }}
+          restore-keys: userland-
+
+      - name: Build the userland
+        run: scripts/userland.sh
+
       # Each of these is a kernel: built for x86_64-unknown-none, wrapped in a
       # bootable image by tools/boot-test and run under QEMU, which reports the
       # result by the status it exits with. Each run also gets an ext4 disk

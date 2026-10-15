@@ -118,7 +118,7 @@ fn failed(path: &str, error: &str) -> (i32, String) {
 #[test_case]
 fn a_program_reads_files_and_lists_directories() {
     assert_eq!(run(&["cat", "/hello.txt", "/dir/nested/deep.txt"]), ok("hello from ext4\ndeep\n"));
-    assert_eq!(run(&["ls", "/"]), ok("bin/\ndev/\ndir/\nhello.txt\nlost+found/\n"));
+    assert_eq!(run(&["ls", "/"]), ok("bin/\ndev/\ndir/\nhello.txt\nlost+found/\nproc/\n"));
     assert_eq!(run(&["ls", "/dir/nested"]), ok("deep.txt\n"));
     // Relative to the working directory, the root; and the long way round.
     assert_eq!(run(&["cat", "hello.txt"]), ok("hello from ext4\n"));
@@ -215,9 +215,12 @@ fn a_program_s_files_close_as_it_ends() {
     let elf = simplos::ramdisk().expect("tools/boot-test attaches user/probe");
     let process = process::spawn(elf, &["probe", "hold", "/held.txt"], |_| {}).unwrap();
     assert_eq!(process.wait(), 0);
-    // Busy if the program's file were still open.
-    ROOT.lock().as_ref().unwrap().remove_file("held.txt").unwrap();
-    drop(process);
+    // Kept in lost+found if the program's file were still open.
+    let root = ROOT.lock();
+    let fs = root.as_ref().unwrap();
+    fs.remove_file("held.txt").unwrap();
+    assert!(fs.read_dir("lost+found").unwrap().is_empty());
+    drop((root, process));
 }
 
 #[test_case]
@@ -246,7 +249,7 @@ fn a_program_makes_and_removes_directories() {
     // unlinkat, each relative to the directory above.
     assert_eq!(run(&["write", "/made/a/b/again.txt", "x"]), ok(""));
     assert_eq!(run(&["rm-r", "/made"]), ok(""));
-    assert_eq!(run(&["ls", "/"]), ok("bin/\ndev/\ndir/\nhello.txt\nlost+found/\n"));
+    assert_eq!(run(&["ls", "/"]), ok("bin/\ndev/\ndir/\nhello.txt\nlost+found/\nproc/\n"));
 }
 
 #[test_case]
@@ -366,7 +369,7 @@ fn bad_pipe_calls_are_refused() {
 #[test_case]
 fn the_devices_are_in_dev() {
     // Wherever the disk has it or not: mounted over it, as on Linux.
-    assert_eq!(run(&["ls", "/dev"]), ok("null\ntty\nzero\n"));
+    assert_eq!(run(&["ls", "/dev"]), ok("fd/\nnull\nstderr\nstdin\nstdout\ntty\nzero\n"));
     assert_eq!(run(&["stat", "/dev"]), ok("0 dir 755\n0 dir 755\n"));
     assert_eq!(run(&["cd", "/dev", "null"]), ok("/dev\n"));
     assert_eq!(run(&["cd", "/dev/..", "hello.txt"]), ok("/\nhello from ext4\n"));
@@ -393,11 +396,74 @@ fn without_a_disk_there_is_still_a_root() {
     assert_eq!(
         seen,
         [
-            ok("dev/\n"),
+            ok("dev/\nproc/\n"),
             ok("0 dir 755\n0 dir 755\n"),
             ok(""),
             failed("/hello.txt", "No such file or directory (os error 2)"),
             failed("/new.txt", "Read-only file system (os error 30)"),
         ]
     );
+}
+
+#[test_case]
+fn a_program_moves_several_buffers_in_one_call() {
+    // Through a pipe: writev's three, one empty, as one write; readv into
+    // two, the first filled first. Then too many buffers, and one that
+    // isn't there.
+    assert_eq!(run(&["vectors"]), ok("13 13 \"one \" \"two three\" -22 -14\n"));
+}
+
+#[test_case]
+fn symbolic_and_hard_links_lead_where_they_should() {
+    // Read back, followed, and lstat'd as itself; through a directory, with
+    // `..` the directory's parent; a link to nothing, which O_CREAT makes;
+    // a loop and O_NOFOLLOW, ELOOP; a program run through one; a hard link
+    // outliving the other name. Then refused: a hard link to a directory
+    // (EPERM), a link where there's a file (EEXIST), readlink of a file
+    // (EINVAL), a hard link to nothing (ENOENT), and a file on the way, even
+    // with `..` after it (ENOTDIR).
+    let expected = r#""/hello.txt" "hello from ext4\n" true true "deep\n" true "made\n" Err(40) Err(40) "hello from user space\n" 2 "shared\n" [Err(1), Err(17), Err(22), Err(2), Err(20)]"#;
+    assert_eq!(run(&["links"]), ok(&(String::from(expected) + "\n")));
+}
+
+#[test_case]
+fn a_program_changes_a_file_s_permissions_owner_times_and_length() {
+    // Made now; chmod by path and by descriptor; chown, owner and group
+    // apart, and lchown of a link as itself; utimensat's times, one left as
+    // it was; a write making it modified now, and no times making both now;
+    // cut short and grown with zeros, through a descriptor
+    // and by path, but not through one open only to read (EINVAL). Then
+    // access: read and write, run what may not be (EACCES) and what may,
+    // write a device and /dev (EROFS), a missing file, a bad mode (EINVAL).
+    // And sendfile: from where the file's at, from a place given, which
+    // moves on and leaves the file's own where it was, at its end.
+    let expected = r#"true 600 [1000, 100, 7] 640 [1000, 2000] [1000, 3000] true true "x123" [120, 49, 50, 51, 0, 0] 0 2 -22 [0, -13, 0, 0, -30, -2, -22] 16 4 10 0 "hello from ext4\nfrom""#;
+    assert_eq!(run(&["attributes"]), ok(&(String::from(expected) + "\n")));
+}
+
+#[test_case]
+fn a_file_removed_or_replaced_while_open_stays_until_closed() {
+    // As zsh does a here-document: written, opened, removed, read. And one
+    // renamed over while open still reads as it was to whoever has it.
+    // Closed as the program ends, they're gone, from lost+found too.
+    assert_eq!(run(&["unlinked"]), ok("true \"here\\n\" \"old\\n\" \"new\\n\"\n"));
+    let root = ROOT.lock();
+    assert!(root.as_ref().unwrap().read_dir("lost+found").unwrap().is_empty());
+}
+
+#[test_case]
+fn a_program_reads_of_itself_in_proc() {
+    // Its pages, 256 more as it maps a megabyte and none once it unmaps it;
+    // ext4's type and block size by path and by descriptor, alike; its name.
+    assert_eq!(run(&["proc"]), ok("256 0 0xef53 true 4096 probe\n"));
+}
+
+#[test_case]
+fn fsync_writes_what_waits_in_memory() {
+    // A small write waits to be made with what follows it; fsync makes it,
+    // and sync, as /proc/diskstats shows.
+    for call in ["fsync", "sync"] {
+        assert_eq!(run(&[call, "/synced.txt"]), ok("synced\n"), "{call}");
+    }
+    ROOT.lock().as_ref().unwrap().remove_file("synced.txt").unwrap();
 }

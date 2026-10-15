@@ -19,7 +19,9 @@ use crate::fs;
 use crate::io::interrupts::gdt;
 use crate::memory::{AddressSpace, USER_END};
 use crate::signal::{self, Info, Signals};
+use crate::syscall;
 use crate::thread::{self, WaitQueue};
+use crate::time;
 use crate::tty::Tty;
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -45,7 +47,7 @@ pub const MMAP_START: u64 = 0x0000_1000_0000_0000;
 const STACK_TOP: u64 = 0x0000_7FFF_FFFF_0000;
 /// shortcut: a fixed 256 KiB, mapped up front; grow it on page faults when a
 /// program needs more.
-const STACK_SIZE: u64 = 256 * 1024;
+pub const STACK_SIZE: u64 = 256 * 1024;
 /// Where `mmap` stops: a gap below the stack.
 pub const MMAP_END: u64 = STACK_TOP - STACK_SIZE - 0x10_0000;
 
@@ -83,8 +85,25 @@ pub struct Process {
     pub cwd: Mutex<String>,
     /// The permission bits taken off what it creates.
     pub umask: AtomicU32,
+    /// How nice it is to others, from -20 to 19, as `setpriority` set it.
+    ///
+    /// shortcut: kept and reported, but every thread gets the same turns;
+    /// weigh them by this when the scheduler has priorities.
+    pub nice: AtomicI32,
+    /// Its resource limits, soft and hard, by `RLIMIT_*` number. Taken with
+    /// interrupts on.
+    pub limits: Mutex<[(u64, u64); syscall::LIMITS]>,
+    /// The CPU time it has had, and its children it waited for have.
+    pub times: Times,
+    /// Its alarm, which the alarm thread sends it when due. Taken with
+    /// interrupts on.
+    pub alarm: Mutex<time::Alarm>,
     /// The program it's a copy of; none for one the kernel started.
     parent: Weak<Process>,
+    /// What it runs, as /proc tells it. Taken with interrupts on.
+    pub command: Mutex<Command>,
+    /// When it started, in nanoseconds since boot.
+    pub started: u64,
     /// The copies it made that it hasn't waited for, ended or not. Taken only
     /// with interrupts off, as `wait4` looks at them from
     /// `WaitQueue::wait_until`.
@@ -94,6 +113,77 @@ pub struct Process {
     pub children: Mutex<Vec<Arc<Process>>>,
     /// Woken as each of them ends.
     pub child_exited: WaitQueue,
+}
+
+/// What a process runs: its program's name, as Linux's `comm` is, the last
+/// part of the path it was run by, at most 15 bytes; and its arguments,
+/// each ending in a NUL, as /proc/PID/cmdline has them.
+#[derive(Clone, Default)]
+pub struct Command {
+    pub name: String,
+    pub args: Vec<u8>,
+}
+
+impl Command {
+    pub fn new(path: &[u8], args: &[&[u8]]) -> Command {
+        let name = path.rsplit(|&byte| byte == b'/').next().unwrap_or_default();
+        let name = String::from_utf8_lossy(&name[..name.len().min(15)]).into_owned();
+        Command {
+            name,
+            args: args.iter().flat_map(|arg| arg.iter().chain(&[0])).copied().collect(),
+        }
+    }
+}
+
+/// The CPU's time, in timer ticks, as /proc/stat counts it: running
+/// programs, in the kernel for them, and neither.
+pub struct CpuTime {
+    pub user: AtomicU64,
+    pub system: AtomicU64,
+    pub idle: AtomicU64,
+}
+
+pub static CPU_TIME: CpuTime =
+    CpuTime { user: AtomicU64::new(0), system: AtomicU64::new(0), idle: AtomicU64::new(0) };
+
+/// CPU time, in timer ticks: a program's own, running and in the kernel for
+/// it; and that of the children it has waited for, theirs and their own
+/// children's.
+#[derive(Default)]
+pub struct Times {
+    pub user: AtomicU64,
+    pub system: AtomicU64,
+    pub children_user: AtomicU64,
+    pub children_system: AtomicU64,
+}
+
+impl Times {
+    /// Count a child's, as its parent waits for it.
+    pub fn add_child(&self, child: &Times) {
+        let all = |own: &AtomicU64, children: &AtomicU64| {
+            own.load(Ordering::Relaxed) + children.load(Ordering::Relaxed)
+        };
+        self.children_user.fetch_add(all(&child.user, &child.children_user), Ordering::Relaxed);
+        self.children_system
+            .fetch_add(all(&child.system, &child.children_system), Ordering::Relaxed);
+    }
+}
+
+/// From the timer interrupt: the tick that's ending is the running program's,
+/// its own (`user`) or the kernel's for it. Nothing for the kernel's threads.
+pub fn charge_tick(user: bool) {
+    let charged = thread::with_current_user(|current| {
+        let times = &current.process.times;
+        let count = if user { &times.user } else { &times.system };
+        count.fetch_add(1, Ordering::Relaxed);
+    });
+    // The machine's: with no program's thread running, it was idle.
+    let count = match (charged, user) {
+        (None, _) => &CPU_TIME.idle,
+        (Some(()), true) => &CPU_TIME.user,
+        (Some(()), false) => &CPU_TIME.system,
+    };
+    count.fetch_add(1, Ordering::Relaxed);
 }
 
 /// A file descriptor: what it refers to, shared with its copies, and whether
@@ -266,9 +356,15 @@ pub fn spawn_with(
         files: Mutex::new(files.collect()),
         cwd: Mutex::new(String::new()),
         umask: AtomicU32::new(0o022),
+        nice: AtomicI32::new(0),
+        limits: Mutex::new(syscall::DEFAULT_LIMITS),
+        times: Times::default(),
+        alarm: Mutex::new(time::Alarm::default()),
         parent: Weak::new(),
         children: Mutex::new(Vec::new()),
         child_exited: WaitQueue::new(),
+        command: Mutex::new(Command::new(args.first().copied().unwrap_or_default(), &args)),
+        started: time::since_boot(),
     });
     register(&process);
     let user = UserState {
@@ -283,16 +379,83 @@ pub fn spawn_with(
     Ok(process)
 }
 
-/// `spawn_with`, for the program at `path` on the disk: or the errno
-/// `execve` would give for it.
+/// `spawn_with` for the program at `path`, a path from the root, read from
+/// the disk: an ELF program, or a script, run as `execve` runs them (see
+/// `program_for`). The errno saying why not if it can't be.
 pub fn spawn_program(
     path: &str,
     args: &[&str],
     env: &[&str],
     files: Vec<Option<Arc<fs::Handle>>>,
 ) -> Result<Arc<Process>, i64> {
-    let elf = fs::read_program(&fs::resolve("", path))?;
-    spawn_with(&elf, args, env, files).map_err(load_errno)
+    let mut args: Vec<Vec<u8>> = args.iter().map(|arg| arg.as_bytes().to_vec()).collect();
+    let elf = program_for("", path, &mut args)?;
+    let command =
+        Command::new(path.as_bytes(), &args.iter().map(Vec::as_slice).collect::<Vec<_>>());
+    let args: Vec<String> = args.iter().map(|arg| String::from_utf8_lossy(arg).into()).collect();
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let process = spawn_with(&elf, &args, env, files).map_err(load_errno)?;
+    *process.command.lock() = command;
+    Ok(process)
+}
+
+/// The ELF program that runs for `path`, from the directory `cwd` (a path
+/// from the root, as `fs::resolve` makes them), with `args`: the file's
+/// own; or for a script, what its first line names, given the line's
+/// argument if it has one and the script's path, in place of the first of
+/// `args`, as Linux runs them. That can be a script too, up to where Linux
+/// gives up (ELOOP).
+pub fn program_for(cwd: &str, path: &str, args: &mut Vec<Vec<u8>>) -> Result<Vec<u8>, i64> {
+    const ENOENT: i64 = 2;
+    const ELOOP: i64 = 40;
+    if path.is_empty() {
+        return Err(ENOENT);
+    }
+    let mut path = String::from(path);
+    let mut elf = fs::read_program(&fs::lookup(cwd, &path, true)?)?;
+    for depth in 0.. {
+        let Some((interpreter, argument)) = interpreter(&elf) else { break };
+        if depth == 5 {
+            return Err(ELOOP);
+        }
+        let interpreter = String::from_utf8(interpreter.to_vec()).map_err(|_| ENOENT)?;
+        let mut first = Vec::from([interpreter.clone().into_bytes()]);
+        first.extend(argument.map(<[u8]>::to_vec));
+        first.push(path.into_bytes());
+        args.splice(..args.len().min(1), first);
+        elf = fs::read_program(&fs::lookup(cwd, &interpreter, true)?)?;
+        path = interpreter;
+    }
+    Ok(elf)
+}
+
+/// What runs the script `program`, as Linux reads its first line: `#!`, then
+/// the interpreter's path, then what's left of the line as one argument if
+/// anything is, past spaces and tabs. Within the first 256 bytes, where a
+/// line that goes on past them must at least have the path whole. `None` if
+/// it isn't a script, or names nothing.
+fn interpreter(program: &[u8]) -> Option<(&[u8], Option<&[u8]>)> {
+    const LONGEST: usize = 256;
+    let blank = |byte: &u8| matches!(byte, b' ' | b'\t');
+    let head = program.strip_prefix(b"#!")?;
+    let head = &head[..head.len().min(LONGEST - 2)];
+    let line = match head.iter().position(|&byte| byte == b'\n') {
+        Some(end) => &head[..end],
+        None if program.len() < LONGEST => head,
+        None => {
+            let line = &head[..head.len() - 1];
+            let path = line.iter().position(|byte| !blank(byte))?;
+            line[path..].iter().position(|byte| blank(byte) || *byte == 0)?;
+            line
+        }
+    };
+    let line = line.split(|&byte| byte == 0).next()?;
+    let start = line.iter().position(|byte| !blank(byte))?;
+    let end = line.iter().rposition(|byte| !blank(byte))? + 1;
+    let line = &line[start..end];
+    let (path, rest) = line.split_at(line.iter().position(blank).unwrap_or(line.len()));
+    let argument = rest.iter().position(|byte| !blank(byte)).map(|at| &rest[at..]);
+    Some((path, argument))
 }
 
 /// The errno for why a program couldn't be loaded.
@@ -338,9 +501,15 @@ pub fn fork(parent: &Arc<Process>, registers: Registers) -> Option<u64> {
         files: Mutex::new(parent.files.lock().clone()),
         cwd: Mutex::new(parent.cwd.lock().clone()),
         umask: AtomicU32::new(parent.umask.load(Ordering::Relaxed)),
+        nice: AtomicI32::new(parent.nice.load(Ordering::Relaxed)),
+        limits: Mutex::new(*parent.limits.lock()),
+        times: Times::default(),
+        alarm: Mutex::new(time::Alarm::default()),
         parent: Arc::downgrade(parent),
         children: Mutex::new(Vec::new()),
         child_exited: WaitQueue::new(),
+        command: Mutex::new(parent.command.lock().clone()),
+        started: time::since_boot(),
     });
     register(&child);
     let user = thread::with_current_user(|user| user.fork(child.clone(), pml4, registers))?;
@@ -809,4 +978,36 @@ pub fn pages(start: u64, end: u64) -> PageRange {
     let first = Page::containing_address(VirtAddr::new(start));
     let past = Page::containing_address(VirtAddr::new(end.next_multiple_of(4096)));
     Page::range(first, past)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::interpreter;
+    use alloc::vec::Vec;
+
+    /// The interpreter `line` names, and its argument, as text.
+    fn named(line: &[u8]) -> Option<(&str, Option<&str>)> {
+        let text = |bytes| core::str::from_utf8(bytes).unwrap();
+        interpreter(line).map(|(path, argument)| (text(path), argument.map(text)))
+    }
+
+    #[test_case]
+    fn a_script_s_first_line_names_what_runs_it() {
+        assert_eq!(named(b"#!/bin/sh\necho"), Some(("/bin/sh", None)));
+        // One argument, however many words, without the blanks around it.
+        assert_eq!(named(b"#! \t/bin/sh  -e -x \t\nmore"), Some(("/bin/sh", Some("-e -x"))));
+        // The end of the file ends the line too.
+        assert_eq!(named(b"#!/bin/sh"), Some(("/bin/sh", None)));
+        assert_eq!(named(b"#!\n/bin/sh"), None);
+        assert_eq!(named(b"#! \t \n"), None);
+        assert_eq!(named(b"\x7fELF"), None);
+        // Too long a line: its argument is cut short, but not its path.
+        let mut long = b"#!/bin/sh ".to_vec();
+        long.resize(300, b'x');
+        let cut = core::str::from_utf8(&long[10..255]).unwrap();
+        assert_eq!(named(&long), Some(("/bin/sh", Some(cut))));
+        let mut path: Vec<u8> = b"#!/".to_vec();
+        path.resize(300, b'x');
+        assert_eq!(named(&path), None);
+    }
 }

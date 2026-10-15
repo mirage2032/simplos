@@ -152,6 +152,9 @@ for patch in "${patches[@]}"; do
     # shellcheck disable=SC2206 # the names are words
     names+=($named)
 done
+# Each once: cargo takes `--lib` only once.
+# shellcheck disable=SC2207 # the names are words
+names=($(printf '%s\n' ${names[@]+"${names[@]}"} | sort -u))
 echo "the tests as they are..."
 if ! build "$out/as-is/log" "$out/as-is/kernels" ${names[@]+"${names[@]}"}; then
     echo "they don't build: see $out/as-is/log" >&2

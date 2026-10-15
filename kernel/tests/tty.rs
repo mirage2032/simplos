@@ -105,6 +105,15 @@ fn a_program_reads_what_is_typed_a_line_at_a_time() {
 }
 
 #[test_case]
+fn a_vectored_read_takes_a_line_as_a_read_would() {
+    let (tty, screen) = terminal();
+    // The line fills the first buffer exactly: readv returns with it, as
+    // read would, rather than waiting for another for the second.
+    tty.input(b"four\r");
+    assert_eq!(run(&tty, &screen, &["readv"]), ok("four\r\n5 \"four\\n\" \"\"\r\n"));
+}
+
+#[test_case]
 fn the_end_of_file_ends_a_line_or_what_is_typed() {
     let (tty, screen) = terminal();
     tty.input(b"partial\x04\x04");

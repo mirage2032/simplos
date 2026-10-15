@@ -8,8 +8,8 @@
 //!
 //! An ext4 disk goes with it, `disk.img` here, made the first time and kept,
 //! so what's written to it is there next time; delete it to start afresh. It
-//! starts with `hello.txt`, and user/probe as `/bin/probe`, for programs to
-//! run.
+//! starts with `hello.txt`, user/probe as `/bin/probe`, and the userland that
+//! `scripts/userland.sh` builds, busybox and zsh, if it can.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -86,6 +86,19 @@ fn disk() -> Option<PathBuf> {
     std::fs::write(tree.join("hello.txt"), "hello from the ext4 disk\n").ok()?;
     std::fs::create_dir_all(tree.join("bin")).ok()?;
     std::fs::copy(env!("PROBE_PATH"), tree.join("bin/probe")).ok()?;
+    // Built the first time, which takes a few minutes; links and modes kept.
+    let repository = here.join("..");
+    let userland = Command::new(repository.join("scripts/userland.sh")).status();
+    let copied = userland.is_ok_and(|status| status.success())
+        && Command::new("cp")
+            .arg("-a")
+            .arg(repository.join("target/userland/root/."))
+            .arg(&tree)
+            .status()
+            .is_ok_and(|status| status.success());
+    if !copied {
+        eprintln!("note: the disk has no busybox or zsh; delete {} to try again", image.display());
+    }
     // Where Linux and Homebrew put it: often not on PATH.
     let mke2fs = [
         "/usr/sbin/mke2fs",
@@ -99,7 +112,7 @@ fn disk() -> Option<PathBuf> {
         .args(["-q", "-t", "ext4", "-d"])
         .arg(&tree)
         .arg(&image)
-        .arg("64M")
+        .arg("256M")
         .stdout(Stdio::null())
         .status();
     if made.is_ok_and(|status| status.success()) {

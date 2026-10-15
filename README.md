@@ -83,8 +83,9 @@ The kernel mounts the first disk holding an ext4 (or ext3, or ext2) file
 system to read and write, replaying its journal first if it wasn't unmounted
 cleanly, as the root of every path; with no such disk, the root is an empty
 directory that can't be written. Either way, `/dev` holds `null`, `zero` and
-`tty`, mounted over whatever the disk has there, as on Linux. The shell's `ls`
-and `cat` show what's there.
+`tty`, `fd` and `stdin`, `stdout` and `stderr`, and `/proc` what the kernel
+knows of the machine and its processes, both over whatever the disk has
+there, as on Linux. The shell's `ls` and `cat` show what's there.
 
 `cargo run` attaches `fullkernel/disk.img`, which it makes the first time
 with e2fsprogs' `mke2fs` and keeps, so what's written to it is there next
@@ -98,7 +99,12 @@ cargo run -- -drive format=raw,file=disk.img
 ```
 
 Nothing unmounts it when QEMU is closed, which to the disk is a power cut:
-the next boot replays the journal, as Linux would. The work is done by
+the next boot replays the journal, as Linux would. Small writes to a file,
+one after another, wait in memory to be written as one, as each write
+costs the disk a handful of its own however little it writes: until
+anything else is done on the disk, the file is closed, a program calls
+`fsync`, `fdatasync`, `syncfs` or `sync`, or a second has passed, so the
+power going loses that second's at most. The work is done by
 `fs/ext4` (see below), behind a lock that sleeps whoever waits for it
 (`thread::SleepLock`), since a call can wait on the disk for a long time.
 The disk is trusted: lwext4 is C, parsing it in ring 0, and isn't fuzzed yet.
@@ -109,12 +115,49 @@ stdio) works as it does on Linux: `open`, `openat`, `close`, `read`, `write`,
 `getdents64`, `fcntl`, `fsync`, `mkdir`, `mkdirat`, `rmdir`, `unlink`,
 `unlinkat`, `rename`, `renameat`, `renameat2`, `chdir`, `getcwd` and `umask`;
 and for what isn't a file, `pipe`, `pipe2`, `dup`, `dup2` and `dup3`, and
-`/dev/null`, `/dev/zero` and `/dev/tty`. In the shell, `run cat /hello.txt`
-has the user program read it, and `run` lists its other modes. For now:
+`/dev/null`, `/dev/zero` and `/dev/tty`. `/dev/fd/N`, and `/proc/PID/fd/N`
+for any process's, is descriptor N, which opening it duplicates, as FreeBSD's
+`/dev/fd` does it, and `/dev/stdin` and the others link to `fd/0` and the
+rest. `statfs` and `fstatfs` say how big a file system is and how much of it
+is free. In the shell, `run cat /hello.txt` has the user program read it, and
+`run` lists its other modes.
 
-- no symbolic link is followed, so `stat` and `lstat` are the same;
-- a file that's open can't be removed or renamed over (`EBUSY`);
-- `/dev` holds just those three, and can't be written.
+`/proc` is made as it's read (`proc.rs`), with the files Linux has there
+that busybox's `free`, `ps`, `top`, `df` and `mount` read: `meminfo`,
+`uptime`, `loadavg`, `stat`, `mounts` and `version`; `diskstats`, each
+disk's reads and writes since boot; `self`, a link to the
+reader's own directory; and in each process's, its `stat`, `status`,
+`cmdline` and `comm`, and `fd`.
+
+Symbolic links (`symlink`, `symlinkat`, `readlink`, `readlinkat`) are
+followed wherever a path goes through one, as Linux follows them
+(`fs::lookup`): at the end too, but for the calls about the link itself, as
+`lstat`, `unlink` and `rename`, or asked not to (`O_NOFOLLOW`,
+`AT_SYMLINK_NOFOLLOW`); `..` after one is the parent of where it led; 40 in a
+row is `ELOOP`. Hard links (`link`, `linkat`) give a file another name, to
+anything but a directory.
+
+A file's permissions, owner and times are changed with `chmod`, `fchmod`,
+`fchmodat`, `chown`, `fchown`, `lchown`, `fchownat` and `utimensat`, and its
+length with `truncate` and `ftruncate`; making a file sets all three of its
+times, writing to it when it was modified, and any change when it was
+changed. `access`, `faccessat` and `faccessat2` answer as for root, who may
+read and write anything but where nothing can be written (`EROFS`), and run
+what anyone may. `sendfile` copies from one descriptor to another. For now:
+
+- a file removed or renamed over while it's open stays until it's closed, as
+  on Linux, but in `/lost+found`, as `.open-` and its inode, where Linux
+  keeps it on ext4's orphan list, which lwext4 doesn't know; the disk's next
+  mount takes out any the power went before closing. And a directory that's
+  open can't be removed (`EBUSY`);
+- `/dev` holds just those devices, and can't be written; and opening
+  `/dev/fd/N` shares N's place in the file, where Linux opens the file anew;
+- `/proc` has none of `maps`, `environ` and the rest, nor load averages, and
+  every process's terminal reads as `tty1`;
+- times are kept to the second, as lwext4 sets none of ext4's nanoseconds;
+  reading doesn't set when a file was read, as if mounted `noatime`; and a
+  stream of writes through one descriptor sets when it was modified once a
+  second, not each time.
 
 ## Processes
 
@@ -122,11 +165,28 @@ A program can start others as on Linux: `fork`, `vfork` and `clone` (as C
 libraries use it for them) copy it, `execve` replaces it with an ELF program
 from the disk, closing the descriptors marked close-on-exec, and `wait4`
 waits for its copies and tells how each ended; `getpid` and `getppid` say
-who's who. So Rust's `std::process::Command` works: its `spawn`, `status`,
+who's who. `execve` runs a script through what its first line names
+(`#!/bin/sh -e` and the like), as Linux does, with the line's one argument
+and the script's path; that can be a script too, five deep. So Rust's `std::process::Command` works: its `spawn`, `status`,
 `output` and `exec`. `cargo run`'s
 disk has the user program as `/bin/probe` (a `disk.img` made before this
 doesn't: delete it), so in the shell, `run spawn /bin/probe hello` has it
-run itself again. For now:
+run itself again.
+
+A program can ask what it runs on: `uname` says Linux, the interface it's
+talking to, with simplos as the host and in the version; `sched_getaffinity`
+gives it the one CPU; `sysinfo` how long it's been up, how much memory there
+is and is free, and how many processes; it runs as root (`getuid` and the
+like say 0), in no other groups (`getgroups`); `getpriority` and
+`setpriority` keep how nice it is; and `getrlimit`, `setrlimit` and
+`prlimit64` keep its limits, which its copies inherit. `readv` and `writev` move several buffers in one call, as musl's
+`printf` and the like do. For now:
+
+- every id is 0, and can't be set to another, as there are no other users;
+  what `setgroups` sets is forgotten;
+- limits and niceness are kept and reported, not enforced: a program has the
+  1024 descriptors and 256 KiB of stack there are, whatever it sets, and the
+  same turns at the CPU as any other;
 
 - `fork` copies all of a program's memory at once, rather than sharing it
   until either side writes to it;
@@ -135,8 +195,7 @@ run itself again. For now:
   parent back;
 - a program that ended keeps its memory until it's waited for, and those
   never waited for go with their parent rather than to an init;
-- `execve` takes ELF programs of up to 4 MiB, which it reads whole, and not
-  scripts: shells run those themselves when told `ENOEXEC`.
+- `execve` takes ELF programs of up to 4 MiB, which it reads whole.
 
 ## Terminal
 
@@ -158,8 +217,10 @@ programs are given `TERM=linux`: moving the cursor, erasing, inserting and
 deleting characters and lines, scrolling a region, the 16 colours and 256 and
 any, bold, underlined and reversed, saving the cursor, hiding it, and saying
 where it is, which comes back as if typed; and the alternate screen, which
-full-screen programs ask for whatever the entry says. The keys send what the
-console's do. In the shell, `run colors` shows the colours.
+full-screen programs ask for whatever the entry says. It looks like the
+Linux console too: light grey on black, and bold text bright, as the
+console draws it. The keys send what the console's do. In the shell, `run
+colors` shows the colours.
 
 `poll` and `ppoll` wait for pipes and terminals, as long as they're asked
 to, and `O_NONBLOCK` (from `open`, `pipe2`, `fcntl` or `FIONBIO`) makes what
@@ -216,6 +277,24 @@ ended by ^C. For now:
 - a program in the background isn't stopped for reading or writing its
   terminal, and one whose parent ended isn't given to an init.
 
+## Time
+
+The time of day comes from the CMOS real-time clock, read once at boot, and
+the HPET carries it on from there (`time.rs`). Programs read it, and the
+time since boot, with `clock_gettime`, `gettimeofday` and `time`, to the
+nanosecond; `clock_nanosleep` sleeps for a while or until a time. Each timer
+tick is counted to the program it interrupts, as its own time or the
+kernel's for it, which `getrusage`, `times` and `wait4` report, its waited-for
+children's too. `setitimer` and `alarm` set a program's alarm, which the
+alarm thread sends as SIGALRM when it's due, and every so often after if
+asked. For now:
+
+- the clock is taken to be UTC, as QEMU keeps it, and can't be set;
+- CPU time is counted to the tick, 10 ms;
+- an alarm can come up to a tick late, though never early, and only the
+  real-time one is there: none that counts CPU time (`ITIMER_VIRTUAL`,
+  `ITIMER_PROF`).
+
 ## The first program
 
 Once it's up, the kernel runs the first of `/sbin/init`, `/etc/init`,
@@ -231,7 +310,52 @@ cargo run -- -fw_cfg name=opt/simplos/init,string="/bin/probe colors"
 
 When there's none, or once it ends, which on Linux would stop everything,
 the kernel's own shell runs instead, and its `run /PATH ARGS` runs a program
-from the disk.
+from the disk. With the userland below on the disk, the first program is
+its `/sbin/init`, a script that logs root in to zsh.
+
+## Userland
+
+`scripts/userland.sh` builds the programs that make a disk a system to use:
+busybox 1.38.0, with a link for each of its applets where Linux keeps them
+(`/bin/sh`, `/bin/ls`, `/usr/bin/awk` and the rest), and zsh 5.9.2 with its
+shell functions, on ncurses 6.6 with the terminals it knows built in.
+They're static programs for x86-64 Linux, linked with musl by zig cc 0.17.0,
+from the sources the script pins and checks by their SHA-256, into
+`target/userland/root`. The first build takes a few minutes and needs the
+network; after that it's done, until the script changes. It builds on x86-64
+Linux only.
+
+Over them go the files in `userland/`, copied every time, so changing them
+needs no new build:
+
+- `/sbin/init`, which the kernel runs first: it logs root in to zsh, as
+  `login` would, in `/root`;
+- `/etc/passwd`, `/etc/group` and `/etc/shells`, in which zsh is root's
+  shell;
+- `/etc/zshrc`, for every interactive zsh: completion, with a menu;
+  history, kept in `~/.zsh_history`; Emacs's keys and the console's Home,
+  End and Delete; and a prompt saying who, where and in which directory.
+
+What the completion system knows of its 998 functions it keeps in
+`~/.zcompdump`, which the build makes for root, by running the same zsh:
+made on simplos, it takes half a minute, most of it reading the functions
+a byte at a time, each byte from the disk.
+
+`cargo run`'s disk gets all of it as it's made: delete `fullkernel/disk.img`
+for one that has it. Then zsh is what you type at, and once it ends, the
+kernel's own shell. For now:
+
+- busybox is built without `init`, which the kernel would run first, and
+  which wants a console and an `inittab` there aren't; and without `tc`;
+- the disk's files belong to whoever made it, as `mke2fs -d` copies owners,
+  which is why `/etc/zshrc` has `compinit -u`;
+- what's read a little at a time is read from the disk each time, as
+  lwext4 keeps no file's data in memory, so zsh's `read`, which reads a
+  byte at a time, is slow.
+
+busybox is GPL-2.0, as simplos is; zsh and ncurses are MIT-style. A disk
+made with them holds their programs, built from the upstream releases the
+script names, unchanged, configured as it says.
 
 ## Tests
 
@@ -251,8 +375,11 @@ ext4 disk made by e2fsprogs' `mke2fs`, which `tests/ext4.rs` writes to, and
 `tests/files.rs` has the user program read and write through system calls. It holds
 the user program as `/bin/probe`, which `tests/processes.rs` has it start
 copies of and run again; `tests/tty.rs` types into a terminal for it to read;
-`tests/signals.rs` has it send signals to itself and its copies.
-After a run that passes, e2fsck must find nothing wrong with it, and it must have been
+`tests/signals.rs` has it send signals to itself and its copies;
+`tests/time.rs` has it read the clocks, count CPU time and set alarms.
+`tests/shells.rs` runs busybox's sh and zsh, as commands and typed at on a
+terminal: its disk is 64 MiB and holds the userland too, which the runner
+builds with `scripts/userland.sh` the first time. After a run that passes, e2fsck must find nothing wrong with it, and it must have been
 unmounted, so the tests need e2fsprogs installed.
 
 Each test boots twice, under BIOS and UEFI at once, and passes only if it
@@ -299,7 +426,7 @@ the right firmware and the right framebuffer mode.
 | `vendor/ps2/` | the `ps2` crate, with its `x86_64` dependency bumped. |
 | `fs/ext4/` | ext4 (and ext3 and ext2) file systems, read and written with a journal: a Rust interface over the vendored lwext4, tested on the host against e2fsprogs. |
 | `vendor/lwext4/` | [lwext4](https://github.com/gkostka/lwext4), the C library `fs/ext4` uses for now. |
-| `scripts/` | `build-images.sh`, `smoke-test.sh`, `boot-test.sh`. |
+| `scripts/` | `build-images.sh`, `smoke-test.sh`, `boot-test.sh`, `mutants.sh`, and `userland.sh`, which builds busybox and zsh for the disk. |
 
 There is no cargo workspace: `kernel` builds for `x86_64-unknown-none` with
 `build-std`, the host tools and `fs/ext4`'s tests build for the host, `user/probe` builds for
@@ -313,7 +440,7 @@ be added to the others that need it.
 `vendor/lwext4` is upstream [lwext4](https://github.com/gkostka/lwext4) at
 commit `58bcf89` (2022-09-22): its `src/` and `include/` without the mkfs and
 MBR code, which nothing uses. It is GPL-2.0 (its extents and xattr code are
-"GPL-2.0 or later"), like simplos. It has five local fixes, each marked
+"GPL-2.0 or later"), like simplos. It has six local fixes, each marked
 `LOCAL PATCH` in the source, all found by `fs/ext4`'s tests:
 
 - **`src/ext4.c`, renaming a directory** — the block holding its `..` entry
@@ -335,11 +462,17 @@ MBR code, which nothing uses. It is GPL-2.0 (its extents and xattr code are
 - **`src/ext4_fs.c`, mounting to write** — it marked the file system as
   having errors, where Linux clears its "clean" flag: after a crash, Linux
   would warn of errors that weren't there.
+- **`src/ext4.c`, a symbolic link too long for its inode** — its target went
+  into a block of its own, after whatever a file freed before had left
+  there, where Linux zeroes the rest: e2fsck took such links to be broken.
 
-And one addition, also marked: **`src/ext4.c`, renaming onto a file that's
+And two additions, also marked: **`src/ext4.c`, renaming onto a file that's
 there** replaces it in the rename's own transaction, as `rename(2)` promises,
 so a crash leaves the old file or the new one there, never neither. Upstream
-refuses (`EEXIST`).
+refuses (`EEXIST`). And **`ext4_inode_attrs_set`** changes a file's
+permissions, owner, group and times by inode, in one transaction: upstream
+sets each by path, in a transaction of its own, and the path of a file that's
+open may have changed.
 
 `fs/ext4` compiles it with the host's C compiler, the same way for the
 kernel as for its tests on the host: freestanding, with no C library but the
@@ -349,9 +482,12 @@ few headers in `fs/ext4/src/include` and the few functions in
 registers of a thread that's in it, so it must never touch SSE ones, which
 hold user programs' state. Compiled without it, an optimised kernel has a
 couple of hundred SSE instructions; CI checks it has none. Its `build.rs` also
-turns off debug `printf`, picks lwext4's own errno values, and gives it
-`malloc` and friends from Rust's allocator. Nothing outside `fs/ext4` sees it, so it can be
-replaced by Rust code without touching the rest. Its habits that differ from
+turns off debug `printf`, picks lwext4's own errno values, gives it `malloc`
+and friends from Rust's allocator, and has it keep up to 512 blocks of each
+file system in memory, where upstream's 8 had every lookup in a big directory
+read it from the disk again: zsh's `compinit` checking its 1185 functions, in
+one directory, took 24 s, and now takes 1.6 s. Nothing outside `fs/ext4` sees
+it, so it can be replaced by Rust code without touching the rest. Its habits that differ from
 Linux's are handled there rather than patched: it would mount a file system
 whose journal needs replaying as if it were clean, make the missing
 directories on the way to a new file, say nothing to making a directory that's
@@ -360,12 +496,16 @@ opened for reading, quietly mount read-only what it can't write, and crash
 unmounting after a failed mount.
 
 What it still can't do: rename a directory onto an empty one in one
-transaction (it's two), remove a file over 16 MiB in one transaction, remove
-or replace a file that's open (refused, where Linux removes the name and
-keeps the file until it's closed), set timestamps, or leave a hole in a file
-(writing past the end fills the gap with zeros). A new file's permissions are
-set just after it's made, in a transaction of their own. Every change is on the device before the call
-returns, in the journal if there is one, which is simple and slow.
+transaction (it's two), remove a file over 16 MiB in one transaction, keep a
+file that's open once its last name is gone (it would free it under whoever
+has it open: `fs/ext4` gives it another name first), or leave a hole in a
+file (writing past the end fills the gap with zeros). A new file's permissions and times are
+set just after it's made, in a transaction of their own. Every call is a
+transaction of its own, in the journal before the call returns, where
+there's one: lwext4's cache then writes the blocks to their places in its
+own time (its write-back mode), or as the file system is unmounted. Without
+a journal, it writes them through. So `fs/ext4` holds a stream of small
+writes to a file, and makes them in one call.
 
 Building and running `fs/ext4`'s tests needs e2fsprogs (`mke2fs`, `e2fsck`,
 `debugfs`) and `gzip`. Every test that writes ends with `e2fsck -fn` on the

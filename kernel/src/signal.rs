@@ -33,6 +33,7 @@ pub const SIGFPE: usize = 8;
 pub const SIGKILL: usize = 9;
 pub const SIGSEGV: usize = 11;
 pub const SIGPIPE: usize = 13;
+pub const SIGALRM: usize = 14;
 pub const SIGCHLD: usize = 17;
 pub const SIGCONT: usize = 18;
 pub const SIGSTOP: usize = 19;
@@ -244,6 +245,11 @@ impl Signals {
     /// Whether a signal is pending that isn't blocked.
     pub fn has_signal(&self) -> bool {
         self.pending.load(Ordering::Acquire) & !self.blocked.load(Ordering::Relaxed) != 0
+    }
+
+    /// Whether it's stopped, by SIGSTOP or the like.
+    pub fn stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
     }
 
     pub fn pending(&self) -> u64 {

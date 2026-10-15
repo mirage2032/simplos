@@ -5,11 +5,11 @@
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::fs::{FileExt, PermissionsExt};
+use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicIsize, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn main() {
     let arg = |n: usize| std::env::args().nth(n).unwrap_or_default();
@@ -687,6 +687,28 @@ fn main() {
             let file = OpenOptions::new().append(true).create(true).open(arg(2));
             or_fail(&arg(2), or_fail(&arg(2), file).write_all(arg(3).as_bytes()));
         }
+        // A small write, which the kernel holds in memory to make with what
+        // follows, made by fsync, or sync: the disks' writes, by
+        // /proc/diskstats, go up. Thrice, in case the kernel's own writing,
+        // once a second, comes in between.
+        Some(call @ ("fsync" | "sync")) => {
+            let writes = || {
+                let stats = or_fail("/proc/diskstats", fs::read_to_string("/proc/diskstats"));
+                let lines = stats.lines();
+                lines.filter_map(|line| line.split_whitespace().nth(7)?.parse::<u64>().ok()).sum()
+            };
+            let mut file = or_fail(&arg(2), fs::File::create(arg(2)));
+            let synced = (0..3).any(|_| {
+                or_fail(&arg(2), file.write_all(b"x"));
+                let before: u64 = writes();
+                match call {
+                    "fsync" => or_fail(&arg(2), file.sync_all()),
+                    _ => drop(syscall(162, 0, 0, 0)),
+                }
+                writes() > before
+            });
+            println!("{}", if synced { "synced" } else { "still held" });
+        }
         // What stat says, then what fstat says of it open.
         Some("stat") => {
             let open = or_fail(&arg(2), fs::File::open(arg(2)));
@@ -716,6 +738,465 @@ fn main() {
             let mut buf = vec![0; arg(4).parse().unwrap_or(0)];
             let read = or_fail(&arg(2), file.read_at(&mut buf, arg(3).parse().unwrap_or(0)));
             or_fail(&arg(2), io::stdout().write_all(&buf[..read]));
+        }
+        // Several buffers in one call: writev's go out as one write, and
+        // readv's come in as one read, filling the first before the next;
+        // then too many buffers, EINVAL, and one that isn't there, EFAULT.
+        Some("vectors") => {
+            use std::io::{IoSlice, IoSliceMut};
+            let (mut reader, mut writer) = or_fail("pipe", io::pipe());
+            let parts = [IoSlice::new(b"one "), IoSlice::new(b""), IoSlice::new(b"two three")];
+            let written = or_fail("writev", writer.write_vectored(&parts));
+            drop(writer);
+            let (mut first, mut second) = ([0u8; 4], [0u8; 32]);
+            let mut into = [IoSliceMut::new(&mut first), IoSliceMut::new(&mut second)];
+            let read = or_fail("readv", reader.read_vectored(&mut into));
+            let iov = [b"x".as_ptr() as usize, 1];
+            let too_many = syscall(20, 1, iov.as_ptr() as usize, 1025);
+            let nowhere = syscall(20, 1, 0x1000, 1);
+            let second = String::from_utf8_lossy(&second[..read.saturating_sub(4)]).into_owned();
+            println!("{written} {read} {:?} {second:?} {too_many} {nowhere}", str_of(&first));
+        }
+        // One readv from standard input into buffers of 5 and 10 bytes.
+        Some("readv") => {
+            use std::io::IoSliceMut;
+            let (mut first, mut second) = ([0u8; 5], [0u8; 10]);
+            // Safety: standard input stays open; this doesn't close it.
+            let stdin = std::mem::ManuallyDrop::new(unsafe { fs::File::from_raw_fd(0) });
+            let mut into = [IoSliceMut::new(&mut first), IoSliceMut::new(&mut second)];
+            let read = or_fail("readv", (&*stdin).read_vectored(&mut into));
+            println!("{read} {:?} {:?}", str_of(&first), str_of(&second));
+        }
+        // What a program asks about the machine and itself: what uname says,
+        // its user and group, the CPUs it has, and its limits, one of which a
+        // copy inherits; and readlink of what isn't a link.
+        Some("system") => {
+            let mut uts = [0u8; 6 * 65];
+            syscall(63, uts.as_mut_ptr() as usize, 0, 0);
+            let uname: Vec<&str> = uts.chunks(65).map(str_of).collect();
+            let ids = [102, 107, 104, 108].map(|nr| syscall(nr, 0, 0, 0));
+            let set = [syscall(105, 0, 0, 0), syscall(105, 1000, 0, 0)];
+            let mut mask = [0u8; 128];
+            let cpus = syscall(204, 0, mask.len(), mask.as_mut_ptr() as usize);
+            let short = syscall(204, 0, 4, mask.as_mut_ptr() as usize);
+            let parallel = std::thread::available_parallelism().map_or(0, |n| n.get());
+            let mut files = [0u64; 2];
+            syscall(97, 7, files.as_mut_ptr() as usize, 0);
+            let lowered = syscall(160, 7, [100u64, 1024].as_ptr() as usize, 0);
+            let too_many = syscall(160, 7, [2000u64, 2000].as_ptr() as usize, 0);
+            let backwards = syscall(160, 7, [20u64, 10].as_ptr() as usize, 0);
+            let child = syscall(57, 0, 0, 0);
+            if child == 0 {
+                let mut limit = [0u64; 2];
+                syscall5(302, [0, 7, 0, limit.as_mut_ptr() as usize, 0]);
+                std::process::exit(limit[0] as i32);
+            }
+            let inherited = wait(child).1;
+            let mut core = [0u64; 2];
+            syscall5(302, [0, 4, 0, core.as_mut_ptr() as usize, 0]);
+            let mut buf = [0u8; 64];
+            let mut link = |path: &std::ffi::CStr| {
+                syscall(89, path.as_ptr() as usize, buf.as_mut_ptr() as usize, buf.len())
+            };
+            let (file, missing) = (link(c"/hello.txt"), link(c"/missing"));
+            println!(
+                "{uname:?} {ids:?} {set:?} {cpus} {} {short} {parallel} {files:?} {lowered} \
+                 {too_many} {backwards} {inherited} {core:?} {file} {missing}",
+                mask[0]
+            );
+        }
+        // The time of day, which the disk's files were stamped with just
+        // before boot, by each call that tells it; a sleep, never short; one
+        // until a time, and until one past; how fine the clock is; and a
+        // clock there isn't.
+        Some("clocks") => {
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+            let stamped =
+                or_fail("/hello.txt", fs::metadata("/hello.txt").and_then(|m| m.modified()));
+            let stamped = stamped.duration_since(UNIX_EPOCH).unwrap().as_secs();
+            let mut timeval = [0u64; 2];
+            syscall(96, timeval.as_mut_ptr() as usize, 0, 0);
+            let seconds = syscall(201, 0, 0, 0) as u64;
+            let agree = timeval[0].abs_diff(now) <= 1
+                && timeval[1] < 1_000_000
+                && seconds.abs_diff(now) <= 1;
+            let start = Instant::now();
+            std::thread::sleep(Duration::from_millis(100));
+            let slept = (100..2000).contains(&start.elapsed().as_millis());
+            // Until a time of day, which taken for a while would be decades.
+            let mut realtime = [0u64; 2];
+            syscall(228, 0, realtime.as_mut_ptr() as usize, 0);
+            let at = realtime[0] * 1_000_000_000 + realtime[1] + 100_000_000;
+            let until = [at / 1_000_000_000, at % 1_000_000_000];
+            let start = Instant::now();
+            let absolute = syscall5(230, [0, 1, until.as_ptr() as usize, 0, 0]);
+            let waited = (90..2000).contains(&start.elapsed().as_millis());
+            let start = Instant::now();
+            let past = syscall5(230, [0, 1, [1u64, 0].as_ptr() as usize, 0, 0]);
+            let past = (past, start.elapsed().as_millis() < 500);
+            let mut resolution = [0u64; 2];
+            syscall(229, 1, resolution.as_mut_ptr() as usize, 0);
+            let none = syscall(228, 99, realtime.as_mut_ptr() as usize, 0);
+            println!(
+                "{} {agree} {slept} {absolute} {waited} {past:?} {resolution:?} {none}",
+                now.abs_diff(stamped) < 600
+            );
+        }
+        // CPU time: computing, a program's own; making system calls, the
+        // kernel's for it; a copy's, as wait4 tells it, its parent's
+        // children's once waited for.
+        Some("cpu-time") => {
+            let usage = |who: usize| {
+                let mut usage = [0u64; 18];
+                syscall(98, who, usage.as_mut_ptr() as usize, 0);
+                [usage[0] * 1000 + usage[1] / 1000, usage[2] * 1000 + usage[3] / 1000]
+            };
+            let computing = |ms| {
+                let start = Instant::now();
+                let mut x = 0u64;
+                while start.elapsed() < Duration::from_millis(ms) {
+                    for i in 0..100_000 {
+                        x = std::hint::black_box(x.wrapping_mul(31).wrapping_add(i));
+                    }
+                }
+            };
+            computing(300);
+            let [user, system] = usage(0);
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_millis(300) {
+                (0..100).for_each(|_| _ = syscall(110, 0, 0, 0));
+            }
+            let in_kernel = usage(0)[1] - system;
+            let mut clock = [0u64; 2];
+            syscall(228, 2, clock.as_mut_ptr() as usize, 0);
+            let mut tms = [0u64; 4];
+            let ticks = syscall(100, tms.as_mut_ptr() as usize, 0, 0);
+            let child = syscall(57, 0, 0, 0);
+            if child == 0 {
+                computing(300);
+                std::process::exit(0);
+            }
+            let before = usage(usize::MAX)[0];
+            let mut told = [0u64; 18];
+            syscall5(61, [child as usize, 0, 0, told.as_mut_ptr() as usize, 0]);
+            let after = usage(usize::MAX)[0];
+            println!(
+                "{} {} {} {} {} {} {} {}",
+                user >= 200,
+                in_kernel >= 30,
+                clock[0] * 1000 + clock[1] / 1_000_000 >= 200,
+                tms[0] >= 20,
+                ticks > 0,
+                before == 0,
+                told[0] * 1000 + told[1] / 1000 >= 200,
+                after >= 200
+            );
+        }
+        // Alarms: SIGALRM in 100 ms, which ends a wait for it; one every
+        // 50 ms, three times; what's left of one, as getitimer and alarm say;
+        // a copy starts without one; not handled, it ends the program; and
+        // it ends a read, with EINTR.
+        Some("alarms") => {
+            sigaction(SIGALRM, record, SA_SIGINFO);
+            let start = Instant::now();
+            syscall(38, 0, [0u64, 0, 0, 100_000].as_ptr() as usize, 0);
+            let paused = syscall(34, 0, 0, 0);
+            let after =
+                start.elapsed().as_millis() >= 100 && LAST.load(Ordering::SeqCst) == SIGALRM;
+            CAUGHT.store(0, Ordering::SeqCst);
+            let start = Instant::now();
+            syscall(38, 0, [0u64, 50_000, 0, 50_000].as_ptr() as usize, 0);
+            while CAUGHT.load(Ordering::SeqCst) < 3 {
+                syscall(34, 0, 0, 0);
+            }
+            syscall(38, 0, [0u64; 4].as_ptr() as usize, 0);
+            let repeated = start.elapsed().as_millis() >= 150;
+            let none = syscall(37, 10, 0, 0);
+            let mut left = [0u64; 4];
+            syscall(36, 0, left.as_mut_ptr() as usize, 0);
+            let off = syscall(37, 0, 0, 0);
+            syscall(37, 5, 0, 0);
+            let child = syscall(57, 0, 0, 0);
+            if child == 0 {
+                let mut left = [0u64; 4];
+                syscall(36, 0, left.as_mut_ptr() as usize, 0);
+                std::process::exit(i32::from(left != [0; 4]));
+            }
+            let copy = wait(child).1;
+            syscall(37, 0, 0, 0);
+            let child = syscall(57, 0, 0, 0);
+            if child == 0 {
+                set_action(SIGALRM, SIG_DFL, 0);
+                syscall(38, 0, [0u64, 0, 0, 50_000].as_ptr() as usize, 0);
+                loop {
+                    syscall(34, 0, 0, 0);
+                }
+            }
+            let ended = wait(child).1;
+            let (mut reader, _writer) = or_fail("pipe", io::pipe());
+            syscall(38, 0, [0u64, 0, 0, 50_000].as_ptr() as usize, 0);
+            let read = reader.read(&mut [0]).map_err(|e| e.raw_os_error());
+            println!(
+                "{paused} {after} {repeated} {none} {} {off} {copy} {ended} {read:?}",
+                (9..=10).contains(&left[2])
+            );
+        }
+        // Symbolic links: made and read back, followed, and lstat'd as
+        // themselves; through a directory, after which `..` is the
+        // directory's parent, not the link's; one that leads nowhere, which
+        // O_CREAT makes the file for; a loop; O_NOFOLLOW; a program run
+        // through one. Hard links: two names for a file, which outlives
+        // either. And what Linux refuses.
+        Some("links") => {
+            use std::os::unix::fs::{OpenOptionsExt, symlink};
+            let code = |result: io::Result<()>| result.map_err(|e| e.raw_os_error().unwrap_or(0));
+            or_fail("/links", fs::create_dir("/links"));
+            or_fail("abs", symlink("/hello.txt", "/links/abs"));
+            let target = or_fail("abs", fs::read_link("/links/abs"));
+            let through = or_fail("abs", fs::read_to_string("/links/abs"));
+            let itself =
+                or_fail("abs", fs::symlink_metadata("/links/abs")).file_type().is_symlink();
+            let followed = or_fail("abs", fs::metadata("/links/abs")).is_file();
+            or_fail("up", symlink("../dir", "/links/up"));
+            let deep = or_fail("up", fs::read_to_string("/links/up/nested/deep.txt"));
+            let inode = |path| or_fail(path, fs::metadata(path)).ino();
+            let parent = inode("/links/up/nested/..") == inode("/dir");
+            or_fail("nowhere", symlink("made-by-open", "/links/nowhere"));
+            or_fail("nowhere", fs::write("/links/nowhere", "made\n"));
+            let made = or_fail("made", fs::read_to_string("/links/made-by-open"));
+            or_fail("loop", symlink("loop2", "/links/loop1"));
+            or_fail("loop", symlink("loop1", "/links/loop2"));
+            let looped = code(fs::read("/links/loop1").map(drop));
+            let nofollow = code(
+                OpenOptions::new().read(true).custom_flags(0o400000).open("/links/abs").map(drop),
+            );
+            or_fail("probe", symlink("/bin/probe", "/links/probe"));
+            let ran = or_fail("probe", Command::new("/links/probe").output());
+            or_fail("one", fs::write("/links/one", "shared\n"));
+            or_fail("two", fs::hard_link("/links/one", "/links/two"));
+            let links = or_fail("one", fs::metadata("/links/one")).nlink();
+            or_fail("one", fs::remove_file("/links/one"));
+            let kept = or_fail("two", fs::read_to_string("/links/two"));
+            let refused = [
+                code(fs::hard_link("/dir", "/links/dir")),
+                code(symlink("anything", "/hello.txt")),
+                code(fs::read_link("/hello.txt").map(drop)),
+                code(fs::hard_link("/links/missing", "/links/three")),
+                code(fs::metadata("/hello.txt/../dir").map(drop)),
+            ];
+            println!(
+                "{target:?} {through:?} {itself} {followed} {deep:?} {parent} {made:?} \
+                 {looped:?} {nofollow:?} {:?} {links} {kept:?} {refused:?}",
+                String::from_utf8_lossy(&ran.stdout)
+            );
+        }
+        // A file's permissions, owner and times, changed by path and
+        // through a descriptor, and a link's as itself; its times as it's
+        // made and written; its length cut and grown; what access says of
+        // files; and sendfile, from where a file's at and from a place given.
+        Some("attributes") => {
+            use std::fs::{FileTimes, Permissions};
+            use std::os::unix::fs::{chown, lchown, symlink};
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+            let path = "/attributes.txt";
+            or_fail(path, fs::write(path, "0123456789"));
+            let stat = |path| or_fail(path, fs::symlink_metadata(path));
+            let made = stat(path);
+            let fresh =
+                [made.atime(), made.mtime(), made.ctime()].iter().all(|t| (t - now).abs() <= 5);
+            or_fail(path, fs::set_permissions(path, Permissions::from_mode(0o600)));
+            let by_path = stat(path).mode() & 0o7777;
+            or_fail(path, chown(path, Some(1000), None));
+            or_fail(path, chown(path, None, Some(100)));
+            or_fail("link", symlink(path, "/attributes-link"));
+            or_fail("link", lchown("/attributes-link", Some(7), Some(7)));
+            let owners = [stat(path).uid(), stat(path).gid(), stat("/attributes-link").uid()];
+            let file = or_fail(path, OpenOptions::new().read(true).write(true).open(path));
+            or_fail(path, file.set_permissions(Permissions::from_mode(0o640)));
+            let by_fd = stat(path).mode() & 0o7777;
+            let times = FileTimes::new()
+                .set_accessed(UNIX_EPOCH + Duration::from_secs(1000))
+                .set_modified(UNIX_EPOCH + Duration::from_secs(2000));
+            or_fail(path, file.set_times(times));
+            let set = [stat(path).atime(), stat(path).mtime()];
+            or_fail(
+                path,
+                file.set_times(
+                    FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(3000)),
+                ),
+            );
+            let omitted = [stat(path).atime(), stat(path).mtime()];
+            or_fail(path, (&file).write_all(b"x"));
+            let written = (stat(path).mtime() - now).abs() <= 5 && stat(path).atime() == 1000;
+            let path_c = c"/attributes.txt";
+            // As `touch` does it: no times, both now.
+            syscall5(280, [-100isize as usize, path_c.as_ptr() as usize, 0, 0, 0]);
+            let touched = (stat(path).atime() - now).abs() <= 5;
+            or_fail(path, file.set_len(4));
+            let cut = or_fail(path, fs::read(path));
+            or_fail(path, file.set_len(6));
+            let grown = or_fail(path, fs::read(path));
+            let truncated = syscall(76, path_c.as_ptr() as usize, 2, 0);
+            let short = stat(path).len();
+            let read_only = or_fail(path, fs::File::open(path));
+            let refused = syscall(77, read_only.as_raw_fd() as usize, 0, 0);
+            let access = |path: &std::ffi::CStr, mode| syscall(21, path.as_ptr() as usize, mode, 0);
+            let accesses = [
+                access(path_c, 4 | 2),
+                access(path_c, 1),
+                access(c"/bin/probe", 1),
+                access(c"/dev/null", 2),
+                access(c"/dev", 2),
+                access(c"/missing", 0),
+                access(path_c, 8),
+            ];
+            let hello = or_fail("/hello.txt", fs::File::open("/hello.txt"));
+            let (mut reader, writer) = or_fail("pipe", io::pipe());
+            let all =
+                syscall5(40, [writer.as_raw_fd() as usize, hello.as_raw_fd() as usize, 0, 100, 0]);
+            let mut place = 6u64;
+            let part = syscall5(
+                40,
+                [
+                    writer.as_raw_fd() as usize,
+                    hello.as_raw_fd() as usize,
+                    &raw mut place as usize,
+                    4,
+                    0,
+                ],
+            );
+            let rest =
+                syscall5(40, [writer.as_raw_fd() as usize, hello.as_raw_fd() as usize, 0, 100, 0]);
+            drop(writer);
+            let mut sent = String::new();
+            or_fail("pipe", reader.read_to_string(&mut sent));
+            drop((file, read_only));
+            or_fail(path, fs::remove_file(path));
+            or_fail("link", fs::remove_file("/attributes-link"));
+            println!(
+                "{fresh} {by_path:o} {owners:?} {by_fd:o} {set:?} {omitted:?} {written} {touched} {:?} \
+                 {grown:?} {truncated} {short} {refused} {accesses:?} {all} {part} {place} {rest} \
+                 {sent:?}",
+                str_of(&cut),
+            );
+        }
+        // A file removed while it's open, as zsh's here-documents are, and
+        // one renamed over: both still read as they were through the
+        // descriptors open on them.
+        Some("unlinked") => {
+            let path = "/here-document";
+            or_fail(path, fs::write(path, "here\n"));
+            let mut here = or_fail(path, fs::File::open(path));
+            or_fail(path, fs::remove_file(path));
+            let gone = fs::metadata(path).is_err();
+            let path = "/replaced";
+            or_fail(path, fs::write(path, "old\n"));
+            let mut old = or_fail(path, fs::File::open(path));
+            or_fail("/new", fs::write("/new", "new\n"));
+            or_fail(path, fs::rename("/new", path));
+            let (mut text, mut was) = (String::new(), String::new());
+            or_fail("here", here.read_to_string(&mut text));
+            or_fail(path, old.read_to_string(&mut was));
+            let now = or_fail(path, fs::read_to_string(path));
+            or_fail(path, fs::remove_file(path));
+            println!("{gone} {text:?} {was:?} {now:?}");
+        }
+        // Scripts run by what their first line names: with its argument, the
+        // script's path as given, and the script's own arguments; through
+        // a script naming another; and those that can't be run.
+        Some("scripts") => {
+            let scripts = [
+                ("/script", "#!/bin/probe env\nnot run\n"),
+                ("/spaced", "#! \t/bin/probe   env \t\n"),
+                ("/outer", "#!/script\n"),
+                ("/loop", "#!/loop\n"),
+                ("/nothing", "#!  \n"),
+                ("/missing", "#!/not/there\n"),
+                ("/text", "echo hi\n"),
+            ];
+            for (path, text) in scripts {
+                or_fail(path, fs::write(path, text));
+                or_fail(path, fs::set_permissions(path, fs::Permissions::from_mode(0o755)));
+            }
+            let run = |path: &str| match Command::new(path).arg("a").env_clear().output() {
+                Ok(output) => String::from_utf8_lossy(&output.stdout).trim_end().to_string(),
+                Err(error) => error.raw_os_error().unwrap_or(0).to_string(),
+            };
+            let ran: Vec<String> = scripts.iter().map(|(path, _)| run(path)).collect();
+            let relative = run("./script");
+            for (path, _) in scripts {
+                or_fail(path, fs::remove_file(path));
+            }
+            println!("{} | {relative}", ran.join(" | "));
+        }
+        // What sysinfo says of the machine; the groups root is in besides
+        // its own, none; how nice it is, set by process and by group, and
+        // inherited; and a turn given up.
+        Some("machine") => {
+            let mut info = [0u64; 14];
+            let told = syscall(99, info.as_mut_ptr() as usize, 0, 0);
+            let mut boot = [0u64; 2];
+            syscall(228, 7, boot.as_mut_ptr() as usize, 0);
+            let (uptime, total, free, processes) = (info[0], info[4], info[5], info[10] & 0xFFFF);
+            let unit = info[13] & 0xFFFF_FFFF;
+            let machine = [
+                boot[0] - uptime <= 1,
+                total >= 64 << 20 && free < total,
+                processes >= 1,
+                unit == 1,
+            ];
+            let groups = [
+                syscall(115, 0, 0, 0),
+                syscall(116, 0, 0, 0),
+                syscall(115, -1isize as usize, 0, 0),
+            ];
+            let priority = || syscall(140, 0, 0, 0);
+            let mut nice = vec![priority(), syscall(141, 0, 0, 5), priority()];
+            let child = syscall(57, 0, 0, 0);
+            if child == 0 {
+                std::process::exit(priority() as i32);
+            }
+            let inherited = wait(child).1;
+            nice.extend([syscall(141, 1, 0, -3isize as usize), priority()]);
+            nice.extend([
+                syscall(141, 0, 0, 100),
+                priority(),
+                syscall(140, 3, 0, 0),
+                syscall(140, 0, 99999, 0),
+            ]);
+            println!("{told} {machine:?} {groups:?} {nice:?} {inherited} {}", syscall(24, 0, 0, 0));
+        }
+        // What /proc says of it: its memory, as it maps a megabyte and
+        // unmaps it again, and its name; and statfs and fstatfs of the
+        // disk, which agree.
+        Some("proc") => {
+            let rss = || {
+                let stat = or_fail("/proc/self/stat", fs::read_to_string("/proc/self/stat"));
+                // The 24th field, the 22nd after the name.
+                let after = stat.rsplit(')').next().unwrap_or_default();
+                after
+                    .split_whitespace()
+                    .nth(21)
+                    .and_then(|rss| rss.parse::<i64>().ok())
+                    .unwrap_or(-1)
+            };
+            let before = rss();
+            let addr = syscall5(9, [0, 1 << 20, 3, 0x22, 0]);
+            let mapped = rss() - before;
+            syscall(11, addr as usize, 1 << 20, 0);
+            let unmapped = rss() - before;
+            let (mut by_path, mut by_fd) = ([0u64; 15], [0u64; 15]);
+            syscall(137, c"/".as_ptr() as usize, by_path.as_mut_ptr() as usize, 0);
+            let file = or_fail("/hello.txt", fs::File::open("/hello.txt"));
+            syscall(138, file.as_raw_fd() as usize, by_fd.as_mut_ptr() as usize, 0);
+            let name = or_fail("/proc/self/comm", fs::read_to_string("/proc/self/comm"));
+            println!(
+                "{mapped} {unmapped} {:#x} {} {} {}",
+                by_path[0],
+                by_path == by_fd,
+                by_path[1],
+                name.trim_end()
+            );
         }
         Some(other) => {
             eprintln!("probe: unknown mode {other:?}");
@@ -764,6 +1245,7 @@ const SIGKILL: usize = 9;
 const SIGUSR1: usize = 10;
 const SIGUSR2: usize = 12;
 const SIGPIPE: usize = 13;
+const SIGALRM: usize = 14;
 const SIGTERM: usize = 15;
 const SIGCHLD: usize = 17;
 const SIGCONT: usize = 18;
@@ -1001,6 +1483,11 @@ fn wait(pid: isize) -> (isize, String) {
 }
 
 /// A system call made directly, bypassing libc's checks.
+/// The text in `bytes` before its first NUL.
+fn str_of(bytes: &[u8]) -> &str {
+    std::str::from_utf8(bytes.split(|&b| b == 0).next().unwrap_or_default()).unwrap_or("?")
+}
+
 fn syscall(nr: isize, a0: usize, a1: usize, a2: usize) -> isize {
     syscall5(nr, [a0, a1, a2, 0, 0])
 }

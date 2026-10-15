@@ -470,6 +470,12 @@ int ext4_mtime_set(const char *path, uint32_t mtime);
  * @return  Standard error code.*/
 int ext4_ctime_set(const char *path, uint32_t ctime);
 
+/* LOCAL ADDITION: change an inode's permission bits, owner, group and times,
+ * by inode, in a transaction; see its definition in ext4.c. */
+int ext4_inode_attrs_set(const char *mount_point, uint32_t ino, uint32_t mode,
+			 uint32_t uid, uint32_t gid, uint32_t atime,
+			 uint32_t mtime, uint32_t ctime);
+
 /**@brief Get file/directory/link access time.
  *
  * @param path  Path to file/dir/link.

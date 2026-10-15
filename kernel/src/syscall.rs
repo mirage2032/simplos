@@ -8,9 +8,13 @@
 //! checked against its page tables (`AddressSpace::read` and `write`): a bad
 //! one is EFAULT, never a fault in the kernel.
 
+mod clocks;
 mod files;
 mod processes;
 mod signals;
+mod system;
+
+pub use system::{DEFAULT_LIMITS, LIMITS, RELEASE};
 
 use crate::fs::Handle;
 use crate::io::interrupts::gdt;
@@ -212,10 +216,13 @@ fn call(frame: &Frame) -> i64 {
     match frame.nr {
         0 => files::read(&process, a0, a1, a2),
         1 => files::write(&process, a0, a1, a2),
+        19 => files::readv(&process, a0, a1, a2),
+        20 => files::writev(&process, a0, a1, a2),
         2 => files::open(&process, files::AT_FDCWD, a0, a1, a2),
         3 => files::close(&process, a0),
-        // stat and lstat: the same, as no symbolic link is followed yet.
-        4 | 6 => files::newfstatat(&process, files::AT_FDCWD, a0, a1, 0),
+        // stat, and lstat, which doesn't follow a link at the end.
+        4 => files::newfstatat(&process, files::AT_FDCWD, a0, a1, 0),
+        6 => files::newfstatat(&process, files::AT_FDCWD, a0, a1, files::AT_SYMLINK_NOFOLLOW),
         5 => files::fstat(&process, a0, a1),
         7 => poll(&process, a0, a1, (a2 as i32 >= 0).then_some(a2 as i32 as u64)),
         8 => files::lseek(&process, a0, a1, a2),
@@ -238,12 +245,21 @@ fn call(frame: &Frame) -> i64 {
         16 => files::ioctl(&process, a0, a1, a2),
         17 => files::pread(&process, a0, a1, a2, a3),
         18 => files::pwrite(&process, a0, a1, a2, a3),
+        21 => files::faccessat(&process, files::AT_FDCWD, a0, a1, 0),
         22 => files::pipe2(&process, a0, 0),
+        24 => {
+            thread::yield_now();
+            0
+        }
         32 => files::dup(&process, a0),
         33 => files::dup3(&process, a0, a1, 0, true),
         34 => signals::pause(&process),
         35 => clock_nanosleep(&process, CLOCK_MONOTONIC, 0, a0, a1),
+        36 => clocks::getitimer(&process, a0, a1),
+        37 => clocks::alarm(&process, a0),
+        38 => clocks::setitimer(&process, a0, a1, a2),
         39 => process.id as i64,
+        40 => files::sendfile(&process, a0, a1, a2, a3),
         // The copy starts as the call returns, with 0 its result.
         56 => processes::clone(&process, frame.registers(0), a0, a1),
         // fork, vfork.
@@ -263,43 +279,85 @@ fn call(frame: &Frame) -> i64 {
         }
         61 => processes::wait4(&process, a0, a1, a2, a3),
         62 => signals::kill(&process, a0, a1),
+        63 => system::uname(&process, a0),
         72 => files::fcntl(&process, a0, a1, a2),
         79 => files::getcwd(&process, a0, a1),
         80 => files::chdir(&process, a0),
         82 => files::renameat2(&process, files::AT_FDCWD, a0, files::AT_FDCWD, a1, 0),
         83 => files::mkdirat(&process, files::AT_FDCWD, a0, a1),
         84 => files::unlinkat(&process, files::AT_FDCWD, a0, files::AT_REMOVEDIR),
+        86 => files::linkat(&process, files::AT_FDCWD, a0, files::AT_FDCWD, a1, 0),
         87 => files::unlinkat(&process, files::AT_FDCWD, a0, 0),
+        88 => files::symlinkat(&process, a0, files::AT_FDCWD, a1),
+        89 => files::readlinkat(&process, files::AT_FDCWD, a0, a1, a2),
+        90 => files::fchmodat(&process, files::AT_FDCWD, a0, a1),
+        91 => files::fchmodat(&process, a0, 0, a1),
+        92 => files::fchownat(&process, files::AT_FDCWD, a0, a1, a2, 0),
+        93 => files::fchownat(&process, a0, 0, a1, a2, 0),
+        94 => files::fchownat(&process, files::AT_FDCWD, a0, a1, a2, files::AT_SYMLINK_NOFOLLOW),
         95 => files::umask(&process, a0),
+        96 => clocks::gettimeofday(&process, a0, a1),
+        97 => system::prlimit(&process, 0, a0, 0, a1),
+        98 => clocks::getrusage(&process, a0, a1),
+        99 => system::sysinfo(&process, a0),
+        100 => clocks::times(&process, a0),
+        // getuid, getgid, geteuid and getegid.
+        102 | 104 | 107 | 108 => 0,
+        105 | 106 => system::set_id(a0),
         109 => signals::setpgid(&process, a0, a1),
         110 => process.parent_id() as i64,
         111 => process.pgid() as i64,
         112 => signals::setsid(&process),
+        // getgroups, setgroups.
+        115 | 116 => system::groups(a0),
         121 => signals::getpgid(&process, a0),
         124 => signals::getsid(&process, a0),
         127 => signals::rt_sigpending(&process, a0, a1),
         130 => signals::rt_sigsuspend(&process, a0, a1),
         // fsync, fdatasync.
         74 | 75 => files::fsync(&process, a0),
+        76 => files::truncate(&process, a0, a1),
+        77 => files::ftruncate(&process, a0, a1),
         131 => signals::sigaltstack(&process, a0, a1, frame.rsp),
+        137 => files::statfs(&process, a0, a1),
+        138 => files::fstatfs(&process, a0, a1),
+        140 => system::getpriority(&process, a0, a1),
+        141 => system::setpriority(&process, a0, a1, a2),
         158 => arch_prctl(&process, a0, a1),
+        160 => system::prlimit(&process, 0, a0, a1, 0),
+        162 => files::sync(),
         // gettid: one thread per program, so its id is the program's.
         186 => process.id as i64,
         // set_tid_address: nothing to clear at exit with one thread per program.
         200 => signals::tkill(&process, None, a0, a1),
+        201 => clocks::time(&process, a0),
+        204 => system::sched_getaffinity(&process, a0, a1, a2),
         217 => files::getdents64(&process, a0, a1, a2),
         218 => process.id as i64,
+        228 => clocks::clock_gettime(&process, a0, a1),
+        229 => clocks::clock_getres(&process, a0, a1),
         230 => clock_nanosleep(&process, a0, a1, a2, a3),
         234 => signals::tkill(&process, Some(a0), a1, a2),
         257 => files::open(&process, a0, a1, a2, a3),
         258 => files::mkdirat(&process, a0, a1, a2),
+        260 => files::fchownat(&process, a0, a1, a2, a3, a4),
         262 => files::newfstatat(&process, a0, a1, a2, a3),
         263 => files::unlinkat(&process, a0, a1, a2),
         264 => files::renameat2(&process, a0, a1, a2, a3, 0),
+        265 => files::linkat(&process, a0, a1, a2, a3, a4),
+        266 => files::symlinkat(&process, a0, a1, a2),
+        267 => files::readlinkat(&process, a0, a1, a2, a3),
+        268 => files::fchmodat(&process, a0, a1, a2),
+        269 => files::faccessat(&process, a0, a1, a2, 0),
         271 => ppoll(&process, a0, a1, a2),
+        280 => files::utimensat(&process, a0, a1, a2, a3),
         292 => files::dup3(&process, a0, a1, a2, false),
         293 => files::pipe2(&process, a0, a1),
+        302 => system::prlimit(&process, a0, a1, a2, a3),
+        // syncfs.
+        306 => files::fsync(&process, a0),
         316 => files::renameat2(&process, a0, a1, a2, a3, a4),
+        439 => files::faccessat(&process, a0, a1, a2, a3),
         _ => {
             serial_println!("simplos: process {}: no system call {}", process.id, frame.nr);
             -ENOSYS
@@ -489,20 +547,31 @@ fn brk(process: &Process, addr: u64) -> i64 {
 
 const CLOCK_REALTIME: u64 = 0;
 const CLOCK_MONOTONIC: u64 = 1;
+const CLOCK_BOOTTIME: u64 = 7;
 
-/// Sleep for the `struct timespec` at `request`: what `std::thread::sleep`
-/// does, through `clock_nanosleep`, and `nanosleep` too. A signal ends it
-/// early, with what was left of it at `remain`.
+/// Sleep for the `struct timespec` at `request`, or with TIMER_ABSTIME until
+/// `clock` says that time: what `std::thread::sleep` does, through
+/// `clock_nanosleep`, and `nanosleep` too. A signal ends it early, with what
+/// was left of a sleep for a while at `remain`.
 ///
 /// shortcut: one that stops the program and continues it starts the whole
 /// sleep again, where Linux sleeps for what's left.
 fn clock_nanosleep(process: &Process, clock: u64, flags: u64, request: u64, remain: u64) -> i64 {
-    // shortcut: relative sleeps only; TIMER_ABSTIME needs a clock a program
-    // can read, which comes with clock_gettime when one asks for it.
-    if flags != 0 || (clock != CLOCK_REALTIME && clock != CLOCK_MONOTONIC) {
+    const TIMER_ABSTIME: u64 = 1;
+    if flags & !TIMER_ABSTIME != 0
+        || ![CLOCK_REALTIME, CLOCK_MONOTONIC, CLOCK_BOOTTIME].contains(&clock)
+    {
         return -EINVAL;
     }
-    let ms = match timespec_ms(process, request) {
+    let ms = match flags {
+        TIMER_ABSTIME => timespec_ns(process, request).and_then(|until| {
+            Ok(until.saturating_sub(clocks::now(process, clock)?).div_ceil(1_000_000))
+        }),
+        _ => timespec_ms(process, request),
+    };
+    let ms = match ms {
+        // Already past.
+        Ok(0) if flags == TIMER_ABSTIME => return 0,
         Ok(ms) => ms,
         Err(errno) => return -errno,
     };
@@ -510,7 +579,7 @@ fn clock_nanosleep(process: &Process, clock: u64, flags: u64, request: u64, rema
     if thread::poll_until(Some(deadline), || false).is_ok() {
         return 0;
     }
-    if remain != 0 {
+    if remain != 0 && flags != TIMER_ABSTIME {
         let left = deadline.saturating_sub(thread::ticks()) * 1000 / TIMER_HZ as u64;
         let mut timespec = [0u8; 16];
         timespec[..8].copy_from_slice(&(left / 1000).to_le_bytes());
@@ -524,6 +593,11 @@ fn clock_nanosleep(process: &Process, clock: u64, flags: u64, request: u64, rema
 
 /// The `struct timespec` at `addr`, in milliseconds, rounded up.
 fn timespec_ms(process: &Process, addr: u64) -> Result<u64, i64> {
+    Ok(timespec_ns(process, addr)?.div_ceil(1_000_000))
+}
+
+/// The `struct timespec` at `addr`, in nanoseconds.
+fn timespec_ns(process: &Process, addr: u64) -> Result<u64, i64> {
     let mut timespec = [0u8; 16];
     process.memory.lock().space.read(addr, &mut timespec).ok_or(EFAULT)?;
     let seconds = i64::from_le_bytes(timespec[..8].try_into().unwrap());
@@ -531,7 +605,7 @@ fn timespec_ms(process: &Process, addr: u64) -> Result<u64, i64> {
     if seconds < 0 || !(0..1_000_000_000).contains(&nanos) {
         return Err(EINVAL);
     }
-    Ok((seconds as u64).saturating_mul(1000).saturating_add((nanos as u64).div_ceil(1_000_000)))
+    Ok((seconds as u64).saturating_mul(1_000_000_000).saturating_add(nanos as u64))
 }
 
 /// `fs`, where musl keeps its thread-local storage.

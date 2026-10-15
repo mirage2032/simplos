@@ -3,7 +3,7 @@
 //! Provides high-resolution timing (nanosecond precision) using the HPET hardware.
 // TODO: REWORK
 use core::ptr::{read_volatile, write_volatile};
-use spin::{Lazy, Mutex};
+use spin::Once;
 use x86_64::VirtAddr;
 
 // HPET register offsets
@@ -76,8 +76,9 @@ impl Hpet {
     }
 }
 
-/// Global HPET instance
-pub static HPET: Lazy<Mutex<Option<Hpet>>> = Lazy::new(|| Mutex::new(None));
+/// Global HPET instance: set once, at boot, and read without a lock, so that
+/// code running with interrupts off, or holding any lock, can tell the time.
+pub static HPET: Once<Hpet> = Once::new();
 
 /// Initialize the HPET from ACPI tables
 ///
@@ -137,12 +138,17 @@ pub fn init_hpet(rsdp_addr: u64, phys_mem_offset: VirtAddr) -> Result<(), &'stat
     // Initialize HPET driver
     let hpet = unsafe { Hpet::new(hpet_base, phys_mem_offset) };
 
-    *HPET.lock() = Some(hpet);
+    HPET.call_once(|| hpet);
 
     Ok(())
 }
 
+/// Nanoseconds since the HPET started, if there's one.
+pub fn elapsed_nanos() -> Option<u64> {
+    HPET.get().map(Hpet::elapsed_nanos)
+}
+
 /// Get elapsed milliseconds since HPET initialization
 pub fn elapsed_millis() -> Option<u64> {
-    HPET.lock().as_ref().map(|h| h.elapsed_millis())
+    HPET.get().map(Hpet::elapsed_millis)
 }

@@ -38,9 +38,6 @@ const FLUSH_CACHE_EXT: u8 = 0xEA;
 /// command cheap to retry and is still far more than PIO wants at once.
 const MAX_SECTORS: usize = 256;
 
-/// shortcut: spin-count timeouts, not wall-clock; use the HPET if real disks prove slower.
-const SPINS: u32 = 1_000_000;
-
 pub struct Drive {
     base: u16,
     control: u16,
@@ -70,26 +67,26 @@ impl Drive {
 
     /// Wait for BSY to clear and return the status, or the drive's error.
     fn wait_ready(&self) -> Result<u8, DiskError> {
-        for _ in 0..SPINS {
-            let status = self.read_reg(STATUS_COMMAND);
-            if status & BSY == 0 {
-                if status & (ERR | DF) != 0 {
-                    return Err(DiskError::Device(self.read_reg(ERROR)));
-                }
-                return Ok(status);
-            }
-        }
-        Err(DiskError::Timeout)
+        self.wait_for(0)
     }
 
     /// Wait until the drive has a sector for us, or wants one.
     fn wait_data(&self) -> Result<(), DiskError> {
-        for _ in 0..SPINS {
-            if self.wait_ready()? & DRQ != 0 {
-                return Ok(());
-            }
+        self.wait_for(DRQ).map(|_| ())
+    }
+
+    /// Wait for BSY to clear and any of `bits` (for none, just that) to be
+    /// set, and return the status; or the drive's error.
+    fn wait_for(&self, bits: u8) -> Result<u8, DiskError> {
+        let mut status = 0;
+        super::poll(|| {
+            status = self.read_reg(STATUS_COMMAND);
+            status & BSY == 0 && (bits == 0 || status & (bits | ERR | DF) != 0)
+        })?;
+        if status & (ERR | DF) != 0 {
+            return Err(DiskError::Device(self.read_reg(ERROR)));
         }
-        Err(DiskError::Timeout)
+        Ok(status)
     }
 
     /// Select the drive and send an LBA48 command.
@@ -156,7 +153,12 @@ impl Drive {
         }
         // Only an ATA disk answers here; ATAPI and SATA devices abort the
         // command and leave their signature in the LBA registers instead.
-        let status = (0..SPINS).map(|_| self.read_reg(STATUS_COMMAND)).find(|s| s & BSY == 0)?;
+        let mut status = 0;
+        super::poll(|| {
+            status = self.read_reg(STATUS_COMMAND);
+            status & BSY == 0
+        })
+        .ok()?;
         if status & ERR != 0 || self.read_reg(LBA_MID) != 0 || self.read_reg(LBA_HIGH) != 0 {
             return None;
         }
@@ -181,9 +183,8 @@ pub fn probe() -> Vec<(DiskInfo, Drive)> {
             let drive = Drive { base, control, slave };
             let Some(id) = drive.identify() else { continue };
             match parse_identify(&id) {
-                Some((model, sectors)) => {
-                    found.push((DiskInfo { kind: "ata", model, sectors }, drive))
-                }
+                Some((model, sectors)) => found
+                    .push((DiskInfo { kind: "ata", model, sectors, ..DiskInfo::default() }, drive)),
                 None => {
                     serial_println!("simplos: skipping ATA disk without 512-byte sectors");
                 }

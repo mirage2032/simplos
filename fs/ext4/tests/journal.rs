@@ -117,14 +117,8 @@ fn check_cut(dir: &std::path::Path, worker: usize, cut: usize, disk: &[u8], writ
 
     // e2fsck replaying the journal and nothing more, as Linux would.
     std::fs::write(&crashed, &disk).unwrap();
-    let replay = e2fsprogs("e2fsck").args(["-y", "-E", "journal_only"]).arg(&crashed).output();
-    let replay = replay.expect("e2fsck, from e2fsprogs");
-    assert!(
-        replay.status.success(),
-        "after {cut} writes, e2fsck can't replay the journal:\n{}{}",
-        String::from_utf8_lossy(&replay.stdout),
-        String::from_utf8_lossy(&replay.stderr)
-    );
+    replay(&crashed)
+        .unwrap_or_else(|output| panic!("after {cut} writes, e2fsck can't replay:\n{output}"));
     fsck(&crashed)
         .unwrap_or_else(|problems| panic!("after {cut} writes, replayed by e2fsck:\n{problems}"));
 

@@ -10,6 +10,7 @@
 pub mod ahci;
 pub mod ata;
 
+use crate::io::hpet;
 use crate::serial_println;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -17,12 +18,17 @@ use spin::Mutex;
 
 pub const SECTOR: usize = 512;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct DiskInfo {
     /// `"ata"` or `"ahci"`.
     pub kind: &'static str,
     pub model: String,
     pub sectors: u64,
+    /// The reads and writes made since boot, and their sectors.
+    pub reads: u64,
+    pub sectors_read: u64,
+    pub writes: u64,
+    pub sectors_written: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,6 +41,39 @@ pub enum DiskError {
     /// The device refused the command; the value is its error register.
     Device(u8),
     Timeout,
+}
+
+/// How long a disk may take over one command: a flush waits for everything
+/// in the disk's cache, and under QEMU for its image to reach the host's disk,
+/// which can take far longer than a read, and still far less than this.
+const TIMEOUT_MS: u64 = 10_000;
+
+/// Poll `done` until it says so, or for `TIMEOUT_MS` by the HPET's clock.
+fn poll(done: impl FnMut() -> bool) -> Result<(), DiskError> {
+    poll_for(TIMEOUT_MS, done)
+}
+
+fn poll_for(ms: u64, mut done: impl FnMut() -> bool) -> Result<(), DiskError> {
+    let start = hpet::elapsed_millis();
+    let mut tries: u32 = 0;
+    while !done() {
+        tries = tries.wrapping_add(1);
+        let late = match start {
+            // The clock is a slow read, so not on every try.
+            Some(start) => {
+                tries.is_multiple_of(64)
+                    && hpet::elapsed_millis().is_some_and(|now| now - start >= ms)
+            }
+            // shortcut: without an HPET, a million tries, which a fast CPU
+            // makes in a few milliseconds; count the PIT's ticks instead if
+            // a machine without one turns up.
+            None => tries == 1_000_000,
+        };
+        if late {
+            return Err(DiskError::Timeout);
+        }
+    }
+    Ok(())
 }
 
 enum Disk {
@@ -72,7 +111,10 @@ pub fn read(disk: usize, lba: u64, buf: &mut [u8]) -> Result<(), DiskError> {
     match disk {
         Disk::Ata(drive) => drive.read(lba, buf),
         Disk::Ahci(port) => port.read(lba, buf),
-    }
+    }?;
+    info.reads += 1;
+    info.sectors_read += (buf.len() / SECTOR) as u64;
+    Ok(())
 }
 
 /// Write `buf.len() / 512` sectors starting at `lba`, and flush the disk's
@@ -84,7 +126,10 @@ pub fn write(disk: usize, lba: u64, buf: &[u8]) -> Result<(), DiskError> {
     match disk {
         Disk::Ata(drive) => drive.write(lba, buf),
         Disk::Ahci(port) => port.write(lba, buf),
-    }
+    }?;
+    info.writes += 1;
+    info.sectors_written += (buf.len() / SECTOR) as u64;
+    Ok(())
 }
 
 fn check(info: &DiskInfo, lba: u64, len: usize) -> Result<(), DiskError> {
@@ -123,4 +168,20 @@ fn words(bytes: &[u8]) -> [u16; 256] {
         *word = u16::from_le_bytes(*pair);
     }
     id
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test_case]
+    fn a_wait_lasts_its_time_however_quick_each_try() {
+        // A million of these tries take a few milliseconds; it's the clock
+        // that has to say when to stop.
+        let start = hpet::elapsed_millis().expect("QEMU's machines have an HPET");
+        assert_eq!(poll_for(50, || false), Err(DiskError::Timeout));
+        let took = hpet::elapsed_millis().unwrap() - start;
+        assert!((50..1000).contains(&took), "took {took} ms");
+        assert_eq!(poll_for(50, || true), Ok(()));
+    }
 }

@@ -1,9 +1,9 @@
 //! System calls on programs: copying one (`fork` and the like), replacing
 //! one with another (`execve`), and waiting for copies to end (`wait4`).
 
-use super::files::{self, AT_FDCWD, Result, lookup, path_at, ret, string_at};
+use super::clocks;
+use super::files::{self, Result, path_at, ret, string_at};
 use super::{EFAULT, EINVAL, ENOMEM};
-use crate::fs;
 use crate::process::{self, Process, Registers};
 use crate::signal::ERESTARTSYS;
 use alloc::sync::Arc;
@@ -44,13 +44,15 @@ pub fn clone(process: &Arc<Process>, mut child: Registers, flags: u64, stack: u6
 pub fn execve(process: &Process, path: u64, argv: u64, envp: u64) -> Result<Registers> {
     // What the strings and their pointers may take of the new stack.
     let mut room = 128 * 1024;
-    let path = lookup(process, AT_FDCWD, &path_at(process, path)?)?;
-    let args = strings_at(process, argv, &mut room)?;
+    let path = path_at(process, path)?;
+    let mut args = strings_at(process, argv, &mut room)?;
     let env = strings_at(process, envp, &mut room)?;
-    let elf = fs::read_program(&path)?;
+    let cwd = process.cwd.lock().clone();
+    let elf = process::program_for(&cwd, &path, &mut args)?;
     let args: Vec<&[u8]> = args.iter().map(Vec::as_slice).collect();
     let env: Vec<&[u8]> = env.iter().map(Vec::as_slice).collect();
     let start = process::exec(process, &elf, &args, &env).map_err(process::load_errno)?;
+    *process.command.lock() = process::Command::new(path.as_bytes(), &args);
     files::close_on_exec(process);
     Ok(start)
 }
@@ -123,14 +125,18 @@ pub fn wait4(process: &Process, pid: u64, wstatus: u64, options: u64, rusage: u6
         return -ERESTARTSYS;
     }
     let Some((child, status)) = found else { return if any { 0 } else { -ECHILD } };
+    // Its CPU time is its parent's children's, once it's waited for.
+    if child.ended().is_some() {
+        process.times.add_child(&child.times);
+    }
     ret((|| {
         let mut memory = process.memory.lock();
         if wstatus != 0 {
             memory.space.write(wstatus, &status.to_le_bytes()).ok_or(EFAULT)?;
         }
-        // `struct rusage`: nothing is counted yet.
         if rusage != 0 {
-            memory.space.write(rusage, &[0; 144]).ok_or(EFAULT)?;
+            let (user, system) = clocks::total(&child.times);
+            memory.space.write(rusage, &clocks::rusage(user, system)).ok_or(EFAULT)?;
         }
         Ok(child.id as i64)
     })())
