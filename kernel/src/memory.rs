@@ -311,6 +311,35 @@ impl AddressSpace {
         }
     }
 
+    /// The flags of `page`, if it's mapped.
+    pub fn flags(&mut self, page: Page) -> Option<PageTableFlags> {
+        match self.mapper().translate(page.start_address()) {
+            TranslateResult::Mapped { flags, .. } => Some(flags),
+            _ => None,
+        }
+    }
+
+    /// Move the `count` pages from `from` on, every one of them mapped, to
+    /// as many from `to` on, none of them mapped, as `mremap` does: each
+    /// with its frame and flags, so what's in them goes along, copied by
+    /// none. `None`, with nothing moved, when memory for a page table runs
+    /// out.
+    pub fn move_pages(&mut self, from: Page, to: Page, count: u64) -> Option<()> {
+        let mut frames = FRAMES.lock();
+        let frames = frames.as_mut()?;
+        let mut mapper = self.mapper();
+        for moved in 0..count {
+            if !move_page(&mut mapper, from + moved, to + moved, frames) {
+                // Back where they were, whose tables are all still there.
+                for back in 0..moved {
+                    move_page(&mut mapper, to + back, from + back, frames);
+                }
+                return None;
+            }
+        }
+        Some(())
+    }
+
     /// Copy `bytes` to `addr`, whatever the pages' protection: for the loader.
     pub fn load(&mut self, addr: u64, bytes: &[u8]) -> Option<()> {
         self.copy(addr, bytes.len(), PageTableFlags::PRESENT, |at, range| {
@@ -439,6 +468,37 @@ fn copy_tables(
         }
     }
     Some(())
+}
+
+/// Move the page at `from`, which is mapped, to `to`, which isn't, with its
+/// frame and flags: whether it went, which only a page table for `to` that
+/// couldn't be had stops. Then it's still at `from`.
+fn move_page(
+    mapper: &mut OffsetPageTable,
+    from: Page,
+    to: Page,
+    frames: &mut BootInfoFrameAllocator,
+) -> bool {
+    let table_flags =
+        PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+    let TranslateResult::Mapped { flags, .. } = mapper.translate(from.start_address()) else {
+        return false;
+    };
+    let Ok((frame, flush)) = mapper.unmap(from) else { return false };
+    flush.flush();
+    // Safety: the program's own frame, which `from` no longer maps; and
+    // `to` is a lower-half page of the same address space.
+    if let Ok(flush) =
+        unsafe { mapper.map_to_with_table_flags(to, frame, flags, table_flags, frames) }
+    {
+        flush.flush();
+        return true;
+    }
+    // Safety: as above, back where it was, whose tables unmapping kept.
+    unsafe { mapper.map_to_with_table_flags(from, frame, flags, table_flags, frames) }
+        .expect("a page's tables stay as it's unmapped")
+        .flush();
+    false
 }
 
 /// The page table in `frame`, through the physical-memory map.

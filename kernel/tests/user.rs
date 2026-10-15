@@ -93,10 +93,26 @@ fn memory_calls_keep_to_the_program_s_half_and_give_back_what_they_fail_to_get()
     // isn't an address, and making it one stopped the kernel. Then a
     // gigabyte, more than the test machine has, which mmap and brk refuse
     // without keeping a page of what they took; and a megabyte, which
-    // there still is.
+    // there still is. And a page MAP_FIXED maps where mmap would next,
+    // which mmap then hands out no more.
     assert_eq!(
         run(&["memory-edges"]),
-        (0, String::from("[-22, -22, -22, -22] -12 0 true 0 true\n"))
+        (0, String::from("[-22, -22, -22, -22] -12 0 true 0 true true\n"))
+    );
+}
+
+#[test_case]
+fn mremap_grows_moves_and_shrinks_mappings() {
+    // What Linux says, from the same program, but for the last: there,
+    // where nothing's been mapped after it, it grows where it is.
+    assert_eq!(
+        run(&["mremap"]),
+        (
+            0,
+            String::from(
+                "-12 true true true [-22, -22, -22, -22, -22, -14, -14, -22, -22] 0 true true\n"
+            )
+        )
     );
 }
 
