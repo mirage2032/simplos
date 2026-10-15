@@ -717,6 +717,72 @@ fn main() {
             let read = or_fail(&arg(2), file.read_at(&mut buf, arg(3).parse().unwrap_or(0)));
             or_fail(&arg(2), io::stdout().write_all(&buf[..read]));
         }
+        // Several buffers in one call: writev's go out as one write, and
+        // readv's come in as one read, filling the first before the next;
+        // then too many buffers, EINVAL, and one that isn't there, EFAULT.
+        Some("vectors") => {
+            use std::io::{IoSlice, IoSliceMut};
+            let (mut reader, mut writer) = or_fail("pipe", io::pipe());
+            let parts = [IoSlice::new(b"one "), IoSlice::new(b""), IoSlice::new(b"two three")];
+            let written = or_fail("writev", writer.write_vectored(&parts));
+            drop(writer);
+            let (mut first, mut second) = ([0u8; 4], [0u8; 32]);
+            let mut into = [IoSliceMut::new(&mut first), IoSliceMut::new(&mut second)];
+            let read = or_fail("readv", reader.read_vectored(&mut into));
+            let iov = [b"x".as_ptr() as usize, 1];
+            let too_many = syscall(20, 1, iov.as_ptr() as usize, 1025);
+            let nowhere = syscall(20, 1, 0x1000, 1);
+            let second = String::from_utf8_lossy(&second[..read.saturating_sub(4)]).into_owned();
+            println!("{written} {read} {:?} {second:?} {too_many} {nowhere}", str_of(&first));
+        }
+        // One readv from standard input into buffers of 5 and 10 bytes.
+        Some("readv") => {
+            use std::io::IoSliceMut;
+            let (mut first, mut second) = ([0u8; 5], [0u8; 10]);
+            // Safety: standard input stays open; this doesn't close it.
+            let stdin = std::mem::ManuallyDrop::new(unsafe { fs::File::from_raw_fd(0) });
+            let mut into = [IoSliceMut::new(&mut first), IoSliceMut::new(&mut second)];
+            let read = or_fail("readv", (&*stdin).read_vectored(&mut into));
+            println!("{read} {:?} {:?}", str_of(&first), str_of(&second));
+        }
+        // What a program asks about the machine and itself: what uname says,
+        // its user and group, the CPUs it has, and its limits, one of which a
+        // copy inherits; and readlink of what isn't a link.
+        Some("system") => {
+            let mut uts = [0u8; 6 * 65];
+            syscall(63, uts.as_mut_ptr() as usize, 0, 0);
+            let uname: Vec<&str> = uts.chunks(65).map(str_of).collect();
+            let ids = [102, 107, 104, 108].map(|nr| syscall(nr, 0, 0, 0));
+            let set = [syscall(105, 0, 0, 0), syscall(105, 1000, 0, 0)];
+            let mut mask = [0u8; 128];
+            let cpus = syscall(204, 0, mask.len(), mask.as_mut_ptr() as usize);
+            let short = syscall(204, 0, 4, mask.as_mut_ptr() as usize);
+            let parallel = std::thread::available_parallelism().map_or(0, |n| n.get());
+            let mut files = [0u64; 2];
+            syscall(97, 7, files.as_mut_ptr() as usize, 0);
+            let lowered = syscall(160, 7, [100u64, 1024].as_ptr() as usize, 0);
+            let too_many = syscall(160, 7, [2000u64, 2000].as_ptr() as usize, 0);
+            let backwards = syscall(160, 7, [20u64, 10].as_ptr() as usize, 0);
+            let child = syscall(57, 0, 0, 0);
+            if child == 0 {
+                let mut limit = [0u64; 2];
+                syscall5(302, [0, 7, 0, limit.as_mut_ptr() as usize, 0]);
+                std::process::exit(limit[0] as i32);
+            }
+            let inherited = wait(child).1;
+            let mut core = [0u64; 2];
+            syscall5(302, [0, 4, 0, core.as_mut_ptr() as usize, 0]);
+            let mut buf = [0u8; 64];
+            let mut link = |path: &std::ffi::CStr| {
+                syscall(89, path.as_ptr() as usize, buf.as_mut_ptr() as usize, buf.len())
+            };
+            let (file, missing) = (link(c"/hello.txt"), link(c"/missing"));
+            println!(
+                "{uname:?} {ids:?} {set:?} {cpus} {} {short} {parallel} {files:?} {lowered} \
+                 {too_many} {backwards} {inherited} {core:?} {file} {missing}",
+                mask[0]
+            );
+        }
         Some(other) => {
             eprintln!("probe: unknown mode {other:?}");
             std::process::exit(2);
@@ -1001,6 +1067,11 @@ fn wait(pid: isize) -> (isize, String) {
 }
 
 /// A system call made directly, bypassing libc's checks.
+/// The text in `bytes` before its first NUL.
+fn str_of(bytes: &[u8]) -> &str {
+    std::str::from_utf8(bytes.split(|&b| b == 0).next().unwrap_or_default()).unwrap_or("?")
+}
+
 fn syscall(nr: isize, a0: usize, a1: usize, a2: usize) -> isize {
     syscall5(nr, [a0, a1, a2, 0, 0])
 }

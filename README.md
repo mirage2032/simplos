@@ -126,7 +126,19 @@ who's who. So Rust's `std::process::Command` works: its `spawn`, `status`,
 `output` and `exec`. `cargo run`'s
 disk has the user program as `/bin/probe` (a `disk.img` made before this
 doesn't: delete it), so in the shell, `run spawn /bin/probe hello` has it
-run itself again. For now:
+run itself again.
+
+A program can ask what it runs on: `uname` says Linux, the interface it's
+talking to, with simplos as the host and in the version; `sched_getaffinity`
+gives it the one CPU; it runs as root (`getuid` and the like say 0); and
+`getrlimit`, `setrlimit` and `prlimit64` keep its limits, which its copies
+inherit. `readv` and `writev` move several buffers in one call, as musl's
+`printf` and the like do. For now:
+
+- every id is 0, and can't be set to another, as there are no other users;
+- limits are kept and reported, not enforced: a program has the 1024
+  descriptors and 256 KiB of stack there are, whatever it sets;
+- `readlink` says what's there isn't a link, as there are none yet;
 
 - `fork` copies all of a program's memory at once, rather than sharing it
   until either side writes to it;

@@ -10,6 +10,7 @@
 
 extern crate alloc;
 
+use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -141,4 +142,20 @@ fn pipes_join_a_program_to_the_one_it_runs() {
         run(&["feed", "fed through\n", "/bin/probe", "cat"]),
         ok("fed through\nexit status: 0\n")
     );
+}
+
+#[test_case]
+fn a_program_learns_about_the_system_and_itself() {
+    // Linux, as far as its system calls go; root, and only root; one CPU;
+    // its limits, the one it lowered inherited by a copy, which can't raise
+    // past the descriptors there are nor have soft over hard; and
+    // readlink, EINVAL for a file that isn't a link and ENOENT for none.
+    let infinity = u64::MAX;
+    let expected = format!(
+        "[\"Linux\", \"simplos\", \"6.1.0\", \"simplos {}\", \"x86_64\", \"(none)\"] \
+         [0, 0, 0, 0] [0, -1] 8 1 -22 1 [1024, 1024] 0 -1 -22 exit status: 100 \
+         [0, {infinity}] -22 -2\n",
+        env!("CARGO_PKG_VERSION")
+    );
+    assert_eq!(run(&["system"]), ok(&expected));
 }

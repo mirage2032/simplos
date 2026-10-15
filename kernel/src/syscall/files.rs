@@ -49,7 +49,7 @@ pub const AT_REMOVEDIR: u64 = 0x200;
 const MOST: usize = 1 << 20;
 
 /// Descriptors a program can have open at once.
-const MOST_FILES: usize = 1024;
+pub(super) const MOST_FILES: usize = 1024;
 
 /// An errno, positive.
 pub(super) type Result<T> = core::result::Result<T, i64>;
@@ -238,6 +238,62 @@ pub fn read(process: &Process, fd: u64, buf: u64, count: u64) -> i64 {
     ret(read_at(process, fd, buf, count, None))
 }
 
+/// `read` into each of the `count` buffers the `struct iovec`s at `iov`
+/// name, in turn: one read as long as all of them, as Linux's is, so that a
+/// terminal's line or a pipe's bytes come as they would to `read`.
+pub fn readv(process: &Process, fd: u64, iov: u64, count: u64) -> i64 {
+    ret((|| {
+        let buffers = iovecs(process, iov, count)?;
+        let total = buffers.iter().map(|&(_, len)| len).sum::<u64>();
+        let data = read_data(process, fd, total, None)?;
+        let mut memory = process.memory.lock();
+        let mut rest = &data[..];
+        for (base, len) in buffers {
+            let (now, later) = rest.split_at((len as usize).min(rest.len()));
+            memory.space.write(base, now).ok_or(EFAULT)?;
+            rest = later;
+        }
+        Ok(data.len() as i64)
+    })())
+}
+
+/// `write` what the `struct iovec`s at `iov` name, as one write: so a pipe
+/// takes it whole or not at all, as for `write`.
+pub fn writev(process: &Process, fd: u64, iov: u64, count: u64) -> i64 {
+    ret((|| {
+        let mut data = Vec::new();
+        for (base, len) in iovecs(process, iov, count)? {
+            let len = (len as usize).min(MOST - data.len());
+            let start = data.len();
+            data.resize(start + len, 0);
+            process.memory.lock().space.read(base, &mut data[start..]).ok_or(EFAULT)?;
+        }
+        write_data(process, fd, &data, None)
+    })())
+}
+
+/// The `count` buffers, as base and length, the `struct iovec`s at `iov` name.
+fn iovecs(process: &Process, iov: u64, count: u64) -> Result<Vec<(u64, u64)>> {
+    const IOV_MAX: u64 = 1024;
+    if count > IOV_MAX {
+        return Err(EINVAL);
+    }
+    let mut table = vec![0u8; count as usize * 16];
+    process.memory.lock().space.read(iov, &mut table).ok_or(EFAULT)?;
+    let word = |bytes: &[u8]| u64::from_le_bytes(bytes.try_into().unwrap());
+    let buffers: Vec<_> = table
+        .as_chunks::<16>()
+        .0
+        .iter()
+        .map(|entry| (word(&entry[..8]), word(&entry[8..])))
+        .collect();
+    // Their total, as a `ssize_t`, has to be one.
+    match buffers.iter().try_fold(0u64, |total, &(_, len)| total.checked_add(len)) {
+        Some(total) if total as i64 >= 0 => Ok(buffers),
+        _ => Err(EINVAL),
+    }
+}
+
 pub fn pread(process: &Process, fd: u64, buf: u64, count: u64, offset: u64) -> i64 {
     ret(at(offset).and_then(|offset| read_at(process, fd, buf, count, Some(offset))))
 }
@@ -265,26 +321,26 @@ fn read_errno(error: ReadError) -> i64 {
 
 /// Read from `at`, or else from the descriptor's place, and move it on.
 fn read_at(process: &Process, fd: u64, buf: u64, count: u64, at: Option<u64>) -> Result<i64> {
+    let data = read_data(process, fd, count, at)?;
+    process.memory.lock().space.write(buf, &data).ok_or(EFAULT)?;
+    Ok(data.len() as i64)
+}
+
+/// What a read of `count` bytes takes, from `at` or the descriptor's place.
+fn read_data(process: &Process, fd: u64, count: u64, at: Option<u64>) -> Result<Vec<u8>> {
     let count = (count as usize).min(MOST);
     match &*handle(process, fd)? {
         Handle::Tty { .. } | Handle::Pipe { .. } if at.is_some() => Err(ESPIPE),
         Handle::Tty { tty, nonblocking } => {
-            let data = tty.read_or_wait(count, !nonblocking.load(Relaxed)).map_err(read_errno)?;
-            process.memory.lock().space.write(buf, &data).ok_or(EFAULT)?;
-            Ok(data.len() as i64)
+            tty.read_or_wait(count, !nonblocking.load(Relaxed)).map_err(read_errno)
         }
-        Handle::Null => Ok(0),
-        Handle::Zero => {
-            process.memory.lock().space.write(buf, &vec![0; count]).ok_or(EFAULT)?;
-            Ok(count as i64)
-        }
+        Handle::Null => Ok(Vec::new()),
+        Handle::Zero => Ok(vec![0; count]),
         Handle::Pipe { end, .. } if end.write => Err(EBADF),
         // Not even for nothing: with no data, it would wait.
-        Handle::Pipe { .. } if count == 0 => Ok(0),
+        Handle::Pipe { .. } if count == 0 => Ok(Vec::new()),
         Handle::Pipe { end, nonblocking } => {
-            let data = end.read(count, !nonblocking.load(Relaxed)).map_err(read_errno)?;
-            process.memory.lock().space.write(buf, &data).ok_or(EFAULT)?;
-            Ok(data.len() as i64)
+            end.read(count, !nonblocking.load(Relaxed)).map_err(read_errno)
         }
         Handle::Dir { .. } => Err(EISDIR),
         Handle::File { read: false, .. } => Err(EBADF),
@@ -293,29 +349,34 @@ fn read_at(process: &Process, fd: u64, buf: u64, count: u64, at: Option<u64>) ->
             let from = at.unwrap_or_else(|| offset.load(Relaxed));
             let mut data = vec![0; count];
             let read = file.read_at(from, &mut data).map_err(fs::errno)?;
-            process.memory.lock().space.write(buf, &data[..read]).ok_or(EFAULT)?;
+            data.truncate(read);
             if at.is_none() {
                 offset.store(from + read as u64, Relaxed);
             }
-            Ok(read as i64)
+            Ok(data)
         }
     }
 }
 
 /// Write at `at`, or else at the descriptor's place, and move it on.
 fn write_at(process: &Process, fd: u64, buf: u64, count: u64, at: Option<u64>) -> Result<i64> {
-    let handle = handle(process, fd)?;
     let mut data = vec![0; (count as usize).min(MOST)];
     process.memory.lock().space.read(buf, &mut data).ok_or(EFAULT)?;
+    write_data(process, fd, &data, at)
+}
+
+/// Write `data` at `at`, or else at the descriptor's place, and move it on.
+fn write_data(process: &Process, fd: u64, data: &[u8], at: Option<u64>) -> Result<i64> {
+    let handle = handle(process, fd)?;
     match &*handle {
         Handle::Tty { .. } | Handle::Pipe { .. } if at.is_some() => Err(ESPIPE),
         Handle::Tty { tty, .. } => {
-            tty.write(&data);
+            tty.write(data);
             Ok(data.len() as i64)
         }
         Handle::Null | Handle::Zero => Ok(data.len() as i64),
         Handle::Pipe { end, .. } if !end.write => Err(EBADF),
-        Handle::Pipe { end, nonblocking } => match end.write(&data, !nonblocking.load(Relaxed)) {
+        Handle::Pipe { end, nonblocking } => match end.write(data, !nonblocking.load(Relaxed)) {
             Ok(written) => Ok(written as i64),
             // And SIGPIPE, which ends a program that doesn't ignore it.
             Err(WriteError::Broken) => {
@@ -335,13 +396,28 @@ fn write_at(process: &Process, fd: u64, buf: u64, count: u64, at: Option<u64>) -
                 (false, Some(at)) => at,
                 (false, None) => offset.load(Relaxed),
             };
-            let written = file.write_at(to, &data).map_err(fs::errno)?;
+            let written = file.write_at(to, data).map_err(fs::errno)?;
             if at.is_none() {
                 offset.store(to + written as u64, Relaxed);
             }
             Ok(written as i64)
         }
     }
+}
+
+/// Where the symbolic link at `path` points, at most `size` bytes of it.
+///
+/// shortcut: there are no symbolic links yet, so anything there isn't one:
+/// EINVAL, as Linux says for a file.
+pub fn readlinkat(process: &Process, dirfd: u64, path: u64, size: u64) -> i64 {
+    ret((|| {
+        if size as i64 <= 0 {
+            return Err(EINVAL);
+        }
+        let path = lookup(process, dirfd, &path_at(process, path)?)?;
+        fs::lock().metadata(&path).map_err(fs::errno)?;
+        Err(EINVAL)
+    })())
 }
 
 pub fn lseek(process: &Process, fd: u64, offset: u64, whence: u64) -> i64 {

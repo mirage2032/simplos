@@ -401,3 +401,11 @@ fn without_a_disk_there_is_still_a_root() {
         ]
     );
 }
+
+#[test_case]
+fn a_program_moves_several_buffers_in_one_call() {
+    // Through a pipe: writev's three, one empty, as one write; readv into
+    // two, the first filled first. Then too many buffers, and one that
+    // isn't there.
+    assert_eq!(run(&["vectors"]), ok("13 13 \"one \" \"two three\" -22 -14\n"));
+}

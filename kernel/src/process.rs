@@ -19,6 +19,7 @@ use crate::fs;
 use crate::io::interrupts::gdt;
 use crate::memory::{AddressSpace, USER_END};
 use crate::signal::{self, Info, Signals};
+use crate::syscall;
 use crate::thread::{self, WaitQueue};
 use crate::tty::Tty;
 use alloc::boxed::Box;
@@ -45,7 +46,7 @@ pub const MMAP_START: u64 = 0x0000_1000_0000_0000;
 const STACK_TOP: u64 = 0x0000_7FFF_FFFF_0000;
 /// shortcut: a fixed 256 KiB, mapped up front; grow it on page faults when a
 /// program needs more.
-const STACK_SIZE: u64 = 256 * 1024;
+pub const STACK_SIZE: u64 = 256 * 1024;
 /// Where `mmap` stops: a gap below the stack.
 pub const MMAP_END: u64 = STACK_TOP - STACK_SIZE - 0x10_0000;
 
@@ -83,6 +84,9 @@ pub struct Process {
     pub cwd: Mutex<String>,
     /// The permission bits taken off what it creates.
     pub umask: AtomicU32,
+    /// Its resource limits, soft and hard, by `RLIMIT_*` number. Taken with
+    /// interrupts on.
+    pub limits: Mutex<[(u64, u64); syscall::LIMITS]>,
     /// The program it's a copy of; none for one the kernel started.
     parent: Weak<Process>,
     /// The copies it made that it hasn't waited for, ended or not. Taken only
@@ -266,6 +270,7 @@ pub fn spawn_with(
         files: Mutex::new(files.collect()),
         cwd: Mutex::new(String::new()),
         umask: AtomicU32::new(0o022),
+        limits: Mutex::new(syscall::DEFAULT_LIMITS),
         parent: Weak::new(),
         children: Mutex::new(Vec::new()),
         child_exited: WaitQueue::new(),
@@ -338,6 +343,7 @@ pub fn fork(parent: &Arc<Process>, registers: Registers) -> Option<u64> {
         files: Mutex::new(parent.files.lock().clone()),
         cwd: Mutex::new(parent.cwd.lock().clone()),
         umask: AtomicU32::new(parent.umask.load(Ordering::Relaxed)),
+        limits: Mutex::new(*parent.limits.lock()),
         parent: Arc::downgrade(parent),
         children: Mutex::new(Vec::new()),
         child_exited: WaitQueue::new(),

@@ -11,6 +11,9 @@
 mod files;
 mod processes;
 mod signals;
+mod system;
+
+pub use system::{DEFAULT_LIMITS, LIMITS};
 
 use crate::fs::Handle;
 use crate::io::interrupts::gdt;
@@ -212,6 +215,8 @@ fn call(frame: &Frame) -> i64 {
     match frame.nr {
         0 => files::read(&process, a0, a1, a2),
         1 => files::write(&process, a0, a1, a2),
+        19 => files::readv(&process, a0, a1, a2),
+        20 => files::writev(&process, a0, a1, a2),
         2 => files::open(&process, files::AT_FDCWD, a0, a1, a2),
         3 => files::close(&process, a0),
         // stat and lstat: the same, as no symbolic link is followed yet.
@@ -263,6 +268,7 @@ fn call(frame: &Frame) -> i64 {
         }
         61 => processes::wait4(&process, a0, a1, a2, a3),
         62 => signals::kill(&process, a0, a1),
+        63 => system::uname(&process, a0),
         72 => files::fcntl(&process, a0, a1, a2),
         79 => files::getcwd(&process, a0, a1),
         80 => files::chdir(&process, a0),
@@ -270,7 +276,12 @@ fn call(frame: &Frame) -> i64 {
         83 => files::mkdirat(&process, files::AT_FDCWD, a0, a1),
         84 => files::unlinkat(&process, files::AT_FDCWD, a0, files::AT_REMOVEDIR),
         87 => files::unlinkat(&process, files::AT_FDCWD, a0, 0),
+        89 => files::readlinkat(&process, files::AT_FDCWD, a0, a2),
         95 => files::umask(&process, a0),
+        97 => system::prlimit(&process, 0, a0, 0, a1),
+        // getuid, getgid, geteuid and getegid.
+        102 | 104 | 107 | 108 => 0,
+        105 | 106 => system::set_id(a0),
         109 => signals::setpgid(&process, a0, a1),
         110 => process.parent_id() as i64,
         111 => process.pgid() as i64,
@@ -283,10 +294,12 @@ fn call(frame: &Frame) -> i64 {
         74 | 75 => files::fsync(&process, a0),
         131 => signals::sigaltstack(&process, a0, a1, frame.rsp),
         158 => arch_prctl(&process, a0, a1),
+        160 => system::prlimit(&process, 0, a0, a1, 0),
         // gettid: one thread per program, so its id is the program's.
         186 => process.id as i64,
         // set_tid_address: nothing to clear at exit with one thread per program.
         200 => signals::tkill(&process, None, a0, a1),
+        204 => system::sched_getaffinity(&process, a0, a1, a2),
         217 => files::getdents64(&process, a0, a1, a2),
         218 => process.id as i64,
         230 => clock_nanosleep(&process, a0, a1, a2, a3),
@@ -296,9 +309,11 @@ fn call(frame: &Frame) -> i64 {
         262 => files::newfstatat(&process, a0, a1, a2, a3),
         263 => files::unlinkat(&process, a0, a1, a2),
         264 => files::renameat2(&process, a0, a1, a2, a3, 0),
+        267 => files::readlinkat(&process, a0, a1, a3),
         271 => ppoll(&process, a0, a1, a2),
         292 => files::dup3(&process, a0, a1, a2, false),
         293 => files::pipe2(&process, a0, a1),
+        302 => system::prlimit(&process, a0, a1, a2, a3),
         316 => files::renameat2(&process, a0, a1, a2, a3, a4),
         _ => {
             serial_println!("simplos: process {}: no system call {}", process.id, frame.nr);
