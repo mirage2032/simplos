@@ -2214,6 +2214,55 @@ int ext4_inode_exist(const char *path, int type)
 	return r;
 }
 
+/* LOCAL ADDITION: change inode `ino` of the file system mounted at
+ * `mount_point`, in a transaction of its own: its permission bits unless
+ * `mode` is -1, its owner and group unless they're -1, and each of its times
+ * unless it's 0. ext4_mode_set and the others do these by path, and the path
+ * of a file that's open may have changed. */
+int ext4_inode_attrs_set(const char *mount_point, uint32_t ino, uint32_t mode,
+			 uint32_t uid, uint32_t gid, uint32_t atime,
+			 uint32_t mtime, uint32_t ctime)
+{
+	int r;
+	struct ext4_inode_ref ref;
+	struct ext4_mountpoint *mp = ext4_get_mount(mount_point);
+
+	if (!mp)
+		return ENOENT;
+
+	if (mp->fs.read_only)
+		return EROFS;
+
+	EXT4_MP_LOCK(mp);
+	ext4_trans_start(mp);
+
+	r = ext4_fs_get_inode_ref(&mp->fs, ino, &ref);
+	if (r != EOK) {
+		ext4_trans_abort(mp);
+		goto Finish;
+	}
+	if (mode != (uint32_t)-1) {
+		uint32_t kept = ext4_inode_get_mode(&mp->fs.sb, ref.inode) & ~0xFFF;
+		ext4_inode_set_mode(&mp->fs.sb, ref.inode, kept | (mode & 0xFFF));
+	}
+	if (uid != (uint32_t)-1)
+		ext4_inode_set_uid(ref.inode, uid);
+	if (gid != (uint32_t)-1)
+		ext4_inode_set_gid(ref.inode, gid);
+	if (atime)
+		ext4_inode_set_access_time(ref.inode, atime);
+	if (mtime)
+		ext4_inode_set_modif_time(ref.inode, mtime);
+	if (ctime)
+		ext4_inode_set_change_inode_time(ref.inode, ctime);
+	ref.dirty = true;
+	r = ext4_trans_put_inode_ref(mp, &ref);
+
+Finish:
+	EXT4_MP_UNLOCK(mp);
+	return r;
+}
+
 int ext4_mode_set(const char *path, uint32_t mode)
 {
 	int r;

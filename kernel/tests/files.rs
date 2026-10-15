@@ -422,3 +422,18 @@ fn symbolic_and_hard_links_lead_where_they_should() {
     let expected = r#""/hello.txt" "hello from ext4\n" true true "deep\n" true "made\n" Err(40) Err(40) "hello from user space\n" 2 "shared\n" [Err(1), Err(17), Err(22), Err(2), Err(20)]"#;
     assert_eq!(run(&["links"]), ok(&(String::from(expected) + "\n")));
 }
+
+#[test_case]
+fn a_program_changes_a_file_s_permissions_owner_times_and_length() {
+    // Made now; chmod by path and by descriptor; chown, owner and group
+    // apart, and lchown of a link as itself; utimensat's times, one left as
+    // it was; a write making it modified now, and no times making both now;
+    // cut short and grown with zeros, through a descriptor
+    // and by path, but not through one open only to read (EINVAL). Then
+    // access: read and write, run what may not be (EACCES) and what may,
+    // write a device and /dev (EROFS), a missing file, a bad mode (EINVAL).
+    // And sendfile: from where the file's at, from a place given, which
+    // moves on and leaves the file's own where it was, at its end.
+    let expected = r#"true 600 [1000, 100, 7] 640 [1000, 2000] [1000, 3000] true true "x123" [120, 49, 50, 51, 0, 0] 0 2 -22 [0, -13, 0, 0, -30, -2, -22] 16 4 10 0 "hello from ext4\nfrom""#;
+    assert_eq!(run(&["attributes"]), ok(&(String::from(expected) + "\n")));
+}

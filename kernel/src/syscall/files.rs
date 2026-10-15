@@ -839,6 +839,211 @@ pub fn fsync(process: &Process, fd: u64) -> i64 {
     ret(handle(process, fd).map(|_| 0))
 }
 
+/// Everything written is on the disk already, as `fs/ext4` writes through.
+pub fn sync() -> i64 {
+    0
+}
+
+/// Change the file at `path`, from `dirfd`, its last link followed if
+/// `follow`; or, with no `path`, the one `dirfd` is open on.
+fn change(
+    process: &Process,
+    dirfd: u64,
+    path: Option<String>,
+    follow: bool,
+    changes: ext4::Changes,
+) -> Result<i64> {
+    let path = match path {
+        Some(path) => lookup_with(process, dirfd, &path, follow)?,
+        None => match &*handle(process, dirfd)? {
+            Handle::File { file, .. } => {
+                let _tree = fs::lock();
+                file.change(changes).map_err(fs::errno)?;
+                return Ok(0);
+            }
+            Handle::Dir { path, .. } => path.clone(),
+            // A terminal or a pipe has nothing on a disk to change: Linux
+            // keeps their modes in memory, and `mesg` and the like are told
+            // it's done.
+            _ => return Ok(0),
+        },
+    };
+    let tree = fs::lock();
+    tree.disk(&path).and_then(|disk| disk.change(&path, changes)).map_err(fs::errno)?;
+    Ok(0)
+}
+
+/// The path at `addr`, or none for `AT_EMPTY_PATH` and an empty one, or a
+/// null pointer where that means the file `dirfd` is open on.
+fn optional_path(process: &Process, addr: u64, flags: u64) -> Result<Option<String>> {
+    if addr == 0 {
+        return Ok(None);
+    }
+    match path_at(process, addr)? {
+        path if path.is_empty() && flags & AT_EMPTY_PATH != 0 => Ok(None),
+        path => Ok(Some(path)),
+    }
+}
+
+/// `chmod`, `fchmod` and `fchmodat`: the permission bits.
+pub fn fchmodat(process: &Process, dirfd: u64, path: u64, mode: u64) -> i64 {
+    let changes = ext4::Changes { permissions: Some(mode as u32 & 0o7777), ..Default::default() };
+    ret(optional_path(process, path, 0)
+        .and_then(|path| change(process, dirfd, path, true, changes)))
+}
+
+/// `chown`, `fchown`, `lchown` and `fchownat`: owner and group, each left
+/// as it is for -1. Root may give a file to anyone.
+pub fn fchownat(process: &Process, dirfd: u64, path: u64, uid: u64, gid: u64, flags: u64) -> i64 {
+    let id = |id: u64| (id as u32 != u32::MAX).then_some(id as u32);
+    let changes = ext4::Changes { uid: id(uid), gid: id(gid), ..Default::default() };
+    ret((|| {
+        if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+            return Err(EINVAL);
+        }
+        let path = optional_path(process, path, flags)?;
+        change(process, dirfd, path, flags & AT_SYMLINK_NOFOLLOW == 0, changes)
+    })())
+}
+
+/// When the file was last read and modified, from the two `struct
+/// timespec`s at `times`: to now with none, or for one whose nanoseconds
+/// say `UTIME_NOW`; left as they are for `UTIME_OMIT`. With no path, the
+/// file `dirfd` is open on, as `futimens` asks.
+///
+/// shortcut: to the second, as `fs/ext4` keeps them; and not to 0, the
+/// start of 1970, which it takes as leaving the time as it is.
+pub fn utimensat(process: &Process, dirfd: u64, path: u64, times: u64, flags: u64) -> i64 {
+    const UTIME_NOW: i64 = (1 << 30) - 1;
+    const UTIME_OMIT: i64 = (1 << 30) - 2;
+    ret((|| {
+        if flags & !AT_SYMLINK_NOFOLLOW != 0 {
+            return Err(EINVAL);
+        }
+        let now = (crate::time::now() / crate::time::NANOS) as u32;
+        let mut given = [0u8; 32];
+        if times != 0 {
+            process.memory.lock().space.read(times, &mut given).ok_or(EFAULT)?;
+        }
+        let time = |at: usize| {
+            let seconds = i64::from_le_bytes(given[at..at + 8].try_into().unwrap());
+            match i64::from_le_bytes(given[at + 8..at + 16].try_into().unwrap()) {
+                _ if times == 0 => Ok(Some(now)),
+                UTIME_NOW => Ok(Some(now)),
+                UTIME_OMIT => Ok(None),
+                0..1_000_000_000 => Ok(Some(seconds as u32)),
+                _ => Err(EINVAL),
+            }
+        };
+        let changes =
+            ext4::Changes { accessed: time(0)?, modified: time(16)?, ..Default::default() };
+        let path = optional_path(process, path, 0)?;
+        change(process, dirfd, path, flags & AT_SYMLINK_NOFOLLOW == 0, changes)
+    })())
+}
+
+/// Make the file at `path` `length` bytes long: cut short, or longer with
+/// zeros.
+pub fn truncate(process: &Process, path: u64, length: u64) -> i64 {
+    ret((|| {
+        if (length as i64) < 0 {
+            return Err(EINVAL);
+        }
+        let path = lookup(process, AT_FDCWD, &path_at(process, path)?)?;
+        let tree = fs::lock();
+        if tree.metadata(&path).map_err(fs::errno)?.kind == Kind::Directory {
+            return Err(EISDIR);
+        }
+        let file = tree.disk(&path).and_then(|disk| disk.open_writable(&path));
+        file.and_then(|file| file.set_len(length)).map_err(fs::errno)?;
+        Ok(0)
+    })())
+}
+
+/// `truncate` on the file `fd` is open on, for writing.
+pub fn ftruncate(process: &Process, fd: u64, length: u64) -> i64 {
+    ret((|| {
+        if (length as i64) < 0 {
+            return Err(EINVAL);
+        }
+        match &*handle(process, fd)? {
+            Handle::File { file, write: true, .. } => {
+                let _tree = fs::lock();
+                file.set_len(length).map_err(fs::errno)?;
+                Ok(0)
+            }
+            _ => Err(EINVAL),
+        }
+    })())
+}
+
+/// `access`, `faccessat` and `faccessat2`: whether the file at `path` is
+/// there (`F_OK`), and may be read, written and run. Root may read and
+/// write anything, except write where nothing can be (EROFS), and run what
+/// anyone may run, and any directory (EACCES).
+pub fn faccessat(process: &Process, dirfd: u64, path: u64, mode: u64, flags: u64) -> i64 {
+    const X_OK: u64 = 1;
+    const W_OK: u64 = 2;
+    const AT_EACCESS: u64 = 0x200;
+    const EACCES: i64 = 13;
+    const EROFS: i64 = 30;
+    ret((|| {
+        if mode & !7 != 0 || flags & !(AT_EACCESS | AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+            return Err(EINVAL);
+        }
+        let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+        let path = match optional_path(process, path, flags)? {
+            Some(path) => lookup_with(process, dirfd, &path, follow)?,
+            None => match &*handle(process, dirfd)? {
+                Handle::Dir { path, .. } => path.clone(),
+                _ => return Ok(0),
+            },
+        };
+        let tree = fs::lock();
+        let metadata = tree.metadata(&path).map_err(fs::errno)?;
+        // The devices can be written, though /dev itself can't.
+        if mode & W_OK != 0 && metadata.kind != Kind::Other && tree.disk(&path).is_err() {
+            return Err(EROFS);
+        }
+        if mode & X_OK != 0 && metadata.kind != Kind::Directory && metadata.permissions & 0o111 == 0
+        {
+            return Err(EACCES);
+        }
+        Ok(0)
+    })())
+}
+
+/// Copy up to `count` bytes from `in_fd` to `out_fd`: from the place at
+/// `offset`, moving it on, or else from `in_fd`'s own place. What couldn't be
+/// written is left to be read again.
+pub fn sendfile(process: &Process, out_fd: u64, in_fd: u64, offset: u64, count: u64) -> i64 {
+    ret((|| {
+        let mut place = [0u8; 8];
+        let at = match offset {
+            0 => None,
+            offset => {
+                process.memory.lock().space.read(offset, &mut place).ok_or(EFAULT)?;
+                Some(at(u64::from_le_bytes(place))?)
+            }
+        };
+        let data = read_data(process, in_fd, count, at)?;
+        let written = write_data(process, out_fd, &data, None);
+        let sent = *written.as_ref().unwrap_or(&0) as u64;
+        match at {
+            Some(at) => {
+                let moved = (at + sent).to_le_bytes();
+                process.memory.lock().space.write(offset, &moved).ok_or(EFAULT)?;
+            }
+            None => {
+                if let Handle::File { offset, .. } = &*handle(process, in_fd)? {
+                    offset.fetch_sub(data.len() as u64 - sent, Relaxed);
+                }
+            }
+        }
+        written
+    })())
+}
+
 /// What `fd` refers to, for `poll`: `None` if it isn't open.
 pub fn open_handle(process: &Process, fd: i32) -> Option<Arc<Handle>> {
     handle(process, fd as u64).ok()

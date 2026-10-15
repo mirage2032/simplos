@@ -4,7 +4,7 @@
 mod common;
 
 use common::*;
-use ext4::{Error, Ext4, Kind};
+use ext4::{Changes, Error, Ext4, Kind};
 use std::os::unix::fs::MetadataExt;
 
 /// Unlike `big`'s, and a few bytes into its last block.
@@ -398,4 +398,65 @@ fn replaces_and_removes_only_what_it_may() {
     );
     let stat = String::from_utf8(debugfs(&saved, "stat hello.txt")).unwrap();
     assert!(stat.contains("Mode:  0600"), "{stat}");
+}
+
+#[test]
+fn keeps_times_owners_and_sizes() {
+    let _serial = serial();
+    let dir = workspace("times");
+    let root = dir.join("tree");
+    make_tree(&root);
+    let image = image(&dir, &root, &["-t", "ext4"], "64M");
+    let fs = Ext4::mount_writable(Box::new(image.clone())).unwrap();
+    let times = |path| {
+        let metadata = fs.metadata(path).unwrap();
+        (metadata.accessed, metadata.modified, metadata.changed)
+    };
+    let made_at = times("hello.txt");
+    // What's made has all three times set to when.
+    ext4::set_clock(|| 1_000_000_000);
+    write_all(&fs.create("new.txt").unwrap(), 0, b"0123456789");
+    fs.create_dir("newdir").unwrap();
+    fs.symlink(b"new.txt", "newlink").unwrap();
+    for path in ["new.txt", "newdir", "newlink"] {
+        assert_eq!(times(path), (1_000_000_000, 1_000_000_000, 1_000_000_000), "{path}");
+    }
+    // Writing sets when it was modified and changed, not read.
+    ext4::set_clock(|| 1_100_000_000);
+    let hello = fs.open_writable("hello.txt").unwrap();
+    write_all(&hello, 0, b"H");
+    assert_eq!(times("hello.txt"), (made_at.0, 1_100_000_000, 1_100_000_000));
+    // Cut short, then longer, with zeros.
+    let new = fs.open_writable("new.txt").unwrap();
+    new.set_len(4).unwrap();
+    assert_eq!(read_all(&fs, "new.txt"), b"0123");
+    new.set_len(8192).unwrap();
+    let mut longer = b"0123".to_vec();
+    longer.resize(8192, 0);
+    assert!(read_all(&fs, "new.txt") == longer, "grown with zeros");
+    // Changed as asked, by path and through a handle: and its change time.
+    ext4::set_clock(|| 1_200_000_000);
+    let changes = Changes {
+        uid: Some(1000),
+        gid: Some(100),
+        accessed: Some(5),
+        modified: Some(6),
+        ..Changes::default()
+    };
+    fs.change("new.txt", changes).unwrap();
+    new.change(Changes { permissions: Some(0o600), ..Changes::default() }).unwrap();
+    let metadata = fs.metadata("new.txt").unwrap();
+    assert_eq!((metadata.permissions, metadata.uid, metadata.gid), (0o600, 1000, 100));
+    assert_eq!(times("new.txt"), (5, 6, 1_200_000_000));
+    // A link is a change to the file it names.
+    fs.link("hello.txt", "hello-again.txt").unwrap();
+    assert_eq!(times("hello.txt").2, 1_200_000_000);
+    drop((hello, new, fs));
+
+    let saved = dir.join("times.img");
+    image.save(&saved);
+    fsck(&saved).unwrap();
+    let stat = String::from_utf8(debugfs(&saved, "stat new.txt")).unwrap();
+    assert!(stat.contains("User:  1000   Group:   100") && stat.contains("Size: 8192"), "{stat}");
+    assert!(debugfs(&saved, "cat new.txt") == longer, "new.txt reads back different");
 }

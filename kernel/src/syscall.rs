@@ -245,6 +245,7 @@ fn call(frame: &Frame) -> i64 {
         16 => files::ioctl(&process, a0, a1, a2),
         17 => files::pread(&process, a0, a1, a2, a3),
         18 => files::pwrite(&process, a0, a1, a2, a3),
+        21 => files::faccessat(&process, files::AT_FDCWD, a0, a1, 0),
         22 => files::pipe2(&process, a0, 0),
         32 => files::dup(&process, a0),
         33 => files::dup3(&process, a0, a1, 0, true),
@@ -254,6 +255,7 @@ fn call(frame: &Frame) -> i64 {
         37 => clocks::alarm(&process, a0),
         38 => clocks::setitimer(&process, a0, a1, a2),
         39 => process.id as i64,
+        40 => files::sendfile(&process, a0, a1, a2, a3),
         // The copy starts as the call returns, with 0 its result.
         56 => processes::clone(&process, frame.registers(0), a0, a1),
         // fork, vfork.
@@ -284,6 +286,11 @@ fn call(frame: &Frame) -> i64 {
         87 => files::unlinkat(&process, files::AT_FDCWD, a0, 0),
         88 => files::symlinkat(&process, a0, files::AT_FDCWD, a1),
         89 => files::readlinkat(&process, files::AT_FDCWD, a0, a1, a2),
+        90 => files::fchmodat(&process, files::AT_FDCWD, a0, a1),
+        91 => files::fchmodat(&process, a0, 0, a1),
+        92 => files::fchownat(&process, files::AT_FDCWD, a0, a1, a2, 0),
+        93 => files::fchownat(&process, a0, 0, a1, a2, 0),
+        94 => files::fchownat(&process, files::AT_FDCWD, a0, a1, a2, files::AT_SYMLINK_NOFOLLOW),
         95 => files::umask(&process, a0),
         96 => clocks::gettimeofday(&process, a0, a1),
         97 => system::prlimit(&process, 0, a0, 0, a1),
@@ -302,9 +309,12 @@ fn call(frame: &Frame) -> i64 {
         130 => signals::rt_sigsuspend(&process, a0, a1),
         // fsync, fdatasync.
         74 | 75 => files::fsync(&process, a0),
+        76 => files::truncate(&process, a0, a1),
+        77 => files::ftruncate(&process, a0, a1),
         131 => signals::sigaltstack(&process, a0, a1, frame.rsp),
         158 => arch_prctl(&process, a0, a1),
         160 => system::prlimit(&process, 0, a0, a1, 0),
+        162 => files::sync(),
         // gettid: one thread per program, so its id is the program's.
         186 => process.id as i64,
         // set_tid_address: nothing to clear at exit with one thread per program.
@@ -319,17 +329,23 @@ fn call(frame: &Frame) -> i64 {
         234 => signals::tkill(&process, Some(a0), a1, a2),
         257 => files::open(&process, a0, a1, a2, a3),
         258 => files::mkdirat(&process, a0, a1, a2),
+        260 => files::fchownat(&process, a0, a1, a2, a3, a4),
         262 => files::newfstatat(&process, a0, a1, a2, a3),
         263 => files::unlinkat(&process, a0, a1, a2),
         264 => files::renameat2(&process, a0, a1, a2, a3, 0),
         265 => files::linkat(&process, a0, a1, a2, a3, a4),
         266 => files::symlinkat(&process, a0, a1, a2),
         267 => files::readlinkat(&process, a0, a1, a2, a3),
+        268 => files::fchmodat(&process, a0, a1, a2),
+        269 => files::faccessat(&process, a0, a1, a2, 0),
         271 => ppoll(&process, a0, a1, a2),
+        280 => files::utimensat(&process, a0, a1, a2, a3),
         292 => files::dup3(&process, a0, a1, a2, false),
         293 => files::pipe2(&process, a0, a1),
         302 => system::prlimit(&process, a0, a1, a2, a3),
+        306 => files::fsync(&process, a0),
         316 => files::renameat2(&process, a0, a1, a2, a3, a4),
+        439 => files::faccessat(&process, a0, a1, a2, a3),
         _ => {
             serial_println!("simplos: process {}: no system call {}", process.id, frame.nr);
             -ENOSYS

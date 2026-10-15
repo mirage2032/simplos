@@ -37,6 +37,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ffi::{CStr, c_char, c_int, c_void};
+use core::sync::atomic::{AtomicU32, Ordering};
 use spin::Mutex;
 
 pub const SECTOR: usize = 512;
@@ -139,6 +140,32 @@ pub struct Metadata {
     pub accessed: u32,
     pub modified: u32,
     pub changed: u32,
+}
+
+/// What to change of a file, each `None` left as it is. Its change time is
+/// set too, as Linux sets it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Changes {
+    pub permissions: Option<u32>,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    /// Seconds since 1970: not 0, which leaves it.
+    pub accessed: Option<u32>,
+    pub modified: Option<u32>,
+}
+
+/// What tells the time, in seconds since 1970, for files' times.
+static CLOCK: Mutex<Option<fn() -> u32>> = Mutex::new(None);
+
+/// Have files' times set by `now` from here on: all three as one is made,
+/// its modification time as it's written to or cut, its change time as
+/// anything about it changes. Until then they're left as they are.
+pub fn set_clock(now: fn() -> u32) {
+    *CLOCK.lock() = Some(now);
+}
+
+fn now() -> Option<u32> {
+    CLOCK.lock().map(|now| now())
 }
 
 /// Which of lwext4's mount slots are taken. Every call into lwext4 holds
@@ -313,13 +340,16 @@ impl Ext4 {
         if writable && !self.mount.writable {
             return Err(Error::ReadOnly);
         }
-        match self.metadata(path) {
-            Ok(Metadata { kind: Kind::File, .. }) => {}
+        let made = match self.metadata(path) {
+            Ok(Metadata { kind: Kind::File, .. }) => false,
             Ok(Metadata { kind: Kind::Directory, .. }) => return Err(Error::IsADirectory),
             Ok(_) => return Err(Error::Unsupported),
-            Err(Error::NotFound) if flags & O_CREAT != 0 => self.check_parent(path)?,
+            Err(Error::NotFound) if flags & O_CREAT != 0 => {
+                self.check_parent(path)?;
+                true
+            }
             Err(error) => return Err(error),
-        }
+        };
         let path = self.path(path)?;
         let _lwext4 = LWEXT4.lock();
         let mut error = 0;
@@ -331,7 +361,16 @@ impl Ext4 {
         // Safety: just opened.
         let inode = unsafe { ffi::simplos_ext4_file_inode(raw) };
         self.mount.open.lock().push(inode);
-        Ok(File { mount: self.mount.clone(), raw, inode, writable })
+        let file = File { mount: self.mount.clone(), raw, inode, writable, touched: 0.into() };
+        // A new file has all its times set; one emptied, when.
+        match (made, flags & O_TRUNC != 0) {
+            (true, _) => self.mount.stamp(inode)?,
+            (false, true) => file.touch()?,
+            (false, false) => {}
+        }
+        // Not dropped while the lock is held: closing it takes the lock.
+        drop(_lwext4);
+        Ok(file)
     }
 
     /// Make a directory at `path`.
@@ -341,10 +380,27 @@ impl Ext4 {
             return Err(Error::AlreadyExists);
         }
         self.check_parent(path)?;
-        let path = self.path(path)?;
-        let _lwext4 = LWEXT4.lock();
+        let at = self.path(path)?;
+        let lwext4 = LWEXT4.lock();
         // Safety: as in `metadata`.
-        check(unsafe { ffi::ext4_dir_mk(path.as_ptr()) })
+        check(unsafe { ffi::ext4_dir_mk(at.as_ptr()) })?;
+        drop(lwext4);
+        self.stamp(path)
+    }
+
+    /// Set all of a new file's times to now.
+    fn stamp(&self, path: &str) -> Result<(), Error> {
+        let inode = self.metadata(path)?.inode;
+        let _lwext4 = LWEXT4.lock();
+        self.mount.stamp(inode)
+    }
+
+    /// Change what `changes` says of the file at `path`, and its change
+    /// time. A symbolic link is changed itself, not followed.
+    pub fn change(&self, path: &str, changes: Changes) -> Result<(), Error> {
+        let inode = self.metadata(path)?.inode;
+        let _lwext4 = LWEXT4.lock();
+        self.mount.change(inode, changes)
     }
 
     /// Remove the file at `path`, unless it's open.
@@ -435,10 +491,7 @@ impl Ext4 {
 
     /// Set the permission bits of the file at `path`: `0o644` and the like.
     pub fn set_permissions(&self, path: &str, permissions: u32) -> Result<(), Error> {
-        let path = self.path(path)?;
-        let _lwext4 = LWEXT4.lock();
-        // Safety: as in `metadata`.
-        check(unsafe { ffi::ext4_mode_set(path.as_ptr(), permissions & 0o7777) })
+        self.change(path, Changes { permissions: Some(permissions), ..Changes::default() })
     }
 
     /// Make a symbolic link at `path` to `target`, which can be anything:
@@ -449,10 +502,12 @@ impl Ext4 {
         }
         self.check_parent(path)?;
         let target = CString::new(target).map_err(|_| Error::InvalidArgument)?;
-        let path = self.path(path)?;
-        let _lwext4 = LWEXT4.lock();
+        let at = self.path(path)?;
+        let lwext4 = LWEXT4.lock();
         // Safety: two NUL-terminated strings, the second a path on our mount.
-        check(unsafe { ffi::ext4_fsymlink(target.as_ptr(), path.as_ptr()) })
+        check(unsafe { ffi::ext4_fsymlink(target.as_ptr(), at.as_ptr()) })?;
+        drop(lwext4);
+        self.stamp(path)
     }
 
     /// Where the symbolic link at `path` points, as it was given.
@@ -483,10 +538,13 @@ impl Ext4 {
             return Err(Error::AlreadyExists);
         }
         self.check_parent(to)?;
-        let (from, to) = (self.path(from)?, self.path(to)?);
-        let _lwext4 = LWEXT4.lock();
+        let (from_at, to_at) = (self.path(from)?, self.path(to)?);
+        let lwext4 = LWEXT4.lock();
         // Safety: as in `rename`.
-        check(unsafe { ffi::ext4_flink(from.as_ptr(), to.as_ptr()) })
+        check(unsafe { ffi::ext4_flink(from_at.as_ptr(), to_at.as_ptr()) })?;
+        drop(lwext4);
+        // One more name: a change to it.
+        self.change(from, Changes::default())
     }
 
     /// That the directory `path` would go in is there: lwext4 makes any
@@ -530,6 +588,38 @@ impl Mount {
             self.journaling = true;
         }
         Ok(())
+    }
+
+    /// Change what `changes` says of inode `inode`, and set its change time
+    /// to now; `LWEXT4` is held.
+    fn change(&self, inode: u32, changes: Changes) -> Result<(), Error> {
+        const LEAVE: u32 = u32::MAX;
+        // Safety: the mount point is NUL-terminated, and `inode` came from
+        // lwext4.
+        check(unsafe {
+            ffi::ext4_inode_attrs_set(
+                self.mount_point.as_ptr(),
+                inode,
+                changes.permissions.map_or(LEAVE, |permissions| permissions & 0o7777),
+                changes.uid.unwrap_or(LEAVE),
+                changes.gid.unwrap_or(LEAVE),
+                changes.accessed.unwrap_or(0),
+                changes.modified.unwrap_or(0),
+                now().unwrap_or(0),
+            )
+        })
+    }
+
+    /// Set all of inode `inode`'s times to now, as it's made; `LWEXT4` is
+    /// held. Without a clock, nothing.
+    fn stamp(&self, inode: u32) -> Result<(), Error> {
+        match now() {
+            Some(now) => self.change(
+                inode,
+                Changes { accessed: Some(now), modified: Some(now), ..Changes::default() },
+            ),
+            None => Ok(()),
+        }
     }
 
     /// What's known of inode `inode`; `LWEXT4` is held.
@@ -618,6 +708,9 @@ pub struct File {
     inode: u32,
     /// lwext4 would write to a file opened only for reading.
     writable: bool,
+    /// The second its modification time was last set to through this
+    /// handle: a stream of writes changes it once a second, not each time.
+    touched: AtomicU32,
 }
 
 // Safety: as for `Mount`.
@@ -663,13 +756,57 @@ impl File {
         }
         let _lwext4 = LWEXT4.lock();
         // lwext4 would put what's written past the end at the end.
-        let mut end = self.mount.stat(self.inode)?.size;
-        while end < offset {
+        let end = self.mount.stat(self.inode)?.size;
+        self.fill(end, offset)?;
+        let written = self.write_locked(offset, buf)?;
+        // It's written: a time that couldn't be set isn't worth failing the
+        // write over, and having it written again.
+        if written > 0 {
+            let _ = self.touch();
+        }
+        Ok(written)
+    }
+
+    /// Zeros from `end`, the end of the file, to `to`; `LWEXT4` is held.
+    fn fill(&self, mut end: u64, to: u64) -> Result<(), Error> {
+        while end < to {
             let zeros = [0; 4096];
-            let gap = (offset - end).min(zeros.len() as u64) as usize;
+            let gap = (to - end).min(zeros.len() as u64) as usize;
             end += self.write_locked(end, &zeros[..gap])? as u64;
         }
-        self.write_locked(offset, buf)
+        Ok(())
+    }
+
+    /// Make the file `size` bytes long: cut short, or longer with zeros (not
+    /// a hole: see `write_at`).
+    pub fn set_len(&self, size: u64) -> Result<(), Error> {
+        if !self.writable {
+            return Err(Error::ReadOnly);
+        }
+        let _lwext4 = LWEXT4.lock();
+        let end = self.mount.stat(self.inode)?.size;
+        if size < end {
+            // Safety: open until `drop`.
+            check(unsafe { ffi::ext4_ftruncate(self.raw, size) })?;
+        }
+        self.fill(end, size)?;
+        self.touch()
+    }
+
+    /// Change what `changes` says of the file, and its change time.
+    pub fn change(&self, changes: Changes) -> Result<(), Error> {
+        let _lwext4 = LWEXT4.lock();
+        self.mount.change(self.inode, changes)
+    }
+
+    /// Its modification time to now, as it's written to; `LWEXT4` is held.
+    fn touch(&self) -> Result<(), Error> {
+        match now() {
+            Some(now) if self.touched.swap(now, Ordering::Relaxed) != now => {
+                self.mount.change(self.inode, Changes { modified: Some(now), ..Changes::default() })
+            }
+            _ => Ok(()),
+        }
     }
 
     /// `write_at` within the file or at its end; `LWEXT4` is held.
@@ -820,7 +957,6 @@ mod ffi {
         pub fn ext4_journal_stop(mount_point: *const c_char) -> c_int;
         pub fn ext4_dir_mk(path: *const c_char) -> c_int;
         pub fn ext4_dir_rm(path: *const c_char) -> c_int;
-        pub fn ext4_mode_set(path: *const c_char, mode: u32) -> c_int;
         pub fn ext4_fremove(path: *const c_char) -> c_int;
         pub fn ext4_frename(path: *const c_char, new_path: *const c_char) -> c_int;
         pub fn ext4_fsymlink(target: *const c_char, path: *const c_char) -> c_int;
@@ -831,6 +967,17 @@ mod ffi {
             rcnt: *mut usize,
         ) -> c_int;
         pub fn ext4_flink(path: *const c_char, hardlink_path: *const c_char) -> c_int;
+        pub fn ext4_ftruncate(file: *mut File, size: u64) -> c_int;
+        pub fn ext4_inode_attrs_set(
+            mount_point: *const c_char,
+            inode: u32,
+            mode: u32,
+            uid: u32,
+            gid: u32,
+            atime: u32,
+            mtime: u32,
+            ctime: u32,
+        ) -> c_int;
         pub fn ext4_fread(
             file: *mut File,
             buf: *mut c_void,

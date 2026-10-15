@@ -45,6 +45,7 @@ impl BlockDevice for Disk {
 /// replaying its journal if it needs it. Disks without one are left alone:
 /// mounting reads their superblock, and gives up there.
 pub fn init() {
+    ext4::set_clock(|| (crate::time::now() / crate::time::NANOS) as u32);
     for (index, info) in disk::list().into_iter().enumerate() {
         if let Ok(fs) = Ext4::mount_writable(Box::new(Disk { index, sectors: info.sectors })) {
             serial_println!("simplos: ext4 on disk {}", index);

@@ -968,6 +968,96 @@ fn main() {
                 String::from_utf8_lossy(&ran.stdout)
             );
         }
+        // A file's permissions, owner and times, changed by path and
+        // through a descriptor, and a link's as itself; its times as it's
+        // made and written; its length cut and grown; what access says of
+        // files; and sendfile, from where a file's at and from a place given.
+        Some("attributes") => {
+            use std::fs::{FileTimes, Permissions};
+            use std::os::unix::fs::{chown, lchown, symlink};
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+            let path = "/attributes.txt";
+            or_fail(path, fs::write(path, "0123456789"));
+            let stat = |path| or_fail(path, fs::symlink_metadata(path));
+            let made = stat(path);
+            let fresh =
+                [made.atime(), made.mtime(), made.ctime()].iter().all(|t| (t - now).abs() <= 5);
+            or_fail(path, fs::set_permissions(path, Permissions::from_mode(0o600)));
+            let by_path = stat(path).mode() & 0o7777;
+            or_fail(path, chown(path, Some(1000), None));
+            or_fail(path, chown(path, None, Some(100)));
+            or_fail("link", symlink(path, "/attributes-link"));
+            or_fail("link", lchown("/attributes-link", Some(7), Some(7)));
+            let owners = [stat(path).uid(), stat(path).gid(), stat("/attributes-link").uid()];
+            let file = or_fail(path, OpenOptions::new().read(true).write(true).open(path));
+            or_fail(path, file.set_permissions(Permissions::from_mode(0o640)));
+            let by_fd = stat(path).mode() & 0o7777;
+            let times = FileTimes::new()
+                .set_accessed(UNIX_EPOCH + Duration::from_secs(1000))
+                .set_modified(UNIX_EPOCH + Duration::from_secs(2000));
+            or_fail(path, file.set_times(times));
+            let set = [stat(path).atime(), stat(path).mtime()];
+            or_fail(
+                path,
+                file.set_times(
+                    FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(3000)),
+                ),
+            );
+            let omitted = [stat(path).atime(), stat(path).mtime()];
+            or_fail(path, (&file).write_all(b"x"));
+            let written = (stat(path).mtime() - now).abs() <= 5 && stat(path).atime() == 1000;
+            let path_c = c"/attributes.txt";
+            // As `touch` does it: no times, both now.
+            syscall5(280, [-100isize as usize, path_c.as_ptr() as usize, 0, 0, 0]);
+            let touched = (stat(path).atime() - now).abs() <= 5;
+            or_fail(path, file.set_len(4));
+            let cut = or_fail(path, fs::read(path));
+            or_fail(path, file.set_len(6));
+            let grown = or_fail(path, fs::read(path));
+            let truncated = syscall(76, path_c.as_ptr() as usize, 2, 0);
+            let short = stat(path).len();
+            let read_only = or_fail(path, fs::File::open(path));
+            let refused = syscall(77, read_only.as_raw_fd() as usize, 0, 0);
+            let access = |path: &std::ffi::CStr, mode| syscall(21, path.as_ptr() as usize, mode, 0);
+            let accesses = [
+                access(path_c, 4 | 2),
+                access(path_c, 1),
+                access(c"/bin/probe", 1),
+                access(c"/dev/null", 2),
+                access(c"/dev", 2),
+                access(c"/missing", 0),
+                access(path_c, 8),
+            ];
+            let hello = or_fail("/hello.txt", fs::File::open("/hello.txt"));
+            let (mut reader, writer) = or_fail("pipe", io::pipe());
+            let all =
+                syscall5(40, [writer.as_raw_fd() as usize, hello.as_raw_fd() as usize, 0, 100, 0]);
+            let mut place = 6u64;
+            let part = syscall5(
+                40,
+                [
+                    writer.as_raw_fd() as usize,
+                    hello.as_raw_fd() as usize,
+                    &raw mut place as usize,
+                    4,
+                    0,
+                ],
+            );
+            let rest =
+                syscall5(40, [writer.as_raw_fd() as usize, hello.as_raw_fd() as usize, 0, 100, 0]);
+            drop(writer);
+            let mut sent = String::new();
+            or_fail("pipe", reader.read_to_string(&mut sent));
+            drop((file, read_only));
+            or_fail(path, fs::remove_file(path));
+            or_fail("link", fs::remove_file("/attributes-link"));
+            println!(
+                "{fresh} {by_path:o} {owners:?} {by_fd:o} {set:?} {omitted:?} {written} {touched} {:?} \
+                 {grown:?} {truncated} {short} {refused} {accesses:?} {all} {part} {place} {rest} \
+                 {sent:?}",
+                str_of(&cut),
+            );
+        }
         Some(other) => {
             eprintln!("probe: unknown mode {other:?}");
             std::process::exit(2);
