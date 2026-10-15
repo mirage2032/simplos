@@ -40,11 +40,12 @@ jobs:
           ref: ${{ inputs.ref }}
 
       # The tests and the smoke test are real boots, so the runner needs an
-      # emulator. It has no /dev/kvm, so everything runs under TCG.
+      # emulator. It has no /dev/kvm, so everything runs under TCG. qemu-utils
+      # for qemu-img, which makes the images' ext4 disk into qcow2.
       - name: Install QEMU
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y qemu-system-x86
+          sudo apt-get install --no-install-recommends -y qemu-system-x86 qemu-utils
 
       # Honours rust-toolchain.toml, including its components and the
       # x86_64-unknown-none and x86_64-unknown-linux-musl targets. Pull requests
@@ -129,7 +130,8 @@ jobs:
         run: scripts/build-images.sh
 
       # Boots both images for real and checks the kernel's own boot banner —
-      # the firmware it came up under and the framebuffer mode it settled on.
+      # the firmware it came up under and the framebuffer mode it settled on —
+      # and that it mounts the ext4 disk built beside them.
       - name: Boot
         run: scripts/smoke-test.sh
 
@@ -138,6 +140,8 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: disk-images
-          path: dist/*.img
+          path: |
+            dist/*.img
+            dist/disk.qcow2
           if-no-files-found: error
           retention-days: 7

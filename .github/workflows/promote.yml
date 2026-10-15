@@ -2,8 +2,9 @@ name: Promote to master
 
 # Promotes what's merged into develop to master: checks it, gives it a new
 # version, moves both branches to that one commit, and publishes a GitHub
-# Release with the two bootable disk images attached. You're asked which part of
-# the version to bump (patch: fixes · minor: new features · major: big changes).
+# Release with the two bootable disk images and the ext4 disk attached. You're
+# asked which part of the version to bump (patch: fixes · minor: new features ·
+# major: big changes).
 #
 # master is therefore always a released, checked commit, and the images on its
 # latest release are what the website and anyone else should be running — no
@@ -73,7 +74,7 @@ jobs:
       - name: Install QEMU
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y qemu-system-x86
+          sudo apt-get install --no-install-recommends -y qemu-system-x86 qemu-utils
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -131,6 +132,17 @@ jobs:
             echo "::error::The bump changed more than the versions:"; git diff --stat; exit 1
           fi
 
+      # The userland goes on the ext4 disk; the check above has just built it
+      # under this same key, so this is normally a restore.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            target/userland/root
+            target/userland/built
+            target/userland/downloads
+          key: userland-${{ hashFiles('scripts/userland.sh') }}
+          restore-keys: userland-
+
       # Built from the release commit, so the images attached below are exactly
       # what this tag describes. The smoke test runs once more here because
       # these specific files are the artefacts people will download.
@@ -172,12 +184,14 @@ jobs:
           gh release create "v$NEXT" --verify-tag --title "v$NEXT" --generate-notes \
             ${PREVIOUS:+--notes-start-tag "$PREVIOUS"} \
             "dist/bios.img#Bootable BIOS disk image" \
-            "dist/uefi.img#Bootable UEFI disk image"
+            "dist/uefi.img#Bootable UEFI disk image" \
+            "dist/disk.qcow2#ext4 disk with the userland (-drive format=qcow2,file=disk.qcow2)"
           {
             echo "### Released v$NEXT"
             echo "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/v$NEXT"
             echo
             echo "master and develop now point at this commit. Both images boot at"
             echo "1920x1080; pass \`-fw_cfg name=opt/simplos/fb,string=WIDTHxHEIGHT\`"
-            echo "to ask the kernel for something smaller."
+            echo "to ask the kernel for something smaller. Attach \`disk.qcow2\` with"
+            echo "\`-drive format=qcow2,file=disk.qcow2\` for busybox and zsh."
           } >> "$GITHUB_STEP_SUMMARY"

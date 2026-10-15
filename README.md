@@ -30,7 +30,10 @@ emulation when it isn't, so it works on a machine or a CI runner either way.
 Any other argument is passed straight through to QEMU.
 
 A release's images need none of this — download `bios.img` or `uefi.img` from
-[the latest release](../../releases/latest) and boot it.
+[the latest release](../../releases/latest) and boot it. Its `disk.qcow2` is
+the ext4 disk `cargo run` would make, userland and all, 1 GiB to the guest in a
+file of a few megabytes; attach it after the image with
+`-drive format=qcow2,file=disk.qcow2`.
 
 ## Resolution
 
@@ -549,7 +552,8 @@ easy to misread.
 CI checks. `master` is only ever moved by the **Promote to master** workflow,
 which re-runs the checks at the commit it is about to release, bumps the version,
 fast-forwards both branches to it, tags it `vX.Y.Z` and publishes a GitHub
-Release with both disk images attached.
+Release with both disk images and the ext4 disk (`disk.qcow2`, made by
+`scripts/build-images.sh`) attached.
 
 So: branch from `develop`, open a pull request into `develop`, and release by
 running Promote to master from the Actions tab.
