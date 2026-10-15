@@ -141,15 +141,19 @@ fn run(
         // crate `fullkernel`'s runner uses, so nothing has to be installed.
         qemu.arg("-bios").arg(ovmf_prebuilt::ovmf_pure_efi());
     }
+    // The scratch disks' flushes are taken as done (`cache=unsafe`) rather than
+    // each made an fsync of its image on the host: tests/files.rs alone makes
+    // 2,000 of them, and how long those take is the host's business, not the
+    // kernel's. The images still hold everything written, for e2fsck.
     qemu.arg("-drive")
         .arg(format!("format=raw,file={}", image.display()))
         .arg("-drive")
-        .arg(format!("format=raw,file={},if=ide,index=1", ata_scratch.display()))
+        .arg(format!("format=raw,file={},if=ide,index=1,cache=unsafe", ata_scratch.display()))
         .arg("-drive")
-        .arg(format!("format=raw,file={},if=ide,index=2", ext4_scratch.display()))
+        .arg(format!("format=raw,file={},if=ide,index=2,cache=unsafe", ext4_scratch.display()))
         .args(["-device", "ich9-ahci,id=ahci", "-device", "ide-hd,drive=scratch,bus=ahci.0"])
         .arg("-drive")
-        .arg(format!("format=raw,file={},if=none,id=scratch", ahci_scratch.display()))
+        .arg(format!("format=raw,file={},if=none,id=scratch,cache=unsafe", ahci_scratch.display()))
         // How the guest reports its result. Without it a finished test would
         // just sit in `hlt_loop` until the timeout.
         .args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"])
