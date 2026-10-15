@@ -62,9 +62,6 @@ const PRDT: usize = 0x80;
 const BOUNCE: usize = 2048;
 const BOUNCE_SECTORS: usize = (4096 - BOUNCE) / SECTOR;
 
-/// shortcut: spin-count timeouts, not wall-clock; use the HPET if real disks prove slower.
-const SPINS: u32 = 1_000_000;
-
 pub struct Port {
     /// The port's register block, mapped.
     regs: *mut u8,
@@ -86,10 +83,6 @@ fn write(regs: *mut u8, offset: usize, value: u32) {
     unsafe { regs.add(offset).cast::<u32>().write_volatile(value) }
 }
 
-fn spin_until(mut done: impl FnMut() -> bool) -> Result<(), DiskError> {
-    (0..SPINS).find(|_| done()).map(|_| ()).ok_or(DiskError::Timeout)
-}
-
 impl Port {
     fn reg(&self, offset: usize) -> u32 {
         read(self.regs, offset)
@@ -103,9 +96,9 @@ impl Port {
     /// off before their memory can change.
     fn stop(&self) -> Result<(), DiskError> {
         self.set(PX_CMD, self.reg(PX_CMD) & !CMD_ST);
-        spin_until(|| self.reg(PX_CMD) & CMD_CR == 0)?;
+        super::poll(|| self.reg(PX_CMD) & CMD_CR == 0)?;
         self.set(PX_CMD, self.reg(PX_CMD) & !CMD_FRE);
-        spin_until(|| self.reg(PX_CMD) & CMD_FR == 0)
+        super::poll(|| self.reg(PX_CMD) & CMD_FR == 0)
     }
 
     fn start(&self) -> Result<(), DiskError> {
@@ -113,7 +106,7 @@ impl Port {
         self.set(PX_IS, u32::MAX);
         self.set(PX_CMD, self.reg(PX_CMD) | CMD_FRE | CMD_SUD | CMD_POD);
         self.set(PX_CMD, self.reg(PX_CMD) | CMD_ST);
-        spin_until(|| self.reg(PX_TFD) & (TFD_BSY | TFD_DRQ) == 0)
+        super::poll(|| self.reg(PX_TFD) & (TFD_BSY | TFD_DRQ) == 0)
     }
 
     /// Run one command on slot 0 and wait for it. `sectors` of data move
@@ -157,7 +150,7 @@ impl Port {
         self.set(PX_IS, u32::MAX);
         fence(Ordering::SeqCst);
         self.set(PX_CI, 1);
-        let finished = spin_until(|| self.reg(PX_CI) & 1 == 0 || self.reg(PX_IS) & IS_TFES != 0);
+        let finished = super::poll(|| self.reg(PX_CI) & 1 == 0 || self.reg(PX_IS) & IS_TFES != 0);
         fence(Ordering::SeqCst);
 
         let failed = self.reg(PX_IS) & IS_TFES != 0 || self.reg(PX_TFD) & TFD_ERR != 0;
