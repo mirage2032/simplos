@@ -120,6 +120,9 @@ impl Shell {
         self.tty.set_termios(settings, false);
         match status {
             0 => String::new(),
+            // A signal ended it: from a new line, as the ^C echoed may still
+            // be on this one.
+            129.. => format!("\n[exit status {status}]"),
             status => format!("[exit status {status}]"),
         }
     }
@@ -236,7 +239,7 @@ fn unknown_command_says_so() {
 fn run_starts_the_program_in_the_ramdisk_on_the_terminal() {
     let (mut shell, screen) = shell();
     assert_eq!(shell.execute("run hello"), "");
-    assert_eq!(shell.execute("run fault"), "[exit status 139]");
+    assert_eq!(shell.execute("run fault"), "\n[exit status 139]");
     // Which runs itself again, from the ext4 disk tools/boot-test attaches;
     // or is run from there, with an environment, as a terminal's programs
     // are given.

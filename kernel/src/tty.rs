@@ -8,12 +8,19 @@
 //! goes through [`Tty::write`] to the terminal's output: the screen, for the
 //! console. A program sets all of this with the `termios` it reads and writes
 //! with `ioctl`, laid out and defaulting as Linux's.
+//!
+//! A terminal is its session's, and one of the session's process groups is
+//! in its foreground: ^C, ^\ and ^Z typed send it SIGINT, SIGQUIT and
+//! SIGTSTP.
 
+use crate::pipe::ReadError;
+use crate::signal::{self, Info};
 use crate::thread::{self, WaitQueue};
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 use x86_64::instructions::interrupts;
 
@@ -28,6 +35,7 @@ const IXON: u32 = 0o2000;
 const OPOST: u32 = 0o1;
 const ONLCR: u32 = 0o4;
 const ISIG: u32 = 0o1;
+const NOFLSH: u32 = 0o200;
 const ICANON: u32 = 0o2;
 const ECHO: u32 = 0o10;
 const ECHOE: u32 = 0o20;
@@ -113,6 +121,10 @@ pub struct Tty {
     input_ready: WaitQueue,
     /// Taken only with interrupts on: writing to a screen takes a while.
     output: Mutex<Output>,
+    /// The session it's the terminal of, and the process group in its
+    /// foreground: 0 for none.
+    session: AtomicU64,
+    foreground: AtomicU64,
 }
 
 struct State {
@@ -146,44 +158,79 @@ impl Tty {
 
     fn with(output: Output, termios: Termios, size: (u16, u16), closed: bool) -> Tty {
         let state = State { termios, size, ready: VecDeque::new(), line: Vec::new(), closed };
-        Tty { state: Mutex::new(state), input_ready: WaitQueue::new(), output: Mutex::new(output) }
+        Tty {
+            state: Mutex::new(state),
+            input_ready: WaitQueue::new(),
+            output: Mutex::new(output),
+            session: AtomicU64::new(0),
+            foreground: AtomicU64::new(0),
+        }
     }
 
     fn state<R>(&self, f: impl FnOnce(&mut State) -> R) -> R {
         interrupts::without_interrupts(|| f(&mut self.state.lock()))
     }
 
-    /// What was typed: through the line discipline, then echoed.
+    /// What was typed: through the line discipline, then echoed; and the
+    /// signals it typed sent to the foreground.
     pub fn input(&self, bytes: &[u8]) {
-        let mut echo = Vec::new();
-        self.state(|state| bytes.iter().for_each(|&byte| state.receive(byte, &mut echo)));
+        let (mut echo, mut signals) = (Vec::new(), Vec::new());
+        self.state(|state| {
+            bytes.iter().for_each(|&byte| state.receive(byte, &mut echo, &mut signals));
+        });
         self.input_ready.wake_all();
         thread::wake_pollers();
         if !echo.is_empty() {
             self.write(&echo);
         }
+        let foreground = self.foreground();
+        for signal in signals.into_iter().filter(|_| foreground != 0) {
+            crate::process::signal_group(foreground, signal, Info::kernel());
+        }
     }
 
     /// Up to `most` bytes of what's been typed, waiting until there are
     /// some: in canonical mode no more than a line; none at the end of file.
+    /// For the kernel, whose threads have no signals to end it early.
     pub fn read(&self, most: usize) -> Vec<u8> {
         self.read_or_wait(most, true).expect("it waited")
     }
 
-    /// `read`, or if `wait` is false and there's nothing to read yet, `None`.
+    /// `read`, but if `wait` is false and there's nothing to read yet, or a
+    /// signal comes first, nothing.
     ///
     /// shortcut: not waiting, a read in raw mode takes nothing until there
     /// are VMIN bytes, where Linux's takes what's there.
-    pub fn read_or_wait(&self, most: usize, wait: bool) -> Option<Vec<u8>> {
+    pub fn read_or_wait(&self, most: usize, wait: bool) -> Result<Vec<u8>, ReadError> {
         let mut taken = Vec::new();
         let mut done = true;
         if most > 0 {
-            self.input_ready.wait_until(|| {
+            let waited = self.input_ready.wait_until_interruptible(|| {
                 done = self.state.lock().take(most, &mut taken);
                 done || !wait
             });
+            waited.map_err(|_| ReadError::Interrupted)?;
         }
-        done.then_some(taken)
+        if done { Ok(taken) } else { Err(ReadError::Empty) }
+    }
+
+    /// Make it session `session`'s terminal, with group `foreground` in its
+    /// foreground; 0 and 0 for no one's.
+    pub fn control(&self, session: u64, foreground: u64) {
+        self.session.store(session, Ordering::Relaxed);
+        self.foreground.store(foreground, Ordering::Relaxed);
+    }
+
+    pub fn session(&self) -> u64 {
+        self.session.load(Ordering::Relaxed)
+    }
+
+    pub fn foreground(&self) -> u64 {
+        self.foreground.load(Ordering::Relaxed)
+    }
+
+    pub fn set_foreground(&self, group: u64) {
+        self.foreground.store(group, Ordering::Relaxed);
     }
 
     /// Whether a `read` would find something, or the end, without waiting,
@@ -303,8 +350,9 @@ impl State {
         true
     }
 
-    /// One byte typed: into the line, or ready at once, and what to echo.
-    fn receive(&mut self, mut byte: u8, echo: &mut Vec<u8>) {
+    /// One byte typed: into the line, or ready at once; what to echo, and
+    /// the signal it is, if it's one.
+    fn receive(&mut self, mut byte: u8, echo: &mut Vec<u8>, signals: &mut Vec<usize>) {
         let Termios { iflag, lflag, cc, .. } = self.termios;
         let echoing = lflag & ECHO != 0;
         match byte {
@@ -315,9 +363,16 @@ impl State {
         }
         let is = |index: usize| cc[index] != 0 && byte == cc[index];
         if lflag & ISIG != 0 && (is(VINTR) || is(VQUIT) || is(VSUSP)) {
-            // shortcut: no signals yet, so nothing is sent to anyone; the
-            // line typed so far goes, as it would.
-            self.flush();
+            signals.push(match () {
+                _ if is(VINTR) => signal::SIGINT,
+                _ if is(VQUIT) => signal::SIGQUIT,
+                _ => signal::SIGTSTP,
+            });
+            // What's typed and not read goes, as the program it was for is
+            // interrupted.
+            if lflag & NOFLSH == 0 {
+                self.flush();
+            }
             if echoing {
                 self.echo(byte, echo);
             }

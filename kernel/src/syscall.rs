@@ -10,11 +10,14 @@
 
 mod files;
 mod processes;
+mod signals;
 
 use crate::fs::Handle;
 use crate::io::interrupts::gdt;
+use crate::io::interrupts::pit::TIMER_HZ;
 use crate::memory::USER_END;
 use crate::process::{self, LOWEST, MMAP_END, MMAP_START, Process, Registers, pages};
+use crate::signal::{self, ERESTARTNOHAND, Syscall};
 use crate::{serial_println, thread};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -183,10 +186,22 @@ extern "sysv64" fn dispatch(frame: &Frame) -> i64 {
     // program's stack: Intel CPUs' sysret bug. Nothing is ever mapped there,
     // but this doesn't rely on it.
     if frame.rip >= USER_END {
-        process::kill_current(process::SIGSEGV);
+        process::kill_current(signal::SIGSEGV);
     }
     interrupts::enable();
     let result = call(frame);
+    // Signals to take before going back, or a call one ended to start
+    // again: then back by `iretq`, which `sysret` can't do with every
+    // register a handler's frame puts back.
+    if let Some(process) = thread::current_process()
+        && (process.signals.has_signal()
+            || result == -signal::ERESTARTSYS
+            || result == -ERESTARTNOHAND)
+    {
+        let mut registers = frame.registers(result as u64);
+        signal::deliver(process, &mut registers, Some(Syscall { number: frame.nr, result }));
+        process::enter_user(registers);
+    }
     interrupts::disable();
     result
 }
@@ -208,24 +223,35 @@ fn call(frame: &Frame) -> i64 {
         10 => mprotect(&process, a0, a1, a2),
         11 => munmap(&process, a0, a1),
         12 => brk(&process, a0),
-        13 => rt_sigaction(&process, a0, a2, a3),
-        14 => rt_sigprocmask(&process, a2, a3),
+        13 => signals::rt_sigaction(&process, a0, a1, a2, a3),
+        14 => signals::rt_sigprocmask(&process, a0, a1, a2, a3),
+        15 => match signal::sigreturn(&process, frame.rsp) {
+            Some(mut registers) => {
+                signal::deliver(process, &mut registers, None);
+                process::enter_user(registers)
+            }
+            None => {
+                drop(process);
+                process::kill_current(signal::SIGSEGV)
+            }
+        },
         16 => files::ioctl(&process, a0, a1, a2),
         17 => files::pread(&process, a0, a1, a2, a3),
         18 => files::pwrite(&process, a0, a1, a2, a3),
         22 => files::pipe2(&process, a0, 0),
         32 => files::dup(&process, a0),
         33 => files::dup3(&process, a0, a1, 0, true),
-        35 => clock_nanosleep(&process, CLOCK_MONOTONIC, 0, a0),
+        34 => signals::pause(&process),
+        35 => clock_nanosleep(&process, CLOCK_MONOTONIC, 0, a0, a1),
         39 => process.id as i64,
         // The copy starts as the call returns, with 0 its result.
         56 => processes::clone(&process, frame.registers(0), a0, a1),
         // fork, vfork.
         57 | 58 => processes::clone(&process, frame.registers(0), processes::SIGCHLD, 0),
         59 => match processes::execve(&process, a0, a1, a2) {
-            Ok(registers) => {
-                // Nothing on this stack is ever dropped.
-                drop(process);
+            Ok(mut registers) => {
+                // Nothing on this stack is ever dropped: `deliver` lets go.
+                signal::deliver(process, &mut registers, None);
                 process::enter_user(registers)
             }
             Err(errno) => -errno,
@@ -236,6 +262,7 @@ fn call(frame: &Frame) -> i64 {
             process::exit_current(a0 as i32)
         }
         61 => processes::wait4(&process, a0, a1, a2, a3),
+        62 => signals::kill(&process, a0, a1),
         72 => files::fcntl(&process, a0, a1, a2),
         79 => files::getcwd(&process, a0, a1),
         80 => files::chdir(&process, a0),
@@ -244,17 +271,26 @@ fn call(frame: &Frame) -> i64 {
         84 => files::unlinkat(&process, files::AT_FDCWD, a0, files::AT_REMOVEDIR),
         87 => files::unlinkat(&process, files::AT_FDCWD, a0, 0),
         95 => files::umask(&process, a0),
+        109 => signals::setpgid(&process, a0, a1),
         110 => process.parent_id() as i64,
+        111 => process.pgid() as i64,
+        112 => signals::setsid(&process),
+        121 => signals::getpgid(&process, a0),
+        124 => signals::getsid(&process, a0),
+        127 => signals::rt_sigpending(&process, a0, a1),
+        130 => signals::rt_sigsuspend(&process, a0, a1),
         // fsync, fdatasync.
         74 | 75 => files::fsync(&process, a0),
-        131 => sigaltstack(&process, a1),
+        131 => signals::sigaltstack(&process, a0, a1, frame.rsp),
         158 => arch_prctl(&process, a0, a1),
         // gettid: one thread per program, so its id is the program's.
         186 => process.id as i64,
         // set_tid_address: nothing to clear at exit with one thread per program.
+        200 => signals::tkill(&process, None, a0, a1),
         217 => files::getdents64(&process, a0, a1, a2),
         218 => process.id as i64,
-        230 => clock_nanosleep(&process, a0, a1, a2),
+        230 => clock_nanosleep(&process, a0, a1, a2, a3),
+        234 => signals::tkill(&process, Some(a0), a1, a2),
         257 => files::open(&process, a0, a1, a2, a3),
         258 => files::mkdirat(&process, a0, a1, a2),
         262 => files::newfstatat(&process, a0, a1, a2, a3),
@@ -332,7 +368,9 @@ fn poll(process: &Process, fds: u64, count: u64, timeout: Option<u64>) -> i64 {
     };
     // A timeout of 0 only looks.
     let deadline = timeout.map(|ms| if ms == 0 { 0 } else { thread::ticks_after(ms) });
-    thread::poll_until(deadline, || check(&mut revents));
+    if thread::poll_until(deadline, || check(&mut revents)).is_err() {
+        return -ERESTARTNOHAND;
+    }
     let mut ready = 0;
     for (entry, revents) in table.as_chunks_mut::<8>().0.iter_mut().zip(&revents) {
         entry[6..].copy_from_slice(&revents.to_le_bytes());
@@ -449,63 +487,39 @@ fn brk(process: &Process, addr: u64) -> i64 {
     addr as i64
 }
 
-/// Accepted, and every signal reported as having its default action.
-///
-/// shortcut: signals are never delivered, so a handler is never called; a
-/// fault ends the program. Real signals are Phase 4.
-fn rt_sigaction(process: &Process, signal: u64, old: u64, set_size: u64) -> i64 {
-    if set_size != 8 || !(1..=64).contains(&signal) {
-        return -EINVAL;
-    }
-    // `struct sigaction`: handler, flags, restorer and mask, all zero for
-    // SIG_DFL.
-    if old != 0 && process.memory.lock().space.write(old, &[0; 32]).is_none() {
-        return -EFAULT;
-    }
-    0
-}
-
-fn rt_sigprocmask(process: &Process, old: u64, set_size: u64) -> i64 {
-    if set_size != 8 {
-        return -EINVAL;
-    }
-    if old != 0 && process.memory.lock().space.write(old, &[0; 8]).is_none() {
-        return -EFAULT;
-    }
-    0
-}
-
-/// Accepted; the old one reported as disabled.
-fn sigaltstack(process: &Process, old: u64) -> i64 {
-    const SS_DISABLE: u64 = 2;
-    // `stack_t`: a pointer, an int of flags (padded to 8), a size.
-    let mut stack = [0u8; 24];
-    stack[8..16].copy_from_slice(&SS_DISABLE.to_le_bytes());
-    if old != 0 && process.memory.lock().space.write(old, &stack).is_none() {
-        return -EFAULT;
-    }
-    0
-}
-
 const CLOCK_REALTIME: u64 = 0;
 const CLOCK_MONOTONIC: u64 = 1;
 
 /// Sleep for the `struct timespec` at `request`: what `std::thread::sleep`
-/// does, through `clock_nanosleep`, and `nanosleep` too. Nothing interrupts a
-/// sleep (no signals yet), so the time left over is never written.
-fn clock_nanosleep(process: &Process, clock: u64, flags: u64, request: u64) -> i64 {
+/// does, through `clock_nanosleep`, and `nanosleep` too. A signal ends it
+/// early, with what was left of it at `remain`.
+///
+/// shortcut: one that stops the program and continues it starts the whole
+/// sleep again, where Linux sleeps for what's left.
+fn clock_nanosleep(process: &Process, clock: u64, flags: u64, request: u64, remain: u64) -> i64 {
     // shortcut: relative sleeps only; TIMER_ABSTIME needs a clock a program
     // can read, which comes with clock_gettime when one asks for it.
     if flags != 0 || (clock != CLOCK_REALTIME && clock != CLOCK_MONOTONIC) {
         return -EINVAL;
     }
-    match timespec_ms(process, request) {
-        Ok(ms) => {
-            thread::sleep(ms);
-            0
-        }
-        Err(errno) => -errno,
+    let ms = match timespec_ms(process, request) {
+        Ok(ms) => ms,
+        Err(errno) => return -errno,
+    };
+    let deadline = thread::ticks_after(ms);
+    if thread::poll_until(Some(deadline), || false).is_ok() {
+        return 0;
     }
+    if remain != 0 {
+        let left = deadline.saturating_sub(thread::ticks()) * 1000 / TIMER_HZ as u64;
+        let mut timespec = [0u8; 16];
+        timespec[..8].copy_from_slice(&(left / 1000).to_le_bytes());
+        timespec[8..].copy_from_slice(&(left % 1000 * 1_000_000).to_le_bytes());
+        if process.memory.lock().space.write(remain, &timespec).is_none() {
+            return -EFAULT;
+        }
+    }
+    -ERESTARTNOHAND
 }
 
 /// The `struct timespec` at `addr`, in milliseconds, rounded up.

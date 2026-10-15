@@ -183,10 +183,14 @@ pub fn wake_pollers() {
 }
 
 /// Block until `ready` returns true, or the tick `deadline` comes, checking
-/// again whenever `wake_pollers` is called. `ready` runs with interrupts
-/// off, as `WaitQueue::wait_until`'s check does.
-pub fn poll_until(deadline: Option<u64>, mut ready: impl FnMut() -> bool) {
-    POLLERS.wait_until(|| {
+/// again whenever `wake_pollers` is called; or until the current thread's
+/// program has a signal to take, which is `Err`. `ready` runs with
+/// interrupts off, as `WaitQueue::wait_until`'s check does.
+pub fn poll_until(
+    deadline: Option<u64>,
+    mut ready: impl FnMut() -> bool,
+) -> Result<(), Interrupted> {
+    POLLERS.wait_until_interruptible(|| {
         if ready() || deadline.is_some_and(|deadline| ticks() >= deadline) {
             return true;
         }
@@ -194,8 +198,12 @@ pub fn poll_until(deadline: Option<u64>, mut ready: impl FnMut() -> bool) {
             POLL_DEADLINE.fetch_min(deadline, Ordering::Relaxed);
         }
         false
-    });
+    })
 }
+
+/// A wait a signal ended before what it waited for came.
+#[derive(Debug)]
+pub struct Interrupted;
 
 /// Threads waiting for something that another thread or an interrupt handler
 /// announces with [`wake_all`](WaitQueue::wake_all).
@@ -219,6 +227,28 @@ impl WaitQueue {
             }
         });
         reap();
+    }
+
+    /// `wait_until`, but ended early, `Err`, by a signal for the current
+    /// thread's program that it doesn't block, as Linux's interruptible
+    /// waits are. Kernel threads, which have no signals, just wait.
+    pub fn wait_until_interruptible(
+        &self,
+        mut done: impl FnMut() -> bool,
+    ) -> Result<(), Interrupted> {
+        let Some(process) = current_process() else {
+            self.wait_until(done);
+            return Ok(());
+        };
+        // Where `signal::send` wakes it.
+        process.signals.waiting_in(Some(self));
+        let mut finished = false;
+        self.wait_until(|| {
+            finished = done();
+            finished || process.signals.has_signal()
+        });
+        process.signals.waiting_in(None);
+        if finished { Ok(()) } else { Err(Interrupted) }
     }
 
     /// Make every waiting thread ready to run again. Safe to call from an

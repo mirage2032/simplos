@@ -1,10 +1,12 @@
 //! System calls on files: file descriptors, paths, and what's behind them,
 //! the ext4 file system or the console.
 
-use super::{EBADF, EFAULT, EINVAL, ENOTTY};
+use super::{EBADF, EFAULT, EINVAL, ENOTTY, EPERM};
 use crate::fs::{self, Device, Handle};
-use crate::pipe::{self, WriteError};
+use crate::pipe::{self, ReadError, WriteError};
+use crate::process;
 use crate::process::{Fd, Process};
+use crate::signal::{self, ERESTARTSYS, Info};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -155,7 +157,7 @@ pub fn open(process: &Process, dirfd: u64, path: u64, flags: u64, mode: u64) -> 
             let handle = match device {
                 Device::Null => Handle::Null,
                 Device::Zero => Handle::Zero,
-                Device::Tty => Handle::tty(process.tty.clone().ok_or(ENXIO)?),
+                Device::Tty => Handle::tty(process.tty.lock().clone().ok_or(ENXIO)?),
             };
             set_nonblocking(&handle, flags);
             return install(process, handle, cloexec);
@@ -253,13 +255,21 @@ fn at(offset: u64) -> Result<u64> {
     if (offset as i64) < 0 { Err(EINVAL) } else { Ok(offset) }
 }
 
+/// The errno for a read that took nothing.
+fn read_errno(error: ReadError) -> i64 {
+    match error {
+        ReadError::Empty => EAGAIN,
+        ReadError::Interrupted => ERESTARTSYS,
+    }
+}
+
 /// Read from `at`, or else from the descriptor's place, and move it on.
 fn read_at(process: &Process, fd: u64, buf: u64, count: u64, at: Option<u64>) -> Result<i64> {
     let count = (count as usize).min(MOST);
     match &*handle(process, fd)? {
         Handle::Tty { .. } | Handle::Pipe { .. } if at.is_some() => Err(ESPIPE),
         Handle::Tty { tty, nonblocking } => {
-            let data = tty.read_or_wait(count, !nonblocking.load(Relaxed)).ok_or(EAGAIN)?;
+            let data = tty.read_or_wait(count, !nonblocking.load(Relaxed)).map_err(read_errno)?;
             process.memory.lock().space.write(buf, &data).ok_or(EFAULT)?;
             Ok(data.len() as i64)
         }
@@ -272,7 +282,7 @@ fn read_at(process: &Process, fd: u64, buf: u64, count: u64, at: Option<u64>) ->
         // Not even for nothing: with no data, it would wait.
         Handle::Pipe { .. } if count == 0 => Ok(0),
         Handle::Pipe { end, nonblocking } => {
-            let data = end.read(count, !nonblocking.load(Relaxed)).ok_or(EAGAIN)?;
+            let data = end.read(count, !nonblocking.load(Relaxed)).map_err(read_errno)?;
             process.memory.lock().space.write(buf, &data).ok_or(EFAULT)?;
             Ok(data.len() as i64)
         }
@@ -305,12 +315,15 @@ fn write_at(process: &Process, fd: u64, buf: u64, count: u64, at: Option<u64>) -
         }
         Handle::Null | Handle::Zero => Ok(data.len() as i64),
         Handle::Pipe { end, .. } if !end.write => Err(EBADF),
-        // shortcut: no SIGPIPE, as there are no signals: just the error,
-        // which is what a Rust program, ignoring SIGPIPE, gets anyway.
         Handle::Pipe { end, nonblocking } => match end.write(&data, !nonblocking.load(Relaxed)) {
             Ok(written) => Ok(written as i64),
-            Err(WriteError::Broken) => Err(EPIPE),
+            // And SIGPIPE, which ends a program that doesn't ignore it.
+            Err(WriteError::Broken) => {
+                signal::send(process, signal::SIGPIPE, Info::user(process.id));
+                Err(EPIPE)
+            }
             Err(WriteError::Full) => Err(EAGAIN),
+            Err(WriteError::Interrupted) => Err(ERESTARTSYS),
         },
         Handle::Dir { .. } | Handle::File { write: false, .. } => Err(EBADF),
         Handle::File { file, append, offset, .. } => {
@@ -692,11 +705,9 @@ pub fn open_handle(process: &Process, fd: i32) -> Option<Arc<Handle>> {
     handle(process, fd as u64).ok()
 }
 
-/// The terminal calls: its settings, its size, and what's waiting in it; and
-/// for anything, FIONBIO, which sets O_NONBLOCK.
-///
-/// shortcut: no process groups yet, so a program asking which is in the
-/// foreground is told it's its own, and telling it which changes nothing.
+/// The terminal calls: its settings, its size, what's waiting in it, and
+/// whose it is: its session, and the group in its foreground; and for
+/// anything, FIONBIO, which sets O_NONBLOCK.
 pub fn ioctl(process: &Process, fd: u64, request: u64, arg: u64) -> i64 {
     use crate::tty::Termios;
     const TCGETS: u64 = 0x5401;
@@ -704,8 +715,11 @@ pub fn ioctl(process: &Process, fd: u64, request: u64, arg: u64) -> i64 {
     const TCSETSW: u64 = 0x5403;
     const TCSETSF: u64 = 0x5404;
     const TCFLSH: u64 = 0x540B;
+    const TIOCSCTTY: u64 = 0x540E;
     const TIOCGPGRP: u64 = 0x540F;
     const TIOCSPGRP: u64 = 0x5410;
+    const TIOCNOTTY: u64 = 0x5422;
+    const TIOCGSID: u64 = 0x5429;
     const TIOCGWINSZ: u64 = 0x5413;
     const TIOCSWINSZ: u64 = 0x5414;
     const FIONREAD: u64 = 0x541B;
@@ -721,8 +735,51 @@ pub fn ioctl(process: &Process, fd: u64, request: u64, arg: u64) -> i64 {
             return Ok(0);
         }
         let Handle::Tty { tty, .. } = &*handle else { return Err(ENOTTY) };
+        // Whether it's the caller's session's terminal.
+        let controlling = process.tty.lock().as_ref().is_some_and(|own| Arc::ptr_eq(own, tty));
         let mut put = |bytes: &[u8]| memory.space.write(arg, bytes).ok_or(EFAULT).map(|()| 0);
         match request {
+            TIOCGPGRP | TIOCSPGRP | TIOCGSID | TIOCNOTTY if !controlling => Err(ENOTTY),
+            TIOCGPGRP => put(&(tty.foreground() as i32).to_le_bytes()),
+            TIOCGSID => put(&(tty.session() as i32).to_le_bytes()),
+            TIOCSPGRP => {
+                let mut group = [0u8; 4];
+                memory.space.read(arg, &mut group).ok_or(EFAULT)?;
+                let group = i32::from_le_bytes(group);
+                if group < 0 {
+                    return Err(EINVAL);
+                }
+                // One of its session's groups.
+                let members = process::group(group as u64);
+                if !members.iter().any(|member| member.sid() == process.sid()) {
+                    return Err(EPERM);
+                }
+                tty.set_foreground(group as u64);
+                Ok(0)
+            }
+            // A session's leader without a terminal takes this one; from
+            // another session only if it asks to, with 1.
+            TIOCSCTTY => {
+                let taken = tty.session() != 0 && tty.session() != process.sid();
+                if process.sid() != process.id
+                    || process.tty.lock().is_some()
+                    || (taken && arg != 1)
+                {
+                    return Err(EPERM);
+                }
+                tty.control(process.sid(), process.pgid());
+                *process.tty.lock() = Some(tty.clone());
+                Ok(0)
+            }
+            // shortcut: a session's leader giving its terminal up doesn't
+            // send its foreground SIGHUP, as Linux's does.
+            TIOCNOTTY => {
+                *process.tty.lock() = None;
+                if process.sid() == process.id {
+                    tty.control(0, 0);
+                }
+                Ok(0)
+            }
             TCGETS => put(&tty.termios().to_bytes()),
             TIOCGWINSZ => {
                 let (rows, cols) = tty.size();
@@ -731,7 +788,6 @@ pub fn ioctl(process: &Process, fd: u64, request: u64, arg: u64) -> i64 {
                 winsize[2..4].copy_from_slice(&cols.to_le_bytes());
                 put(&winsize)
             }
-            TIOCGPGRP => put(&(process.id as i32).to_le_bytes()),
             FIONREAD => put(&(tty.available() as i32).to_le_bytes()),
             TCSETS | TCSETSW | TCSETSF => {
                 // Output is written as it comes, so there's none to wait for.
@@ -747,7 +803,6 @@ pub fn ioctl(process: &Process, fd: u64, request: u64, arg: u64) -> i64 {
                 tty.set_size(half(0), half(2));
                 Ok(0)
             }
-            TIOCSPGRP => Ok(0),
             // Input, or input and output, of which there's none waiting.
             TCFLSH if arg == 0 || arg == 2 => {
                 tty.flush_input();

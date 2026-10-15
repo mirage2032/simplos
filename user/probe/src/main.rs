@@ -8,6 +8,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{FileExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicIsize, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 fn main() {
@@ -385,6 +386,265 @@ fn main() {
             print!("{}", String::from_utf8_lossy(&output.stdout));
             println!("{:?} {}", String::from_utf8_lossy(&output.stderr), output.status);
         }
+        // Signals within the program: a handler, told who sent it; blocked,
+        // then not; sent by tkill; run once; ignored; SIGKILL, which can be
+        // neither caught nor blocked; and what kill refuses.
+        Some("signals") => {
+            let me = getpid();
+            let set = sigaction(SIGUSR1, record, SA_SIGINFO);
+            let sent = kill(me, SIGUSR1);
+            let first = (CAUGHT.load(Ordering::SeqCst), LAST.load(Ordering::SeqCst));
+            let (from, code) = (FROM.load(Ordering::SeqCst) == me, CODE.load(Ordering::SeqCst));
+            sigprocmask(SIG_BLOCK, bit(SIGUSR1));
+            kill(me, SIGUSR1);
+            let mut pending = 0u64;
+            syscall(127, &raw mut pending as usize, 8, 0);
+            // Pending but blocked, it doesn't end a sleep.
+            let nap = [0i64, 20_000_000];
+            let slept = syscall(35, nap.as_ptr() as usize, 0, 0);
+            let blocked = CAUGHT.load(Ordering::SeqCst);
+            sigprocmask(SIG_UNBLOCK, bit(SIGUSR1));
+            let unblocked = CAUGHT.load(Ordering::SeqCst);
+            sigaction(SIGUSR2, record, SA_SIGINFO | SA_RESETHAND);
+            syscall(200, me as usize, SIGUSR2, 0);
+            let (tkill, reset) = (CODE.load(Ordering::SeqCst), handler_of(SIGUSR2));
+            set_action(SIGUSR1, SIG_IGN, 0);
+            kill(me, SIGUSR1);
+            let ignored = CAUGHT.load(Ordering::SeqCst);
+            let catch_kill = sigaction(SIGKILL, record, 0);
+            sigprocmask(SIG_BLOCK, bit(SIGKILL));
+            let kill_blocked = sigprocmask(SIG_BLOCK, 0) & bit(SIGKILL) != 0;
+            let refused = (kill(me, 65), kill(999_999, SIGUSR1), kill(me, 0));
+            println!(
+                "{set} {sent} {first:?} {from} {code}; {} {slept} {blocked} {unblocked}; {tkill} \
+                 {reset} {ignored}; {catch_kill} {kill_blocked} {refused:?}",
+                pending == bit(SIGUSR1)
+            );
+        }
+        // A signal for a copy spinning with no system calls, which the timer
+        // interrupt brings it: every register it had, and the SSE ones, are
+        // as they were once the handler, which changes them, is done.
+        Some("signal-registers") => {
+            let (mut ready, ready_writer) = or_fail("pipe", io::pipe());
+            let child = syscall(57, 0, 0, 0);
+            if child == 0 {
+                sigaction(SIGUSR1, clobber, SA_SIGINFO);
+                or_fail("pipe", (&ready_writer).write_all(b"r"));
+                std::process::exit(if spin_until_flagged() { 0 } else { 1 });
+            }
+            or_fail("pipe", ready.read_exact(&mut [0]));
+            std::thread::sleep(Duration::from_millis(30));
+            kill(child, SIGUSR1);
+            println!("{}", wait(child).1);
+        }
+        // Calls a signal ends: a read, with EINTR, unless the handler asked
+        // for SA_RESTART; a sleep, with what was left of it.
+        Some("interrupted") => {
+            let parent = getpid();
+            let (reader, writer) = or_fail("pipe", io::pipe());
+            // A copy that signals, then writes.
+            let poke = |write: bool| {
+                let child = syscall(57, 0, 0, 0);
+                if child == 0 {
+                    std::thread::sleep(Duration::from_millis(50));
+                    kill(parent, SIGUSR1);
+                    std::thread::sleep(Duration::from_millis(50));
+                    if write {
+                        or_fail("pipe", (&writer).write_all(b"x"));
+                    }
+                    std::process::exit(0);
+                }
+                child
+            };
+            let mut byte = [0u8];
+            let read = |byte: &mut [u8; 1]| {
+                syscall(0, reader.as_raw_fd() as usize, byte.as_mut_ptr() as usize, 1)
+            };
+            sigaction(SIGUSR1, record, SA_SIGINFO);
+            let child = poke(true);
+            let plain = read(&mut byte);
+            wait(child);
+            read(&mut byte);
+            sigaction(SIGUSR1, record, SA_SIGINFO | SA_RESTART);
+            let child = poke(true);
+            let restarted = read(&mut byte);
+            wait(child);
+            let child = poke(false);
+            let (request, mut left) = ([5i64, 0], [0i64; 2]);
+            let slept = syscall(35, request.as_ptr() as usize, left.as_mut_ptr() as usize, 0);
+            wait(child);
+            println!("{plain} {restarted} {slept} {}", (4..=5).contains(&left[0]));
+        }
+        // How copies end, sent: SIGTERM, by default; SIGUSR1, ignored, so
+        // not; SIGKILL, though every signal is blocked; and SIGPIPE, by
+        // default, as a pipe no one reads is written.
+        Some("endings") => {
+            let (mut ready, ready_writer) = or_fail("pipe", io::pipe());
+            let mut child = |setup: &dyn Fn()| {
+                let child = syscall(57, 0, 0, 0);
+                if child == 0 {
+                    setup();
+                    or_fail("pipe", (&ready_writer).write_all(b"r"));
+                    std::thread::sleep(Duration::from_millis(100));
+                    std::process::exit(5);
+                }
+                or_fail("pipe", ready.read_exact(&mut [0]));
+                child
+            };
+            let mut ended = Vec::new();
+            for (setup, signal) in [
+                (&(|| {}) as &dyn Fn(), SIGTERM),
+                (&|| _ = set_action(SIGUSR1, SIG_IGN, 0), SIGUSR1),
+                (&|| _ = sigprocmask(SIG_SETMASK, !0), SIGKILL),
+            ] {
+                let pid = child(setup);
+                kill(pid, signal);
+                ended.push(wait(pid).1);
+            }
+            let pid = syscall(57, 0, 0, 0);
+            if pid == 0 {
+                set_action(SIGPIPE, SIG_DFL, 0);
+                let (reader, mut writer) = or_fail("pipe", io::pipe());
+                drop(reader);
+                let _ = writer.write_all(b"to no one");
+                std::process::exit(0);
+            }
+            ended.push(wait(pid).1);
+            println!("{}", ended.join(", "));
+        }
+        // A copy stopped, continued and killed, as wait4 tells it and its
+        // SIGCHLD's si_code does.
+        Some("stops") => {
+            sigaction(SIGCHLD, record, SA_SIGINFO | SA_RESTART);
+            let child = syscall(57, 0, 0, 0);
+            if child == 0 {
+                loop {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            let code = || CODE.load(Ordering::SeqCst);
+            kill(child, SIGSTOP);
+            let stopped = (wait_status(child, WUNTRACED), code());
+            kill(child, SIGCONT);
+            let continued = (wait_status(child, WCONTINUED), code());
+            kill(child, SIGKILL);
+            let killed = (wait_status(child, 0), code());
+            println!(
+                "{:#x} {} {:#x} {} {} {}",
+                stopped.0, stopped.1, continued.0, continued.1, killed.0, killed.1
+            );
+        }
+        // rt_sigsuspend: what's blocked let through while it waits, and
+        // blocked again once the handler's run.
+        Some("suspend") => {
+            let parent = getpid();
+            sigaction(SIGUSR1, record, SA_SIGINFO);
+            sigprocmask(SIG_BLOCK, bit(SIGUSR1));
+            let child = syscall(57, 0, 0, 0);
+            if child == 0 {
+                std::thread::sleep(Duration::from_millis(30));
+                kill(parent, SIGUSR1);
+                std::process::exit(0);
+            }
+            let nothing = 0u64;
+            let suspended = syscall(130, &raw const nothing as usize, 8, 0);
+            let blocked = sigprocmask(SIG_BLOCK, 0) & bit(SIGUSR1) != 0;
+            // The mask the handler's return puts back: the one from before.
+            let saved = MASK.load(Ordering::SeqCst) & bit(SIGUSR1) != 0;
+            wait(child);
+            println!("{suspended} {} {blocked} {saved}", CAUGHT.load(Ordering::SeqCst));
+        }
+        // Process groups: its own, leading its session; a copy in a group of
+        // its own, signalled as a group; what setsid and setpgid refuse.
+        Some("groups") => {
+            let me = getpid();
+            let (group, session) = (syscall(121, 0, 0, 0), syscall(124, 0, 0, 0));
+            let new_session = syscall(112, 0, 0, 0);
+            let (mut ready, ready_writer) = or_fail("pipe", io::pipe());
+            let child = syscall(57, 0, 0, 0);
+            if child == 0 {
+                syscall(109, 0, 0, 0);
+                or_fail("pipe", (&ready_writer).write_all(b"r"));
+                loop {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            or_fail("pipe", ready.read_exact(&mut [0]));
+            let own_group = syscall(121, child as usize, 0, 0) == child;
+            let unknown_group = syscall(109, child as usize, 999_999, 0);
+            let sent = kill(-child, SIGTERM);
+            let ended = wait(child).1;
+            let gone = kill(-child, SIGTERM);
+            println!(
+                "{} {} {new_session} {own_group} {unknown_group} {sent} {ended} {gone}",
+                group == me,
+                session == me
+            );
+        }
+        // A handler that asks for the alternate stack runs on it, and
+        // sigaltstack says so there.
+        Some("altstack") => {
+            let stack = vec![0u8; 64 * 1024];
+            let range = stack.as_ptr() as usize..stack.as_ptr() as usize + stack.len();
+            let given = [stack.as_ptr() as u64, 0, stack.len() as u64];
+            let set = syscall(131, given.as_ptr() as usize, 0, 0);
+            sigaction(SIGUSR1, on_altstack, SA_SIGINFO | SA_ONSTACK);
+            kill(getpid(), SIGUSR1);
+            let mut after = [0u64; 3];
+            syscall(131, 0, after.as_mut_ptr() as usize, 0);
+            let on_it = range.contains(&WHERE.load(Ordering::SeqCst));
+            println!("{set} {on_it} {} {}", ALT_FLAGS.load(Ordering::SeqCst), after[1]);
+        }
+        // Wait for SIGINT or SIGQUIT, from a terminal: which came, and
+        // whether from the kernel.
+        Some("catch") => {
+            sigaction(SIGINT, record, SA_SIGINFO);
+            sigaction(SIGQUIT, record, SA_SIGINFO);
+            println!("ready");
+            while CAUGHT.load(Ordering::SeqCst) == 0 {
+                syscall(34, 0, 0, 0);
+            }
+            let kernel = CODE.load(Ordering::SeqCst) == 0x80;
+            println!("caught {}, from the kernel: {kernel}", LAST.load(Ordering::SeqCst));
+        }
+        // A copy in a group of its own put in the terminal's foreground, as
+        // a shell puts a job: whatever the terminal sends then is its. How
+        // it ended, once the program's back in the foreground.
+        Some("foreground") => {
+            let (mut ready, ready_writer) = or_fail("pipe", io::pipe());
+            let child = syscall(57, 0, 0, 0);
+            if child == 0 {
+                syscall(109, 0, 0, 0);
+                or_fail("pipe", (&ready_writer).write_all(b"r"));
+                loop {
+                    syscall(34, 0, 0, 0);
+                }
+            }
+            or_fail("pipe", ready.read_exact(&mut [0]));
+            let group = child as i32;
+            let set = syscall(16, 0, 0x5410, &raw const group as usize);
+            let mut front = 0i32;
+            syscall(16, 0, 0x540F, &raw mut front as usize);
+            println!("{set} {}", front == group);
+            let ended = wait(child).1;
+            let me = getpid() as i32;
+            syscall(16, 0, 0x5410, &raw const me as usize);
+            println!("{ended}");
+        }
+        // Leave a copy behind, which says so when SIGHUP comes: as the
+        // session's leader ends, its terminal hangs up on its foreground.
+        Some("hangup") => {
+            let (mut ready, ready_writer) = or_fail("pipe", io::pipe());
+            let child = syscall(57, 0, 0, 0);
+            if child == 0 {
+                sigaction(SIGHUP, hung_up, SA_SIGINFO);
+                or_fail("pipe", (&ready_writer).write_all(b"r"));
+                loop {
+                    syscall(34, 0, 0, 0);
+                }
+            }
+            or_fail("pipe", ready.read_exact(&mut [0]));
+        }
         // End with PATH open, for the kernel to close.
         Some("hold") => std::mem::forget(or_fail(&arg(2), fs::File::open(arg(2)))),
         // Files, through std::fs, as any program would use them.
@@ -493,6 +753,239 @@ fn or_fail<T>(path: &str, result: io::Result<T>) -> T {
         eprintln!("probe: {path}: {error}");
         std::process::exit(1)
     })
+}
+
+// Signals, through system calls of their own: std has none of these.
+
+const SIGHUP: usize = 1;
+const SIGINT: usize = 2;
+const SIGQUIT: usize = 3;
+const SIGKILL: usize = 9;
+const SIGUSR1: usize = 10;
+const SIGUSR2: usize = 12;
+const SIGPIPE: usize = 13;
+const SIGTERM: usize = 15;
+const SIGCHLD: usize = 17;
+const SIGCONT: usize = 18;
+const SIGSTOP: usize = 19;
+const SIG_DFL: usize = 0;
+const SIG_IGN: usize = 1;
+const SA_SIGINFO: u64 = 4;
+const SA_RESTORER: u64 = 0x0400_0000;
+const SA_ONSTACK: u64 = 0x0800_0000;
+const SA_RESTART: u64 = 0x1000_0000;
+const SA_RESETHAND: u64 = 0x8000_0000;
+const SIG_BLOCK: usize = 0;
+const SIG_UNBLOCK: usize = 1;
+const SIG_SETMASK: usize = 2;
+const WUNTRACED: usize = 2;
+const WCONTINUED: usize = 8;
+
+// What a handler returns to: rt_sigreturn, as libc's restorer does.
+std::arch::global_asm!(".globl probe_restore_rt", "probe_restore_rt:", "mov eax, 15", "syscall");
+
+unsafe extern "C" {
+    fn probe_restore_rt();
+}
+
+fn bit(signal: usize) -> u64 {
+    1 << (signal - 1)
+}
+
+/// A signal handler, given the signal, its siginfo_t and its ucontext.
+type Handler = extern "C" fn(i32, *const u8, *const u8);
+
+/// Set `signal` to run `handler`.
+fn sigaction(signal: usize, handler: Handler, flags: u64) -> isize {
+    set_action(signal, handler as *const () as usize, flags)
+}
+
+/// Set what `signal` does: run the handler at `handler`, or SIG_DFL or
+/// SIG_IGN.
+fn set_action(signal: usize, handler: usize, flags: u64) -> isize {
+    let restorer = probe_restore_rt as *const () as u64;
+    let action = [handler as u64, flags | SA_RESTORER, restorer, 0];
+    syscall5(13, [signal, action.as_ptr() as usize, 0, 8, 0])
+}
+
+/// What `signal` does now: its handler, or SIG_DFL or SIG_IGN.
+fn handler_of(signal: usize) -> u64 {
+    let mut action = [0u64; 4];
+    syscall5(13, [signal, 0, action.as_mut_ptr() as usize, 8, 0]);
+    action[0]
+}
+
+/// Change which signals are blocked: what were.
+fn sigprocmask(how: usize, set: u64) -> u64 {
+    let mut old = 0u64;
+    syscall5(14, [how, &raw const set as usize, &raw mut old as usize, 8, 0]);
+    old
+}
+
+fn kill(pid: isize, signal: usize) -> isize {
+    syscall(62, pid as usize, signal, 0)
+}
+
+fn getpid() -> isize {
+    syscall(39, 0, 0, 0)
+}
+
+/// What `record` saw: how many signals, and of the last its number, its
+/// sender, its si_code, and the mask its return puts back.
+static CAUGHT: AtomicUsize = AtomicUsize::new(0);
+static LAST: AtomicUsize = AtomicUsize::new(0);
+static FROM: AtomicIsize = AtomicIsize::new(0);
+static CODE: AtomicIsize = AtomicIsize::new(0);
+static MASK: AtomicU64 = AtomicU64::new(0);
+
+extern "C" fn record(signal: i32, info: *const u8, context: *const u8) {
+    // Safety: the kernel passes a siginfo_t, whose si_code and si_pid are
+    // ints at 8 and 16, and a ucontext_t, whose uc_sigmask is at 296.
+    let int = |at: usize| unsafe { info.add(at).cast::<i32>().read_unaligned() };
+    let mask = unsafe { context.add(296).cast::<u64>().read_unaligned() };
+    LAST.store(signal as usize, Ordering::SeqCst);
+    FROM.store(int(16) as isize, Ordering::SeqCst);
+    CODE.store(int(8) as isize, Ordering::SeqCst);
+    MASK.store(mask, Ordering::SeqCst);
+    CAUGHT.fetch_add(1, Ordering::SeqCst);
+}
+
+static FLAG: AtomicU32 = AtomicU32::new(0);
+
+/// A handler that changes every register a function may, and the SSE ones,
+/// then sets FLAG.
+extern "C" fn clobber(_signal: i32, _info: *const u8, _context: *const u8) {
+    // Safety: the registers named are the ones changed.
+    unsafe {
+        std::arch::asm!(
+            "xor eax, eax",
+            "xor ecx, ecx",
+            "xor edx, edx",
+            "xor esi, esi",
+            "xor edi, edi",
+            "xor r8d, r8d",
+            "xor r9d, r9d",
+            "xor r10d, r10d",
+            "xor r11d, r11d",
+            "xorps xmm0, xmm0",
+            "xorps xmm1, xmm1",
+            "xorps xmm7, xmm7",
+            "xorps xmm15, xmm15",
+            out("rax") _, out("rcx") _, out("rdx") _, out("rsi") _, out("rdi") _,
+            out("r8") _, out("r9") _, out("r10") _, out("r11") _,
+            out("xmm0") _, out("xmm1") _, out("xmm7") _, out("xmm15") _,
+        )
+    };
+    FLAG.store(1, Ordering::SeqCst);
+}
+
+/// Spin, with a value of its own in every general register and some SSE
+/// ones, until FLAG is set: whether they all hold them still.
+fn spin_until_flagged() -> bool {
+    let kept: u64;
+    // Safety: rbx and rbp, which can't be named, are put back; the rest
+    // are said to change.
+    unsafe {
+        std::arch::asm!(
+            "push rbx",
+            "push rbp",
+            "mov rbx, 0x101",
+            "mov rbp, 0x102",
+            "mov rdx, 0x103",
+            "mov rsi, 0x104",
+            "mov rdi, 0x105",
+            "mov r8, 0x106",
+            "mov r9, 0x107",
+            "mov r10, 0x108",
+            "mov r11, 0x109",
+            "mov r12, 0x10a",
+            "mov r13, 0x10b",
+            "mov r14, 0x10c",
+            "mov r15, 0x10d",
+            "movq xmm0, rbx",
+            "movq xmm1, rdx",
+            "movq xmm7, r8",
+            "movq xmm15, r15",
+            "2:",
+            "cmp dword ptr [rcx], 0",
+            "je 2b",
+            "xor eax, eax",
+            "cmp rbx, 0x101",
+            "jne 3f",
+            "cmp rbp, 0x102",
+            "jne 3f",
+            "cmp rdx, 0x103",
+            "jne 3f",
+            "cmp rsi, 0x104",
+            "jne 3f",
+            "cmp rdi, 0x105",
+            "jne 3f",
+            "cmp r8, 0x106",
+            "jne 3f",
+            "cmp r9, 0x107",
+            "jne 3f",
+            "cmp r10, 0x108",
+            "jne 3f",
+            "cmp r11, 0x109",
+            "jne 3f",
+            "cmp r12, 0x10a",
+            "jne 3f",
+            "cmp r13, 0x10b",
+            "jne 3f",
+            "cmp r14, 0x10c",
+            "jne 3f",
+            "cmp r15, 0x10d",
+            "jne 3f",
+            "movq rax, xmm0",
+            "cmp rax, 0x101",
+            "jne 3f",
+            "movq rax, xmm1",
+            "cmp rax, 0x103",
+            "jne 3f",
+            "movq rax, xmm7",
+            "cmp rax, 0x106",
+            "jne 3f",
+            "movq rax, xmm15",
+            "cmp rax, 0x10d",
+            "jne 3f",
+            "mov eax, 1",
+            "3:",
+            "pop rbp",
+            "pop rbx",
+            in("rcx") &raw const FLAG,
+            out("rax") kept, out("rdx") _, out("rsi") _, out("rdi") _,
+            out("r8") _, out("r9") _, out("r10") _, out("r11") _,
+            out("r12") _, out("r13") _, out("r14") _, out("r15") _,
+            out("xmm0") _, out("xmm1") _, out("xmm7") _, out("xmm15") _,
+        )
+    };
+    kept == 1
+}
+
+/// Say so, then end.
+extern "C" fn hung_up(_signal: i32, _info: *const u8, _context: *const u8) {
+    let said = b"hung up\n";
+    syscall(1, 1, said.as_ptr() as usize, said.len());
+    syscall(60, 0, 0, 0);
+}
+
+/// Where `on_altstack` ran, and what sigaltstack said there.
+static WHERE: AtomicUsize = AtomicUsize::new(0);
+static ALT_FLAGS: AtomicU32 = AtomicU32::new(0);
+
+extern "C" fn on_altstack(_signal: i32, _info: *const u8, _context: *const u8) {
+    let here = 0u8;
+    WHERE.store(&raw const here as usize, Ordering::SeqCst);
+    let mut stack = [0u64; 3];
+    syscall(131, 0, stack.as_mut_ptr() as usize, 0);
+    ALT_FLAGS.store(stack[1] as u32, Ordering::SeqCst);
+}
+
+/// wait4 for child `pid` with `options`: the status it said.
+fn wait_status(pid: isize, options: usize) -> i32 {
+    let mut status = 0i32;
+    syscall5(61, [pid as usize, &raw mut status as usize, options, 0, 0]);
+    status
 }
 
 /// Wait for child `pid`, or any with -1, with wait4: which ended, and how,

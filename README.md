@@ -114,8 +114,6 @@ has the user program read it, and `run` lists its other modes. For now:
 
 - no symbolic link is followed, so `stat` and `lstat` are the same;
 - a file that's open can't be removed or renamed over (`EBUSY`);
-- writing to a pipe nobody reads is `EPIPE` without `SIGPIPE`, as there are
-  no signals yet;
 - `/dev` holds just those three, and can't be written.
 
 ## Processes
@@ -137,8 +135,6 @@ run itself again. For now:
   parent back;
 - a program that ended keeps its memory until it's waited for, and those
   never waited for go with their parent rather than to an init;
-- there are no process groups, so `wait4` for a group waits for any child,
-  and no signals, so nothing is ever stopped;
 - `execve` takes ELF programs of up to 4 MiB, which it reads whole, and not
   scripts: shells run those themselves when told `ENOEXEC`.
 
@@ -173,12 +169,52 @@ typed until ^D. For now:
 - of the escape sequences, no line-drawing characters, tab stops but every
   eighth column, insert mode or application cursor keys, none of which the
   `linux` entry asks for; what isn't known is read and ignored;
-- no signals, so ^C, ^\ and ^Z throw away the line typed so far and send
-  nothing, and no process groups: a program asking which is in the
-  foreground is told it's itself;
 - in raw mode, `VTIME` is ignored: a read waits for `VMIN` bytes however
   long they take;
 - the font is ASCII: anything else shows as `?`.
+
+## Signals
+
+Signals are Linux's (`signal.rs`): a program sends them with `kill`, `tkill`
+and `tgkill`, to a process or a process group; its terminal sends ^C's
+SIGINT, ^\'s SIGQUIT and ^Z's SIGTSTP to the group in its foreground; and
+the kernel sends SIGCHLD as a child ends, stops or continues, and SIGPIPE
+as a pipe no one reads is written. Each does what the program asked with
+`rt_sigaction`, or else its default: ending the program, stopping it until
+SIGCONT, or nothing. One that's blocked (`rt_sigprocmask`) waits, pending
+(`rt_sigpending`), until it isn't; `rt_sigsuspend` and `pause` wait for one.
+
+A handler runs on the program's stack, or the one `sigaltstack` gave it,
+with the frame Linux puts there: what the program was doing, its registers
+and its SSE state, all put back by `rt_sigreturn`. A signal is acted on as
+the program goes back to ring 3, as a system call returns or as the timer
+interrupts it, so one that never calls into the kernel still gets it; and a
+call that was waiting (a read, `wait4`, a sleep, `poll`) ends early, with
+`EINTR`, or starts again if the handler asked for `SA_RESTART`. `wait4`
+tells of children that stopped or continued if asked (`WUNTRACED`,
+`WCONTINUED`), and a child's SIGCHLD can be ignored, which frees it as it
+ends.
+
+Programs are in process groups, in sessions (`setpgid`, `setsid`,
+`getpgid`, `getsid`): a program the kernel starts leads one, with the
+terminal it's on and its own group in the terminal's foreground, which
+`TIOCSPGRP` changes, as a shell does for its jobs. As a session's leader
+ends, its foreground is sent SIGHUP. In the shell, `run sleep 100000` is
+ended by ^C. For now:
+
+- a fault ends its program with its signal even if it has a handler for it;
+- a signal whose default dumps core just ends the program, as there's
+  nowhere to dump it;
+- real-time signals aren't queued: one of each is kept at a time;
+- a sleep that a stop, or a signal with no handler, interrupts starts its
+  whole time again, where Linux's sleeps for what's left;
+- a session's leader giving its terminal up (`TIOCNOTTY`) doesn't hang up
+  the terminal's foreground;
+- ^Z, SIGTTIN and SIGTTOU stop no one in a group no one outside it could
+  continue, as POSIX says, which a program the kernel starts is in; a job a
+  shell starts can be stopped;
+- a program in the background isn't stopped for reading or writing its
+  terminal, and one whose parent ended isn't given to an init.
 
 ## The first program
 
@@ -214,7 +250,8 @@ derived from the value written. Every test also gets two blank scratch disks,
 ext4 disk made by e2fsprogs' `mke2fs`, which `tests/ext4.rs` writes to, and
 `tests/files.rs` has the user program read and write through system calls. It holds
 the user program as `/bin/probe`, which `tests/processes.rs` has it start
-copies of and run again; `tests/tty.rs` types into a terminal for it to read.
+copies of and run again; `tests/tty.rs` types into a terminal for it to read;
+`tests/signals.rs` has it send signals to itself and its copies.
 After a run that passes, e2fsck must find nothing wrong with it, and it must have been
 unmounted, so the tests need e2fsprogs installed.
 

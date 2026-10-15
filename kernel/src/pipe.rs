@@ -39,6 +39,15 @@ pub fn new() -> (PipeEnd, PipeEnd) {
     (PipeEnd { pipe: pipe.clone(), write: false }, PipeEnd { pipe, write: true })
 }
 
+/// Why a read took nothing.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReadError {
+    /// It's empty, and the reader won't wait.
+    Empty,
+    /// A signal came first.
+    Interrupted,
+}
+
 /// Why a write put nothing in.
 #[derive(Debug, PartialEq, Eq)]
 pub enum WriteError {
@@ -46,18 +55,19 @@ pub enum WriteError {
     Broken,
     /// It's full, and the writer won't wait.
     Full,
+    /// A signal came first.
+    Interrupted,
 }
 
 impl PipeEnd {
     /// Up to `most` bytes, waiting until there are some if `wait`; none once
     /// every writing end has closed and all that was written has been read.
-    /// `None` if there are none yet and it wouldn't wait.
-    pub fn read(&self, most: usize, wait: bool) -> Option<Vec<u8>> {
+    pub fn read(&self, most: usize, wait: bool) -> Result<Vec<u8>, ReadError> {
         let mut taken = Vec::new();
         let mut empty = false;
         // Checked and taken in one go, so that two readers can't both see
         // the same bytes waiting.
-        self.pipe.changed.wait_until(|| {
+        let waited = self.pipe.changed.wait_until_interruptible(|| {
             let mut state = self.pipe.state.lock();
             if state.data.is_empty() {
                 empty = state.writers > 0;
@@ -70,7 +80,11 @@ impl PipeEnd {
         });
         self.pipe.changed.wake_all();
         thread::wake_pollers();
-        (!empty).then_some(taken)
+        match (waited, empty) {
+            (Err(_), _) => Err(ReadError::Interrupted),
+            (Ok(()), true) => Err(ReadError::Empty),
+            (Ok(()), false) => Ok(taken),
+        }
     }
 
     /// Write all of `data`, waiting for room as it's read out if `wait`, or
@@ -82,28 +96,36 @@ impl PipeEnd {
     pub fn write(&self, data: &[u8], wait: bool) -> Result<usize, WriteError> {
         let mut written = 0;
         let mut broken = false;
-        while written < data.len() && !broken {
-            self.pipe.changed.wait_until(|| {
-                let mut state = self.pipe.state.lock();
-                if state.readers == 0 {
-                    broken = true;
-                    return true;
-                }
-                let room = CAPACITY - state.data.len();
-                let count = room.min(data.len() - written);
-                state.data.extend(&data[written..written + count]);
-                written += count;
-                count > 0 || !wait
-            });
+        let mut interrupted = false;
+        while written < data.len() && !broken && !interrupted {
+            interrupted = self
+                .pipe
+                .changed
+                .wait_until_interruptible(|| {
+                    let mut state = self.pipe.state.lock();
+                    if state.readers == 0 {
+                        broken = true;
+                        return true;
+                    }
+                    let room = CAPACITY - state.data.len();
+                    let count = room.min(data.len() - written);
+                    state.data.extend(&data[written..written + count]);
+                    written += count;
+                    count > 0 || !wait
+                })
+                .is_err();
             self.pipe.changed.wake_all();
             thread::wake_pollers();
             if !wait {
                 break;
             }
         }
-        match (written, broken) {
-            (0, true) => Err(WriteError::Broken),
-            (0, false) if !data.is_empty() => Err(WriteError::Full),
+        // What went in before a signal or the readers went is what's said
+        // was written, as on Linux.
+        match (written, broken, interrupted) {
+            (0, true, _) => Err(WriteError::Broken),
+            (0, _, true) => Err(WriteError::Interrupted),
+            (0, false, false) if !data.is_empty() => Err(WriteError::Full),
             _ => Ok(written),
         }
     }

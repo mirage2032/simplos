@@ -1,7 +1,8 @@
 use crate::io::interrupts::pic::InterruptIndex;
 use crate::io::interrupts::{gdt, pic};
 use crate::io::ps2::{PS2_CONTROLLER, Ps2InterruptCause};
-use crate::process::{self, SIGBUS, SIGFPE, SIGILL, SIGSEGV};
+use crate::process::{self, Registers};
+use crate::signal::{SIGBUS, SIGFPE, SIGILL, SIGSEGV, SIGTRAP};
 use crate::{serial_println, thread};
 use core::fmt;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -28,7 +29,11 @@ pub static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
             .set_handler_fn(double_fault_handler)
             .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
     };
-    idt[InterruptIndex::Timer.as_u8()].set_handler_fn(timer_interrupt_handler);
+    // Safety: `timer_entry` is an interrupt handler, saving what it uses.
+    unsafe {
+        let entry = timer_entry as *const () as u64;
+        idt[InterruptIndex::Timer.as_u8()].set_handler_addr(x86_64::VirtAddr::new(entry));
+    }
     idt[InterruptIndex::Keyboard.as_u8()].set_handler_fn(keyboard_interrupt_handler);
     idt[InterruptIndex::Ps2Mouse.as_u8()].set_handler_fn(mouse_interrupt_handler);
     idt
@@ -66,12 +71,111 @@ fn test_breakpoint_exception() {
 
 pub static TIMER_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
+/// What `timer_entry` saves, from its last push up: every general register,
+/// then what the CPU pushed. A signal handler for the program it interrupted
+/// needs them all, to put back once it's done.
+#[repr(C)]
+struct TrapFrame {
+    r15: u64,
+    r14: u64,
+    r13: u64,
+    r12: u64,
+    r11: u64,
+    r10: u64,
+    r9: u64,
+    r8: u64,
+    rbp: u64,
+    rdi: u64,
+    rsi: u64,
+    rdx: u64,
+    rcx: u64,
+    rbx: u64,
+    rax: u64,
+    rip: u64,
+    cs: u64,
+    rflags: u64,
+    rsp: u64,
+    ss: u64,
+}
+
+impl TrapFrame {
+    fn registers(&self) -> Registers {
+        Registers {
+            rax: self.rax,
+            rbx: self.rbx,
+            rcx: self.rcx,
+            rdx: self.rdx,
+            rsi: self.rsi,
+            rdi: self.rdi,
+            rbp: self.rbp,
+            r8: self.r8,
+            r9: self.r9,
+            r10: self.r10,
+            r11: self.r11,
+            r12: self.r12,
+            r13: self.r13,
+            r14: self.r14,
+            r15: self.r15,
+            rip: self.rip,
+            rflags: self.rflags,
+            rsp: self.rsp,
+        }
+    }
+}
+
+/// The timer interrupt's entry. The CPU's push of five words onto a 16-byte
+/// aligned stack, then fifteen here, leave it aligned for the call.
+#[unsafe(naked)]
+unsafe extern "C" fn timer_entry() {
+    core::arch::naked_asm!(
+        "cld",
+        "push rax",
+        "push rbx",
+        "push rcx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push rbp",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "mov rdi, rsp",
+        "call {handler}",
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rbp",
+        "pop rdi",
+        "pop rsi",
+        "pop rdx",
+        "pop rcx",
+        "pop rbx",
+        "pop rax",
+        "iretq",
+        handler = sym timer_interrupt_handler,
+    );
+}
+
+extern "sysv64" fn timer_interrupt_handler(frame: &TrapFrame) {
     TIMER_COUNTER.fetch_add(1, Ordering::Relaxed);
     pic::notify_end_of_interrupt(&InterruptIndex::Timer);
     // After the end-of-interrupt: this thread may not get back here for a
     // while, and the PIC sends no more ticks until the last one is acknowledged.
     crate::thread::timer_tick();
+    // Back to a program, which may have been sent a signal meanwhile.
+    if frame.cs & 3 == 3 {
+        crate::signal::on_interrupt_return(|| frame.registers());
+    }
 }
 /// Keys go to `CONSOLE` as the Linux console sends them: Enter as `\r`,
 /// Backspace as DEL, Ctrl and a letter as its control character, and the
@@ -94,6 +198,22 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
             && let Ok(Some(key_event)) = keyboard.add_byte(scancode)
             && let Some(key) = keyboard.process_keyevent(key_event)
         {
+            // The rest of what Ctrl makes control characters of, as on a
+            // terminal: ^@, ^[, ^\, ^], ^^ and ^_.
+            let key = match key {
+                DecodedKey::Unicode(c) if keyboard.get_modifiers().is_ctrl() => {
+                    DecodedKey::Unicode(match c {
+                        '2' | '@' | ' ' => '\0',
+                        '[' => '\x1b',
+                        '\\' => '\x1c',
+                        ']' => '\x1d',
+                        '6' | '^' => '\x1e',
+                        '-' | '_' => '\x1f',
+                        c => c,
+                    })
+                }
+                key => key,
+            };
             let mut utf8 = [0; 4];
             let sent = match key {
                 DecodedKey::Unicode('\n') => "\r",
@@ -136,7 +256,7 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
 /// A fault in a user program ends that program, as the signal Linux would
 /// have sent it would. In the kernel it is a bug: say what and where, and
 /// stop, rather than halt silently and look like a freeze.
-fn fault(frame: &InterruptStackFrame, what: fmt::Arguments, signal: i32) -> ! {
+fn fault(frame: &InterruptStackFrame, what: fmt::Arguments, signal: usize) -> ! {
     if frame.code_segment.rpl() == PrivilegeLevel::Ring3 {
         let id = thread::current_process().map_or(0, |process| process.id);
         serial_println!(
@@ -168,7 +288,7 @@ extern "x86-interrupt" fn divide_error_handler(frame: InterruptStackFrame) {
 
 extern "x86-interrupt" fn debug_handler(frame: InterruptStackFrame) {
     // A program can single-step itself by setting the trap flag.
-    fault(&frame, format_args!("debug trap"), process::SIGTRAP)
+    fault(&frame, format_args!("debug trap"), SIGTRAP)
 }
 
 extern "x86-interrupt" fn invalid_opcode_handler(frame: InterruptStackFrame) {

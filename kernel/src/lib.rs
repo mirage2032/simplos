@@ -15,6 +15,7 @@ pub mod memory;
 pub mod pipe;
 pub mod process;
 pub mod shell;
+pub mod signal;
 pub mod syscall;
 pub mod terminal;
 pub mod thread;
