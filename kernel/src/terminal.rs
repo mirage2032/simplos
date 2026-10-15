@@ -26,9 +26,9 @@ use embedded_graphics::primitives::Rectangle;
 use embedded_graphics::text::{Baseline, Text};
 
 /// The screen's own colours, which characters have unless they ask for
-/// others.
-const BACKGROUND: Rgb888 = Rgb888::new(23, 114, 243);
-const FOREGROUND: Rgb888 = Rgb888::new(94, 243, 23);
+/// others: the Linux console's, light grey on black.
+const BACKGROUND: Rgb888 = PALETTE[0];
+const FOREGROUND: Rgb888 = PALETTE[7];
 /// What colours 0 to 15 are, as the Linux console has them: the eight that
 /// `ESC [ 30-37 m` and `40-47` set, then their bright ones.
 const PALETTE: [Rgb888; 16] = [
@@ -70,9 +70,15 @@ impl Style {
     const PLAIN: Style =
         Style { fg: None, bg: None, bold: false, underline: false, reverse: false };
 
-    /// The colours it's drawn in.
+    /// The colours it's drawn in. Bold is bright too, as on the Linux
+    /// console: one of the 8 colours is its bright one.
     fn colors(self) -> (Rgb888, Rgb888) {
-        let (fg, bg) = (self.fg.unwrap_or(FOREGROUND), self.bg.unwrap_or(BACKGROUND));
+        let (mut fg, bg) = (self.fg.unwrap_or(FOREGROUND), self.bg.unwrap_or(BACKGROUND));
+        if self.bold
+            && let Some(at) = PALETTE[..8].iter().position(|&color| color == fg)
+        {
+            fg = PALETTE[at + 8];
+        }
         if self.reverse { (bg, fg) } else { (fg, bg) }
     }
 }
@@ -704,6 +710,21 @@ fn colours_and_attributes_go_with_what_is_written() {
     // Erasing leaves the background being written in.
     terminal.write(b"\x1b[0;42m\x1b[2K");
     assert_eq!(terminal.cells[0].style.bg, Some(PALETTE[2]));
+}
+
+#[test_case]
+fn characters_are_drawn_light_grey_on_black_and_bold_is_bright() {
+    let colors = |style: Style| style.colors();
+    let plain = Style::PLAIN;
+    assert_eq!(colors(plain), (PALETTE[7], PALETTE[0]));
+    // As the Linux console has it: bold white, bold blue's bright blue.
+    assert_eq!(colors(Style { bold: true, ..plain }), (PALETTE[15], PALETTE[0]));
+    let blue = Style { fg: Some(PALETTE[4]), bold: true, ..plain };
+    assert_eq!(colors(blue), (PALETTE[12], PALETTE[0]));
+    // A colour of its own stays as it is.
+    let own = Style { fg: Some(Rgb888::new(1, 2, 3)), bold: true, ..plain };
+    assert_eq!(colors(own), (Rgb888::new(1, 2, 3), PALETTE[0]));
+    assert_eq!(colors(Style { bold: true, reverse: true, ..plain }), (PALETTE[0], PALETTE[15]));
 }
 
 #[test_case]

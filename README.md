@@ -197,8 +197,10 @@ programs are given `TERM=linux`: moving the cursor, erasing, inserting and
 deleting characters and lines, scrolling a region, the 16 colours and 256 and
 any, bold, underlined and reversed, saving the cursor, hiding it, and saying
 where it is, which comes back as if typed; and the alternate screen, which
-full-screen programs ask for whatever the entry says. The keys send what the
-console's do. In the shell, `run colors` shows the colours.
+full-screen programs ask for whatever the entry says. It looks like the
+Linux console too: light grey on black, and bold text bright, as the
+console draws it. The keys send what the console's do. In the shell, `run
+colors` shows the colours.
 
 `poll` and `ppoll` wait for pipes and terminals, as long as they're asked
 to, and `O_NONBLOCK` (from `open`, `pipe2`, `fcntl` or `FIONBIO`) makes what
