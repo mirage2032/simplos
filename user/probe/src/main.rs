@@ -1058,6 +1058,27 @@ fn main() {
                 str_of(&cut),
             );
         }
+        // A file removed while it's open, as zsh's here-documents are, and
+        // one renamed over: both still read as they were through the
+        // descriptors open on them.
+        Some("unlinked") => {
+            let path = "/here-document";
+            or_fail(path, fs::write(path, "here\n"));
+            let mut here = or_fail(path, fs::File::open(path));
+            or_fail(path, fs::remove_file(path));
+            let gone = fs::metadata(path).is_err();
+            let path = "/replaced";
+            or_fail(path, fs::write(path, "old\n"));
+            let mut old = or_fail(path, fs::File::open(path));
+            or_fail("/new", fs::write("/new", "new\n"));
+            or_fail(path, fs::rename("/new", path));
+            let (mut text, mut was) = (String::new(), String::new());
+            or_fail("here", here.read_to_string(&mut text));
+            or_fail(path, old.read_to_string(&mut was));
+            let now = or_fail(path, fs::read_to_string(path));
+            or_fail(path, fs::remove_file(path));
+            println!("{gone} {text:?} {was:?} {now:?}");
+        }
         Some(other) => {
             eprintln!("probe: unknown mode {other:?}");
             std::process::exit(2);

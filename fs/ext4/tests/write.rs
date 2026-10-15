@@ -287,23 +287,56 @@ fn open_files_keep_their_own_place() {
 }
 
 #[test]
-fn open_files_cant_be_removed() {
+fn open_files_stay_until_closed() {
     let _serial = serial();
-    let dir = workspace("busy");
+    let dir = workspace("open");
     let root = dir.join("tree");
     make_tree(&root);
     let image = image(&dir, &root, &["-t", "ext4"], "64M");
     let fs = Ext4::mount_writable(Box::new(image.clone())).unwrap();
-    let (first, second) = (fs.open("hello.txt").unwrap(), fs.open("hello.txt").unwrap());
-    assert_eq!(fs.remove_file("hello.txt").err(), Some(Error::Busy));
-    drop(first);
-    assert_eq!(fs.remove_file("hello.txt").err(), Some(Error::Busy));
-    drop(second);
-    fs.remove_file("hello.txt").unwrap();
-    drop(fs);
-    let saved = dir.join("written.img");
-    image.save(&saved);
-    fsck(&saved).unwrap();
+    // Removed while it's open twice: gone by name, there to both.
+    let big = fs.metadata("big.bin").unwrap().inode;
+    let (reader, writer) = (fs.open("big.bin").unwrap(), fs.open_writable("big.bin").unwrap());
+    fs.remove_file("big.bin").unwrap();
+    assert_eq!(fs.metadata("big.bin").err(), Some(Error::NotFound));
+    write_all(&writer, 0, b"still here");
+    let mut start = [0; 10];
+    assert_eq!(reader.read_at(0, &mut start), Ok(10));
+    assert_eq!(&start, b"still here");
+    // The name that keeps it can't go while it's open; it goes as the last
+    // of it closes, and the file with it.
+    let kept = format!("lost+found/.open-{big}");
+    assert_eq!(fs.remove_file(&kept).err(), Some(Error::Busy));
+    drop(reader);
+    assert!(fs.metadata(&kept).is_ok());
+    drop(writer);
+    assert_eq!(fs.metadata(&kept).err(), Some(Error::NotFound));
+    // Replaced while open: the old file to whoever has it, the new one by
+    // name.
+    let old = fs.open("hello.txt").unwrap();
+    let hello = fs.metadata("hello.txt").unwrap().inode;
+    write_all(&fs.create("new").unwrap(), 0, b"new\n");
+    fs.rename("new", "hello.txt").unwrap();
+    assert_eq!(read_all(&fs, "hello.txt"), b"new\n");
+    let mut was = [0; 16];
+    assert_eq!(old.read_at(0, &mut was), Ok(16));
+    assert_eq!(&was, b"hello from ext4\n");
+    // The power going while it's still open: the next mount takes it out.
+    // Either way, e2fsck finds no file without a name.
+    let cut = Image::new(image.bytes());
+    let before = dir.join("before.img");
+    cut.save(&before);
+    assert_eq!(debugfs_ls(&before, "lost+found"), [format!(".open-{hello}")]);
+    drop(Ext4::mount_writable(Box::new(cut.clone())).unwrap());
+    drop((old, fs));
+
+    for (name, image) in [("closed", image), ("cut", cut)] {
+        let saved = dir.join(format!("{name}.img"));
+        image.save(&saved);
+        fsck(&saved).unwrap_or_else(|errors| panic!("{name}: {errors}"));
+        assert_eq!(debugfs_ls(&saved, "lost+found"), [] as [&str; 0], "{name}");
+        assert_eq!(debugfs(&saved, "cat hello.txt"), b"new\n", "{name}");
+    }
 }
 
 #[test]
@@ -367,11 +400,7 @@ fn replaces_and_removes_only_what_it_may() {
     make_tree(&root);
     let image = image(&dir, &root, &["-t", "ext4"], "64M");
     let fs = Ext4::mount_writable(Box::new(image.clone())).unwrap();
-    // Not while it's open: lwext4 would free it under whoever has it.
-    let open = fs.open("hello.txt").unwrap();
     write_all(&fs.create("new").unwrap(), 0, b"new\n");
-    assert_eq!(fs.rename("new", "hello.txt").err(), Some(Error::Busy));
-    drop(open);
     fs.rename("new", "hello.txt").unwrap();
     // Onto itself: nothing happens.
     fs.rename("hello.txt", "hello.txt").unwrap();

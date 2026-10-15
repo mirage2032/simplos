@@ -215,9 +215,12 @@ fn a_program_s_files_close_as_it_ends() {
     let elf = simplos::ramdisk().expect("tools/boot-test attaches user/probe");
     let process = process::spawn(elf, &["probe", "hold", "/held.txt"], |_| {}).unwrap();
     assert_eq!(process.wait(), 0);
-    // Busy if the program's file were still open.
-    ROOT.lock().as_ref().unwrap().remove_file("held.txt").unwrap();
-    drop(process);
+    // Kept in lost+found if the program's file were still open.
+    let root = ROOT.lock();
+    let fs = root.as_ref().unwrap();
+    fs.remove_file("held.txt").unwrap();
+    assert!(fs.read_dir("lost+found").unwrap().is_empty());
+    drop((root, process));
 }
 
 #[test_case]
@@ -436,4 +439,14 @@ fn a_program_changes_a_file_s_permissions_owner_times_and_length() {
     // moves on and leaves the file's own where it was, at its end.
     let expected = r#"true 600 [1000, 100, 7] 640 [1000, 2000] [1000, 3000] true true "x123" [120, 49, 50, 51, 0, 0] 0 2 -22 [0, -13, 0, 0, -30, -2, -22] 16 4 10 0 "hello from ext4\nfrom""#;
     assert_eq!(run(&["attributes"]), ok(&(String::from(expected) + "\n")));
+}
+
+#[test_case]
+fn a_file_removed_or_replaced_while_open_stays_until_closed() {
+    // As zsh does a here-document: written, opened, removed, read. And one
+    // renamed over while open still reads as it was to whoever has it.
+    // Closed as the program ends, they're gone, from lost+found too.
+    assert_eq!(run(&["unlinked"]), ok("true \"here\\n\" \"old\\n\" \"new\\n\"\n"));
+    let root = ROOT.lock();
+    assert!(root.as_ref().unwrap().read_dir("lost+found").unwrap().is_empty());
 }

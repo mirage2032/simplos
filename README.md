@@ -128,7 +128,11 @@ changed. `access`, `faccessat` and `faccessat2` answer as for root, who may
 read and write anything but where nothing can be written (`EROFS`), and run
 what anyone may. `sendfile` copies from one descriptor to another. For now:
 
-- a file that's open can't be removed or renamed over (`EBUSY`);
+- a file removed or renamed over while it's open stays until it's closed, as
+  on Linux, but in `/lost+found`, as `.open-` and its inode, where Linux
+  keeps it on ext4's orphan list, which lwext4 doesn't know; the disk's next
+  mount takes out any the power went before closing. And a directory that's
+  open can't be removed (`EBUSY`);
 - `/dev` holds just those three, and can't be written;
 - times are kept to the second, as lwext4 sets none of ext4's nanoseconds;
   reading doesn't set when a file was read, as if mounted `noatime`; and a
@@ -415,10 +419,10 @@ opened for reading, quietly mount read-only what it can't write, and crash
 unmounting after a failed mount.
 
 What it still can't do: rename a directory onto an empty one in one
-transaction (it's two), remove a file over 16 MiB in one transaction, remove
-or replace a file that's open (refused, where Linux removes the name and
-keeps the file until it's closed), or leave a hole in a file (writing past
-the end fills the gap with zeros). A new file's permissions and times are
+transaction (it's two), remove a file over 16 MiB in one transaction, keep a
+file that's open once its last name is gone (it would free it under whoever
+has it open: `fs/ext4` gives it another name first), or leave a hole in a
+file (writing past the end fills the gap with zeros). A new file's permissions and times are
 set just after it's made, in a transaction of their own. Every change is on the device before the call
 returns, in the journal if there is one, which is simple and slow.
 

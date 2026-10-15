@@ -201,6 +201,9 @@ struct Mount {
     /// The inodes of the files and directories open on it, once for each
     /// time one's open.
     open: Mutex<Vec<u32>>,
+    /// The inodes of the open files `Ext4::keep` keeps, whose other names
+    /// are gone.
+    kept: Mutex<Vec<u32>>,
 }
 
 // Safety: lwext4's state is only touched with `LWEXT4` held.
@@ -217,7 +220,15 @@ impl Ext4 {
     /// Mount the file system on `device` to read and write, first applying
     /// whatever its journal holds.
     pub fn mount_writable(device: Box<dyn BlockDevice>) -> Result<Ext4, Error> {
-        Ext4::mount_as(device, true)
+        let fs = Ext4::mount_as(device, true)?;
+        // What `keep` kept as the power went, its files closed by it. One
+        // that won't go only takes space.
+        for entry in fs.read_dir(KEPT_IN).unwrap_or_default() {
+            if entry.name.starts_with(KEPT_AS) && entry.kind == Kind::File {
+                let _ = fs.remove_file(&format!("{KEPT_IN}/{}", entry.name));
+            }
+        }
+        Ok(fs)
     }
 
     fn mount_as(device: Box<dyn BlockDevice>, writable: bool) -> Result<Ext4, Error> {
@@ -241,6 +252,7 @@ impl Ext4 {
             journaling: false,
             _ours: ours,
             open: Mutex::new(Vec::new()),
+            kept: Mutex::new(Vec::new()),
         };
         // The slot stays taken until `mount`'s `Drop` has undone whatever
         // `attach` managed, if it fails: that takes the lock, so it runs
@@ -403,11 +415,8 @@ impl Ext4 {
         self.mount.change(inode, changes)
     }
 
-    /// Remove the file at `path`, unless it's open.
-    ///
-    /// shortcut: Linux removes the name of an open file and keeps the file
-    /// until it's closed; lwext4 would free it at once, under whoever has it
-    /// open, so it's refused. Doing it Linux's way needs the orphan list.
+    /// Remove the file at `path`. One that's open stays until it's closed,
+    /// as on Linux: see `keep`.
     pub fn remove_file(&self, path: &str) -> Result<(), Error> {
         let metadata = self.metadata(path)?;
         // lwext4 says nothing to a directory, and leaves it.
@@ -416,11 +425,35 @@ impl Ext4 {
         }
         let path = self.path(path)?;
         let _lwext4 = LWEXT4.lock();
-        if self.mount.open.lock().contains(&metadata.inode) {
-            return Err(Error::Busy);
-        }
+        self.keep(&path, &metadata)?;
         // Safety: as in `metadata`.
         check(unsafe { ffi::ext4_fremove(path.as_ptr()) })
+    }
+
+    /// Before the file at `at`, lwext4's path, loses its last name: if it's
+    /// open, give it another, which `File`'s `drop` takes away as the last
+    /// of it closes. lwext4 would free it at once, under whoever has it
+    /// open. Busy if that other name is the one going, or can't be given;
+    /// `LWEXT4` is held.
+    ///
+    /// shortcut: Linux keeps such a file on ext4's orphan list, which lwext4
+    /// knows nothing of; here it's in /lost+found as `.open-` and its inode
+    /// while open, and taken out as the disk is next mounted if the power
+    /// went first. Upgrade if anything minds it there.
+    fn keep(&self, at: &CStr, metadata: &Metadata) -> Result<(), Error> {
+        let open = self.mount.open.lock();
+        let mut kept = self.mount.kept.lock();
+        if metadata.links > 1 || !open.contains(&metadata.inode) {
+            return Ok(());
+        }
+        if kept.contains(&metadata.inode) {
+            return Err(Error::Busy);
+        }
+        let keeper = self.mount.keeper(metadata.inode);
+        // Safety: as in `rename`.
+        check(unsafe { ffi::ext4_flink(at.as_ptr(), keeper.as_ptr()) }).map_err(|_| Error::Busy)?;
+        kept.push(metadata.inode);
+        Ok(())
     }
 
     /// Remove the directory at `path`, which must be empty and not open.
@@ -451,8 +484,7 @@ impl Ext4 {
     /// empty directory, when a directory replaces it, just before.
     ///
     /// shortcut: a directory replacing one isn't one transaction, so a crash
-    /// in between leaves neither at `to`; Linux has nothing of the kind. And
-    /// what's replaced can't be open, as with `remove_file`.
+    /// in between leaves neither at `to`; Linux has nothing of the kind.
     pub fn rename(&self, from: &str, to: &str) -> Result<(), Error> {
         let (from, to) = (from.trim_matches('/'), to.trim_matches('/'));
         // The root stays where it is.
@@ -476,14 +508,14 @@ impl Ext4 {
                 }
                 (Kind::Directory, _) => return Err(Error::NotADirectory),
                 (_, Kind::Directory) => return Err(Error::IsADirectory),
-                _ => Some(target.inode),
+                _ => Some(target),
             },
         };
         self.check_parent(to)?;
         let (from, to) = (self.path(from)?, self.path(to)?);
         let _lwext4 = LWEXT4.lock();
-        if replaced.is_some_and(|inode| self.mount.open.lock().contains(&inode)) {
-            return Err(Error::Busy);
+        if let Some(replaced) = replaced {
+            self.keep(&to, &replaced)?;
         }
         // Safety: as in `metadata`.
         check(unsafe { ffi::ext4_frename(from.as_ptr(), to.as_ptr()) })
@@ -559,12 +591,23 @@ impl Ext4 {
 }
 
 // open(2)'s flags, which lwext4 takes too.
+/// Where `Ext4::keep` keeps open files whose names are gone, and what it
+/// names them, before their inodes.
+const KEPT_IN: &str = "lost+found";
+const KEPT_AS: &str = ".open-";
+
 const O_RDONLY: c_int = 0o0;
 const O_RDWR: c_int = 0o2;
 const O_CREAT: c_int = 0o100;
 const O_TRUNC: c_int = 0o1000;
 
 impl Mount {
+    /// lwext4's path for the name `Ext4::keep` gives inode `inode`.
+    fn keeper(&self, inode: u32) -> CString {
+        let mount_point = self.mount_point.to_str().unwrap();
+        CString::new(format!("{mount_point}{KEPT_IN}/{KEPT_AS}{inode}")).unwrap()
+    }
+
     /// Register the device with lwext4 and mount it; `LWEXT4` is held.
     fn attach(&mut self) -> Result<(), Error> {
         let mount_point = self.mount_point.as_ptr();
@@ -834,6 +877,15 @@ impl Drop for File {
         let mut open = self.mount.open.lock();
         let at = open.iter().position(|inode| *inode == self.inode).expect("it was opened");
         open.swap_remove(at);
+        let mut kept = self.mount.kept.lock();
+        if !open.contains(&self.inode)
+            && let Some(at) = kept.iter().position(|inode| *inode == self.inode)
+        {
+            kept.swap_remove(at);
+            // The last of a file whose other names are gone: it goes too.
+            // Safety: as in `Ext4::metadata`.
+            unsafe { ffi::ext4_fremove(self.mount.keeper(self.inode).as_ptr()) };
+        }
     }
 }
 
