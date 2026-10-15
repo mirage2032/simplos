@@ -30,7 +30,7 @@ use x86_64::VirtAddr;
 use x86_64::instructions::interrupts;
 use x86_64::registers::model_specific::{Efer, EferFlags, LStar, SFMask, Star};
 use x86_64::registers::rflags::RFlags;
-use x86_64::structures::paging::PageTableFlags;
+use x86_64::structures::paging::{Page, PageTableFlags};
 
 /// What Linux's `strerror` says of the errnos that starting a program can
 /// end in, for the kernel to tell whoever's at the console.
@@ -251,6 +251,7 @@ fn call(frame: &Frame) -> i64 {
             thread::yield_now();
             0
         }
+        25 => mremap(&process, a0, a1, a2, a3, a4),
         32 => files::dup(&process, a0),
         33 => files::dup3(&process, a0, a1, 0, true),
         34 => signals::pause(&process),
@@ -522,6 +523,8 @@ fn mmap(process: &Process, addr: u64, len: u64, prot: u64, flags: u64) -> i64 {
     let Some((start, end)) = user_range(start, len) else { return -EINVAL };
     // What was there goes, as MAP_FIXED says; a fresh range has nothing.
     memory.space.unmap(pages(start, end));
+    // Nor will what's handed out after: past what MAP_FIXED maps.
+    claim(&mut memory, start, end);
     // PROT_NONE: reserved, and left unmapped so any access faults.
     if prot != 0 && memory.space.map(pages(start, end), page_flags(prot)).is_none() {
         // What memory there was goes back: the program, told it got none,
@@ -530,6 +533,97 @@ fn mmap(process: &Process, addr: u64, len: u64, prot: u64, flags: u64) -> i64 {
         return -ENOMEM;
     }
     start as i64
+}
+
+/// Hand nothing out from `mmap_next` that `start..end` now maps: so all
+/// that's mapped among what `mmap` hands out is below `mmap_next`.
+fn claim(memory: &mut process::Memory, start: u64, end: u64) {
+    if start < MMAP_END && end > memory.mmap_next {
+        memory.mmap_next = end.min(MMAP_END);
+    }
+}
+
+/// Make the mapping of `old_len` bytes at `old` `new_len` long: shorter
+/// where it is; longer where it is if nothing's mapped after it, its new
+/// pages zeroed as `mmap`'s; or else, with MREMAP_MAYMOVE, where there's
+/// room, its pages taken there rather than copied, as musl's `realloc`
+/// asks for of big blocks; or with MREMAP_FIXED too, to `new_addr`, what
+/// was there going first. Where it is now.
+///
+/// shortcut: no MREMAP_DONTUNMAP; all of it must be mapped, so a part that
+/// is PROT_NONE, which here is unmapped, is EFAULT; and it grows where it
+/// is only if it's the last `mmap` handed out, where Linux grows into any
+/// gap, so without MREMAP_MAYMOVE it's ENOMEM more often.
+fn mremap(process: &Process, old: u64, old_len: u64, new_len: u64, flags: u64, to: u64) -> i64 {
+    const MREMAP_MAYMOVE: u64 = 1;
+    const MREMAP_FIXED: u64 = 2;
+    let (may_move, fixed) = (flags & MREMAP_MAYMOVE != 0, flags & MREMAP_FIXED != 0);
+    if flags & !(MREMAP_MAYMOVE | MREMAP_FIXED) != 0 || fixed && !may_move {
+        return -EINVAL;
+    }
+    let Some((old, old_end)) = user_range(old, old_len) else { return -EINVAL };
+    let Some(new_len) = new_len.checked_next_multiple_of(4096).filter(|&len| len > 0) else {
+        return -EINVAL;
+    };
+    let mut memory = process.memory.lock();
+    // What its new pages are mapped with: what its first is.
+    let Some(prot) = memory.space.flags(page(old)) else { return -EFAULT };
+    let prot = prot & (PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE);
+    if pages(old, old_end).any(|page| memory.space.flags(page).is_none()) {
+        return -EFAULT;
+    }
+    let old_len = old_end - old;
+    let to = if fixed {
+        let Some((to, to_end)) = user_range(to, new_len) else { return -EINVAL };
+        if to < old_end && old < to_end {
+            return -EINVAL;
+        }
+        memory.space.unmap(pages(to, to_end));
+        claim(&mut memory, to, to_end);
+        to
+    } else if new_len <= old_len {
+        memory.space.unmap(pages(old + new_len, old_end));
+        return old as i64;
+    } else if old_end == memory.mmap_next {
+        // Where it is: nothing's mapped after the last handed out.
+        let Some(end) = old.checked_add(new_len).filter(|&end| end <= MMAP_END) else {
+            return -ENOMEM;
+        };
+        if memory.space.map(pages(old_end, end), prot).is_none() {
+            memory.space.unmap(pages(old_end, end));
+            return -ENOMEM;
+        }
+        memory.mmap_next = end;
+        return old as i64;
+    } else if !may_move {
+        return -ENOMEM;
+    } else {
+        let to = memory.mmap_next;
+        match to.checked_add(new_len).filter(|&end| end <= MMAP_END) {
+            Some(end) => memory.mmap_next = end,
+            None => return -ENOMEM,
+        }
+        to
+    };
+    // Its pages taken along, but for those past `new_len`, and new ones
+    // after them, if it's grown.
+    let taken = old_len.min(new_len);
+    let new = pages(to + taken, to + new_len);
+    if new_len > taken && memory.space.map(new, prot).is_none() {
+        memory.space.unmap(new);
+        return -ENOMEM;
+    }
+    if memory.space.move_pages(page(old), page(to), taken / 4096).is_none() {
+        memory.space.unmap(new);
+        return -ENOMEM;
+    }
+    memory.space.unmap(pages(old + taken, old_end));
+    to as i64
+}
+
+/// The page at `addr`, an address in the program's half.
+fn page(addr: u64) -> Page {
+    Page::containing_address(VirtAddr::new(addr))
 }
 
 fn mprotect(process: &Process, addr: u64, len: u64, prot: u64) -> i64 {

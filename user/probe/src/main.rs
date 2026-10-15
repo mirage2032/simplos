@@ -75,7 +75,92 @@ fn main() {
             let refused = syscall(12, heap as usize + (1 << 30), 0, 0) == heap;
             let kept_by_brk = rss() - before;
             let megabyte = syscall5(9, [0, 1 << 20, 3, 0x22, 0]) > 0;
-            println!("{edges:?} {mapped} {kept} {refused} {kept_by_brk} {megabyte}");
+            // A page MAP_FIXED maps just where mmap would map next, which it
+            // then doesn't.
+            let below = syscall5(9, [0, 4096, 3, 0x22, 0]) as usize;
+            let fixed = syscall5(9, [below + 4096, 4096, 3, 0x32, 0]);
+            let claimed = syscall5(9, [0, 4096, 3, 0x22, 0]) != fixed;
+            println!("{edges:?} {mapped} {kept} {refused} {kept_by_brk} {megabyte} {claimed}");
+        }
+        // mremap, in a window of its own: a mapping that can't grow where
+        // it is, as something's right after it, unless it may move, and
+        // then moved, what was in it taken along, its new pages zeros and
+        // none left behind; shrunk where it is; moved where asked, longer
+        // and then shorter; then what it refuses, a part not mapped among
+        // it; all of it given back; one grown where it is, as
+        // nothing's after it, which only simplos promises; and realloc,
+        // which asks it to grow big blocks.
+        Some("mremap") => {
+            const PAGE: usize = 4096;
+            const MAYMOVE: usize = 1;
+            const FIXED: usize = 2;
+            let mmap = |at: usize, len: usize, prot: usize, flags: usize| {
+                syscall5(9, [at, len, prot, flags, 0]) as usize
+            };
+            let mremap =
+                |old, old_len, new_len, flags, to| syscall5(25, [old, old_len, new_len, flags, to]);
+            // Whether the byte at `at` can be read: as write(2) to a pipe,
+            // which copies it, says.
+            let (_reader, writer) = or_fail("pipe", io::pipe());
+            let readable = |at: usize| syscall(1, writer.as_raw_fd() as usize, at, 1) == 1;
+            // Safety: only ever of pages just mapped.
+            let holds = |at: usize, len: usize, byte: u8| {
+                let bytes = unsafe { std::slice::from_raw_parts(at as *const u8, len) };
+                bytes.iter().all(|&b| b == byte)
+            };
+            let before = rss();
+            let window = mmap(0, 64 * PAGE, 0, 0x22);
+            let first = mmap(window, 2 * PAGE, 3, 0x32);
+            // Safety: the two pages just mapped.
+            unsafe { std::ptr::write_bytes(first as *mut u8, 7, 2 * PAGE) };
+            let after = mmap(window + 4 * PAGE, PAGE, 3, 0x32);
+            let stuck = mremap(first, 2 * PAGE, 4 * PAGE, 0, 0);
+            let moved = mremap(first, 2 * PAGE, 8 * PAGE, MAYMOVE, 0) as usize;
+            let taken = moved != first
+                && holds(moved, 2 * PAGE, 7)
+                && holds(moved + 2 * PAGE, 6 * PAGE, 0)
+                && !readable(first)
+                && readable(after);
+            let shrunk = mremap(moved, 8 * PAGE, PAGE, 0, 0) as usize == moved
+                && readable(moved)
+                && !readable(moved + PAGE);
+            let there = window + 16 * PAGE;
+            let fixed = mremap(moved, PAGE, 2 * PAGE, MAYMOVE | FIXED, there) as usize == there
+                && holds(there, PAGE, 7)
+                && holds(there + PAGE, PAGE, 0)
+                && !readable(moved);
+            // And there, made shorter, which leaves nothing where it was.
+            let elsewhere = window + 24 * PAGE;
+            let fixed = fixed
+                && mremap(there, 2 * PAGE, PAGE, MAYMOVE | FIXED, elsewhere) as usize == elsewhere
+                && holds(elsewhere, PAGE, 7)
+                && !readable(there)
+                && !readable(there + PAGE);
+            let one = mmap(0, PAGE, 3, 0x22);
+            let refused = [
+                mremap(one + 1, PAGE, 2 * PAGE, MAYMOVE, 0),
+                mremap(one, PAGE, PAGE, FIXED, window + 32 * PAGE),
+                mremap(one, PAGE, PAGE, 8, 0),
+                mremap(one, 0, PAGE, MAYMOVE, 0),
+                mremap(one, PAGE, 0, MAYMOVE, 0),
+                mremap(moved, PAGE, 2 * PAGE, MAYMOVE, 0),
+                mremap(one, 2 * PAGE, 3 * PAGE, MAYMOVE, 0),
+                mremap(one, PAGE, 2 * PAGE, MAYMOVE | FIXED, one),
+                mremap(one, PAGE, PAGE, MAYMOVE | FIXED, 0x7FFF_FFFF_F000),
+            ];
+            syscall(11, window, 64 * PAGE, 0);
+            syscall(11, one, PAGE, 0);
+            let back = rss() - before;
+            let last = mmap(0, PAGE, 3, 0x22);
+            let in_place = mremap(last, PAGE, 2 * PAGE, 0, 0) as usize == last;
+            syscall(11, last, if in_place { 2 * PAGE } else { PAGE }, 0);
+            let mut big = vec![5u8; 2 << 20];
+            big.resize(16 << 20, 6);
+            let reallocated =
+                big[..2 << 20].iter().all(|&b| b == 5) && big[2 << 20..].iter().all(|&b| b == 6);
+            println!(
+                "{stuck} {taken} {shrunk} {fixed} {refused:?} {back} {in_place} {reallocated}"
+            );
         }
         Some("exit") => std::process::exit(arg(2).parse().unwrap_or(0)),
         Some("mkdir") => or_fail(&arg(2), fs::create_dir(arg(2))),
@@ -1595,7 +1680,8 @@ fn syscall(nr: isize, a0: usize, a1: usize, a2: usize) -> isize {
     syscall5(nr, [a0, a1, a2, 0, 0])
 }
 
-/// The same, with up to five arguments.
+/// The same, with up to five arguments, and a sixth of 0: mmap's offset,
+/// which Linux refuses if it isn't a page's.
 fn syscall5(nr: isize, [a0, a1, a2, a3, a4]: [usize; 5]) -> isize {
     let result;
     // Safety: whatever a call is pointed at outlives it, and the compiler
@@ -1609,6 +1695,7 @@ fn syscall5(nr: isize, [a0, a1, a2, a3, a4]: [usize; 5]) -> isize {
             in("rdx") a2,
             in("r10") a3,
             in("r8") a4,
+            in("r9") 0,
             out("rcx") _,
             out("r11") _,
             options(nostack),

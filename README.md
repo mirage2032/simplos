@@ -183,8 +183,11 @@ gives it the one CPU; `sysinfo` how long it's been up, how much memory there
 is and is free, and how many processes; it runs as root (`getuid` and the
 like say 0), in no other groups (`getgroups`); `getpriority` and
 `setpriority` keep how nice it is; and `getrlimit`, `setrlimit` and
-`prlimit64` keep its limits, which its copies inherit. `readv` and `writev` move several buffers in one call, as musl's
-`printf` and the like do. For now:
+`prlimit64` keep its limits, which its copies inherit. `readv` and
+`writev` move several buffers in one call, as musl's `printf` and the like
+do. `mremap` makes what `mmap` mapped longer or shorter, or moves it,
+taking its pages along rather than copying them, as musl's `realloc` asks
+of big blocks. For now:
 
 - every id is 0, and can't be set to another, as there are no other users;
   what `setgroups` sets is forgotten;
@@ -199,7 +202,11 @@ like say 0), in no other groups (`getgroups`); `getpriority` and
   parent back;
 - a program that ended keeps its memory until it's waited for, and those
   never waited for go with their parent rather than to an init;
-- `execve` takes ELF programs of up to 4 MiB, which it reads whole.
+- `execve` takes ELF programs of up to 4 MiB, which it reads whole;
+- `mremap` grows a mapping where it is only if it's the last `mmap`
+  handed out, where Linux grows into any room after it, and moves it
+  otherwise; it takes no part that's `PROT_NONE`, and has no
+  `MREMAP_DONTUNMAP`.
 
 ## Terminal
 
