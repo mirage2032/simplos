@@ -135,8 +135,8 @@ pub struct Metadata {
     pub size: u64,
     /// Space it takes, in 512-byte units, as `stat` counts it.
     pub blocks: u64,
-    /// Seconds since 1970. lwext4 sets none of these: they're what Linux
-    /// last set, or 0.
+    /// Seconds since 1970, by the clock `set_clock` gave, or by whatever
+    /// set them last; 0 for never.
     pub accessed: u32,
     pub modified: u32,
     pub changed: u32,
