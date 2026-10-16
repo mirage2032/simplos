@@ -123,8 +123,9 @@ the same frames, so every program running uutils' coreutils, or linked to
 `libc.so`, has one copy of it between them. What's written goes to the file
 as it's written, and into whatever of it is kept: ext4 tells the cache of
 every change to a file, whoever makes it (`Ext4::watch`). It keeps up to
-128 MiB, gives back the pages no program maps, those used longest ago
-first, as free memory runs low, and all of them when it runs out; and
+256 MiB, or more of what programs map, gives back the pages no program
+maps, those used longest ago first, as free memory runs low, and all of
+them when it runs out; and
 `/proc/meminfo` counts them as `Cached`. Under emulation, ten runs of
 uutils' 14 MB `coreutils true` took 10 s before it and take 1 s; a second
 `gcc -O2` of a hello world, 10 s before and 0.7 s now. For now:
