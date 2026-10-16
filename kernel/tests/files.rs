@@ -313,8 +313,15 @@ fn mmap_maps_files() {
     // What Linux says, from the same program: from a page on, with zeros
     // past the end; MAP_SHARED read-only; a private copy written, which
     // leaves the file as it was; and EINVAL, EBADF, ENODEV, EACCES and
-    // EACCES.
-    assert_eq!(run(&["file-mmap", "/mapped.bin"]), ok("true true true [-22, -9, -19, -13, -13]\n"));
+    // EACCES. Then mprotect making a MAP_SHARED page of a file open to be
+    // written writable: EACCES, where Linux writes what's written there to
+    // the file, which nothing here would; and again once it's been made
+    // read-only.
+    let refused = "[-22, -9, -19, -13, -13, -13, -13]";
+    assert_eq!(
+        run(&["file-mmap", "/mapped.bin"]),
+        ok(&alloc::format!("true true true {refused}\n"))
+    );
     ROOT.lock().as_ref().unwrap().remove_file("mapped.bin").unwrap();
 }
 

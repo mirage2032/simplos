@@ -250,12 +250,17 @@ fn main() {
             let private = bytes(copy, 1) == [0xff] && or_fail(&path, fs::read(&path)) == contents;
             let (reader, _writer) = or_fail("pipe", io::pipe());
             let writing = or_fail(&path, OpenOptions::new().write(true).open(&path));
+            let both = or_fail(&path, OpenOptions::new().read(true).write(true).open(&path));
+            let shared_read = mmap(4096, 1, 1, both.as_raw_fd() as usize, 0) as usize;
             let refused = [
                 mmap(4096, 1, 2, fd, 100),
                 mmap(4096, 1, 2, 1000, 0),
                 mmap(4096, 1, 2, reader.as_raw_fd() as usize, 0),
                 mmap(4096, 1, 2, writing.as_raw_fd() as usize, 0),
                 mmap(4096, 3, 1, fd, 0),
+                // mprotect, PROT_READ | PROT_WRITE; again after PROT_READ.
+                syscall(10, shared_read, 4096, 3),
+                syscall(10, shared_read, 4096, 1).min(syscall(10, shared_read, 4096, 3)),
             ];
             println!("{mapped} {shared} {private} {refused:?}");
         }

@@ -19,7 +19,7 @@ pub use system::{DEFAULT_LIMITS, LIMITS, RELEASE};
 use crate::fs::Handle;
 use crate::io::interrupts::gdt;
 use crate::io::interrupts::pit::TIMER_HZ;
-use crate::memory::USER_END;
+use crate::memory::{FILE_SHARED, USER_END};
 use crate::process::{self, LOWEST, MMAP_END, MMAP_START, Process, Registers, Task, pages};
 use crate::signal::{self, ERESTARTNOHAND, Syscall};
 use crate::{serial_println, thread};
@@ -665,12 +665,14 @@ fn user_range(start: u64, len: u64) -> Option<(u64, u64)> {
 }
 
 /// Memory for the program: zeros, anonymous; or from `offset` on in the file
-/// `fd` is open on, as MAP_PRIVATE maps it, a copy of the program's own.
+/// `fd` is open on. Read-only, private or shared, that's the page cache's
+/// own pages, so what's written to the file then shows, as on Linux;
+/// writable and private, a copy of the program's own.
 ///
-/// shortcut: a file is read into memory as it's mapped, rather than as it's
-/// used, and nothing written to it after shows through. MAP_SHARED is taken
-/// as MAP_PRIVATE when the mapping can't be written, as nothing could tell,
-/// and refused (ENODEV) when it can be; and no MAP_SHARED anonymous memory.
+/// shortcut: a file is read in whole as it's mapped, rather than as it's
+/// used. MAP_SHARED is refused (ENODEV) when it's writable, and can't be
+/// made writable later (`mprotect`), as nothing would write it to the file;
+/// and there's no MAP_SHARED anonymous memory.
 fn mmap(
     process: &Process,
     addr: u64,
@@ -736,7 +738,11 @@ fn mmap(
         && prot & PROT_WRITE == 0
     {
         drop(memory);
-        if let Err(errno) = map_file(process, handle, offset, start, len, page_flags(prot)) {
+        let flags = match shared {
+            true => page_flags(prot) | FILE_SHARED,
+            false => page_flags(prot),
+        };
+        if let Err(errno) = map_file(process, handle, offset, start, len, flags) {
             process.memory.lock().space.unmap(pages(start, end));
             return -errno;
         }
@@ -946,10 +952,19 @@ fn page(addr: u64) -> Page {
 /// does with a thread's stack, and its guard page kept out of reach.
 ///
 /// shortcut: a page nothing reserved is mapped as well, where Linux says
-/// ENOMEM; keep track of what's reserved when something needs telling.
+/// ENOMEM; keep track of what's reserved when something needs telling. And
+/// a file's page mapped MAP_SHARED isn't made writable (EACCES), where Linux
+/// would write what's written there to the file.
 fn mprotect(process: &Process, addr: u64, len: u64, prot: u64) -> i64 {
+    const EACCES: i64 = 13;
     let Some((start, end)) = user_range(addr, len) else { return -EINVAL };
     let mut memory = process.memory.lock();
+    let shared = |flags: PageTableFlags| flags.contains(FILE_SHARED);
+    if prot & PROT_WRITE != 0
+        && pages(start, end).any(|page| memory.space.flags(page).is_some_and(shared))
+    {
+        return -EACCES;
+    }
     if prot == 0 {
         memory.space.hide(pages(start, end));
         return 0;

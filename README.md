@@ -123,9 +123,10 @@ the same frames, so every program running uutils' coreutils, or linked to
 `libc.so`, has one copy of it between them. What's written goes to the file
 as it's written, and into whatever of it is kept: ext4 tells the cache of
 every change to a file, whoever makes it (`Ext4::watch`). It keeps up to
-256 MiB, or more of what programs map, gives back the pages no program
-maps, those used longest ago first, as free memory runs low, and all of
-them when it runs out; and
+256 MiB: past that, the pages used longest ago go, those programs map
+staying theirs. It gives back the pages no program maps, those used
+longest ago first, as free memory runs low, and all of them when it runs
+out; and
 `/proc/meminfo` counts them as `Cached`. Under emulation, ten runs of
 uutils' 14 MB `coreutils true` took 10 s before it and take 1 s; a second
 `gcc -O2` of a hello world, 10 s before and 0.7 s now. For now:
@@ -186,6 +187,10 @@ read and write anything but where nothing can be written (`EROFS`), and run
 what anyone may. `sendfile` copies from one descriptor to another, and
 `splice` into a pipe or out of one, as uutils' `cat` copies. For now:
 
+- pipes hold their data on the kernel's heap, so all of them together hold
+  at most a quarter of it, but for the first 4 KiB of each: past that, a
+  pipe counts as full sooner than its 64 KiB, where Linux takes the room
+  from all of memory;
 - a file removed or renamed over while it's open stays until it's closed, as
   on Linux, but in `/lost+found`, as `.open-` and its inode, where Linux
   keeps it on ext4's orphan list, which lwext4 doesn't know; the disk's next
@@ -293,7 +298,9 @@ its hash maps' keys, and `/dev/random` and `/dev/urandom` give random bytes
   CPU hasn't, and otherwise from the timestamp counter, stirred, which is
   guessable;
 - `mprotect` gives the program memory nothing reserved too, where Linux
-  says `ENOMEM`;
+  says `ENOMEM`; and won't make a file's page mapped `MAP_SHARED` writable
+  (`EACCES`), where Linux writes what's written there to the file, which
+  nothing here would;
 - `mremap` grows a mapping where it is only if it's the last `mmap`
   handed out, where Linux grows into any room after it, and moves it
   otherwise; it takes no part that's `PROT_NONE`, and has no

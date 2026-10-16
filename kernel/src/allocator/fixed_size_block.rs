@@ -24,8 +24,17 @@ struct ListNode {
     next: Option<&'static mut ListNode>,
 }
 
+/// How many freed blocks of each size are kept for the next of that size:
+/// the rest go back to the fallback heap, which joins them up with what's
+/// free beside them, for an allocation of any size. Kept, a burst of small
+/// ones, as the page cache's index makes, would be good for nothing else
+/// ever after.
+const KEPT: usize = 64;
+
 pub struct FixedSizeBlockAllocator {
     list_heads: [Option<&'static mut ListNode>; BLOCK_SIZES.len()],
+    /// How many blocks each list holds.
+    lengths: [usize; BLOCK_SIZES.len()],
     fallback_allocator: linked_list_allocator::Heap,
 }
 
@@ -34,8 +43,14 @@ impl FixedSizeBlockAllocator {
     pub const fn new() -> Self {
         FixedSizeBlockAllocator {
             list_heads: [const { None }; BLOCK_SIZES.len()],
+            lengths: [0; BLOCK_SIZES.len()],
             fallback_allocator: linked_list_allocator::Heap::empty(),
         }
+    }
+
+    /// What the fallback heap has free, besides the blocks the lists keep.
+    pub fn free(&self) -> usize {
+        self.fallback_allocator.free()
     }
 
     /// Initialize the allocator with the given heap bounds.
@@ -73,6 +88,7 @@ unsafe impl GlobalAlloc for Locked<FixedSizeBlockAllocator> {
                     match allocator.list_heads[index].take() {
                         Some(node) => {
                             allocator.list_heads[index] = node.next.take();
+                            allocator.lengths[index] -= 1;
                             node as *mut ListNode as *mut u8
                         }
                         None => {
@@ -94,7 +110,17 @@ unsafe impl GlobalAlloc for Locked<FixedSizeBlockAllocator> {
         without_interrupts(|| {
             let mut allocator = self.lock();
             match list_index(&layout) {
+                // As it was allocated, by the fallback heap.
+                Some(index) if allocator.lengths[index] == KEPT => {
+                    let size = BLOCK_SIZES[index];
+                    let layout = Layout::from_size_align(size, size).unwrap();
+                    // Safety: a block of this size the fallback handed out.
+                    unsafe {
+                        allocator.fallback_allocator.deallocate(NonNull::new(ptr).unwrap(), layout)
+                    };
+                }
                 Some(index) => {
+                    allocator.lengths[index] += 1;
                     let new_node = ListNode { next: allocator.list_heads[index].take() };
                     // verify that block has size and alignment required for storing node
                     assert!(mem::size_of::<ListNode>() <= BLOCK_SIZES[index]);

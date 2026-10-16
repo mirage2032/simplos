@@ -5,11 +5,30 @@ use crate::thread::{self, WaitQueue};
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::Mutex;
 use x86_64::instructions::interrupts;
 
-/// What a pipe holds before its writers wait: Linux's default.
+/// What a pipe holds before its writers wait: Linux's default, but for
+/// `HELD`.
 pub const CAPACITY: usize = 64 * 1024;
+
+/// What a pipe always has room for, whatever the others hold: so that a
+/// writer waiting on its own pipe goes on once its reader has read.
+const ALWAYS: usize = 4096;
+
+/// What all pipes' buffers take of the kernel's heap, which holds them:
+/// together no more than a quarter of it, but for `ALWAYS` in each, so a
+/// program filling pipes no one reads can't take all of it, which would end
+/// the kernel. By what each buffer has allocated, which a pipe read empty
+/// gives back.
+static HELD: AtomicUsize = AtomicUsize::new(0);
+
+/// How much more a pipe holding `len` bytes takes now.
+fn room(len: usize) -> usize {
+    let left = (crate::allocator::size() / 4).saturating_sub(HELD.load(Ordering::Relaxed));
+    (CAPACITY - len).min(left.max(ALWAYS.saturating_sub(len)))
+}
 
 struct Pipe {
     /// Taken only with interrupts off, as `WaitQueue::wait_until` checks it.
@@ -23,6 +42,12 @@ struct State {
     /// Ends of each kind still open.
     readers: usize,
     writers: usize,
+}
+
+impl Drop for State {
+    fn drop(&mut self) {
+        HELD.fetch_sub(self.data.capacity(), Ordering::Relaxed);
+    }
 }
 
 /// One end of a pipe. Copies of a descriptor share it, and it closes when
@@ -75,6 +100,10 @@ impl PipeEnd {
             }
             let count = most.min(state.data.len());
             taken.extend(state.data.drain(..count));
+            if state.data.is_empty() {
+                let buffer = core::mem::take(&mut state.data);
+                HELD.fetch_sub(buffer.capacity(), Ordering::Relaxed);
+            }
             empty = false;
             true
         });
@@ -107,9 +136,10 @@ impl PipeEnd {
                         broken = true;
                         return true;
                     }
-                    let room = CAPACITY - state.data.len();
-                    let count = room.min(data.len() - written);
+                    let count = room(state.data.len()).min(data.len() - written);
+                    let before = state.data.capacity();
                     state.data.extend(&data[written..written + count]);
+                    HELD.fetch_add(state.data.capacity() - before, Ordering::Relaxed);
                     written += count;
                     count > 0 || !wait
                 })
@@ -137,7 +167,7 @@ impl PipeEnd {
         let state = self.pipe.state.lock();
         match self.write {
             false => Ready { now: !state.data.is_empty(), closed: state.writers == 0 },
-            true => Ready { now: state.data.len() < CAPACITY, closed: state.readers == 0 },
+            true => Ready { now: room(state.data.len()) > 0, closed: state.readers == 0 },
         }
     }
 }
@@ -159,4 +189,34 @@ impl Drop for PipeEnd {
         self.pipe.changed.wake_all();
         thread::wake_pollers();
     }
+}
+
+#[test_case]
+fn pipes_together_take_no_more_than_a_quarter_of_the_heap() {
+    // Pipes no one reads, each written as full as it goes without waiting:
+    // past a quarter of the heap, each takes only its first 4 KiB.
+    let held = HELD.load(Ordering::Relaxed);
+    let mut pipes = Vec::new();
+    let full = [7; CAPACITY];
+    // The one that comes to a quarter takes what's left of it.
+    loop {
+        let (reader, writer) = new();
+        let written = writer.write(&full, false).unwrap();
+        pipes.push((reader, writer));
+        if written <= ALWAYS {
+            assert_eq!(written, ALWAYS);
+            break;
+        }
+    }
+    let quarter = crate::allocator::size() / 4;
+    let taken = HELD.load(Ordering::Relaxed) - held;
+    assert!(taken <= quarter + 2 * CAPACITY, "{taken} of a quarter of {quarter}");
+    // A pipe that has its 4 KiB is full, as poll says; read empty, it gives
+    // its buffer back, and is written to again.
+    let (reader, writer) = pipes.last().unwrap();
+    assert!(!interrupts::without_interrupts(|| writer.poll().now));
+    assert_eq!(reader.read(CAPACITY, false).unwrap().len(), ALWAYS);
+    assert_eq!(writer.write(&full[..100], false), Ok(100));
+    drop(pipes);
+    assert_eq!(HELD.load(Ordering::Relaxed), held, "what pipes took back once they're gone");
 }

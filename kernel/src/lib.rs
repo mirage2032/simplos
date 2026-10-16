@@ -146,7 +146,8 @@ pub fn pre_init(boot_info: &'static mut BootInfo) {
         memory::clear_lower_half(&mut mapper);
         let mut frame_allocator =
             unsafe { BootInfoFrameAllocator::init(&boot_info.memory_regions) };
-        let heap = allocator::heap_size(frame_allocator.memory().0);
+        let screen = boot_info.framebuffer.as_ref().map_or(0, |fb| fb.info().byte_len);
+        let heap = allocator::heap_size(frame_allocator.memory().0, screen);
         allocator::init_heap(&mut mapper, &mut frame_allocator, heap)
             .expect("heap initialization failed");
         frame_allocator.count_holders();

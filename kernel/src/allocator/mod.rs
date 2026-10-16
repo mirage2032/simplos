@@ -17,11 +17,13 @@ pub const HEAP_START: usize = 0xFFFF_C000_0000_0000;
 /// machine runs takes more of it: the page cache's index; lwext4's
 /// journal, which keeps a copy of each block a transaction writes until
 /// it's committed; and each program's reads and writes, 64 KiB at a time.
-/// A copy of the screen takes 8 MiB of it, for 1920x1080.
-pub fn heap_size(memory: u64) -> usize {
+/// With `screen` bytes more for the display's copy of the screen, which is
+/// on the heap too, 8 MiB at 1920x1080: but never less than 20 MiB, which a
+/// small machine's programs can't spare more than, the screen in it.
+pub fn heap_size(memory: u64, screen: usize) -> usize {
     const SMALLEST: usize = 20 << 20;
     const LARGEST: usize = 256 << 20;
-    (memory as usize / 16).clamp(SMALLEST, LARGEST).next_multiple_of(4096)
+    (memory as usize / 16 + screen).clamp(SMALLEST, LARGEST + screen).next_multiple_of(4096)
 }
 
 /// What `init_heap` made it.
@@ -30,6 +32,12 @@ static SIZE: AtomicUsize = AtomicUsize::new(0);
 /// How big the heap is.
 pub fn size() -> usize {
     SIZE.load(Ordering::Relaxed)
+}
+
+/// What the heap has free in its fallback, where everything bigger than a
+/// block comes from: not counting the few blocks kept for their size.
+pub fn free() -> usize {
+    x86_64::instructions::interrupts::without_interrupts(|| ALLOCATOR.lock().free())
 }
 
 #[global_allocator]
