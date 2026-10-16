@@ -276,6 +276,7 @@ fn call(frame: &Frame) -> i64 {
         53 => files::socketpair(&process, a0, a1, a2, a3),
         188..=199 => files::xattr(&process, frame.nr, a0),
         221 => files::fadvise(&process, a0, a3),
+        275 => files::splice(&process, [a0, a1], [a2, a3], a4, a5),
         // The copy or the new thread starts as the call returns, with 0
         // its result.
         56 => processes::clone(&process, frame.registers(0), a0, a1, [a2, a3], a4),

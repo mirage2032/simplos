@@ -78,7 +78,7 @@ install -m 644 "$uefi" "$root/$out/uefi.img"
 # The ext4 disk, made as `cargo run` makes its own (`disk` in
 # fullkernel/src/main.rs; keep the two in step): hello.txt, the user program
 # as /bin/probe, the userland and GCC. Unlike `cargo run`, the userland and
-# the toolchain have to build: a release without busybox, zsh, vim and gcc
+# the toolchain have to build: a release without busybox, uutils, zsh, vim and gcc
 # isn't one. 1 GiB to the guest, but compressed qcow2 holds only what mke2fs
 # wrote, so the file is a fraction of that, and QEMU attaches it as it is:
 # -drive format=qcow2,file=disk.qcow2. The toolchain over the userland

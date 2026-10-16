@@ -626,6 +626,19 @@ fn socket_pairs_connect_their_two_ends() {
 }
 
 #[test_case]
+fn splice_moves_what_s_read_into_or_out_of_a_pipe() {
+    // What Linux says, from the same program: 4 bytes from the place given,
+    // moved on, into a pipe, the file's own place left; out of the pipe
+    // into another file; the rest from the file's own place; 0 at its end;
+    // and EINVAL for neither end a pipe, ESPIPE for a place for a pipe,
+    // EINVAL for flags there aren't and EBADF for a descriptor not open.
+    assert_eq!(
+        run(&["splice", "/spliced.txt"]),
+        ok("4 6 0 4 10 10 0 \"23450123456789\" [-22, -29, -22, -9]\n")
+    );
+}
+
+#[test_case]
 fn fsync_writes_what_waits_in_memory() {
     // A small write waits to be made with what follows it; fsync makes it,
     // and sync, as /proc/diskstats shows.

@@ -2,10 +2,13 @@
 # Builds the programs simplos runs from its disk, as a tree for one, in
 # target/userland/root: busybox, with a link for each of its applets where
 # Linux keeps them (/bin/sh among them), zsh with its shell functions, and
-# vim with its runtime files.
-# All static, for x86-64 Linux with musl, compiled by zig cc from the sources
-# pinned below, which have to match their checksums. Then over them, the
-# files of simplos's own in userland/: /sbin/init, and what's in /etc.
+# vim with its runtime files; then uutils' coreutils, whose links take the
+# place of busybox's for the commands it has, ls, cp, sort and the rest.
+# All static, for x86-64 Linux with musl: the C compiled by zig cc, uutils by
+# the Rust toolchain rust-toolchain.toml pins, from the sources pinned below,
+# which have to match their checksums, and for uutils the crates its
+# Cargo.lock pins. Then over them, the files of simplos's own in userland/:
+# /sbin/init, and what's in /etc.
 #
 # Usage: scripts/userland.sh
 #
@@ -15,11 +18,12 @@
 #
 # It runs on x86-64 Linux, which can run what zig makes for the target as the
 # builds need to (the C compiler checks, ncurses' and busybox's generators),
-# with the host's make, cc, strip, curl and sha256sum, as CI has them.
+# with the host's make, cc, strip, curl and sha256sum, and cargo, as CI has
+# them.
 #
 # busybox is GPL-2.0, zsh and ncurses MIT-style, vim under the Vim license,
-# which is GPL-compatible: their sources are these, unchanged, configured as
-# below.
+# which is GPL-compatible, and uutils MIT: their sources are these,
+# unchanged, configured as below.
 set -euo pipefail
 
 zig_version=0.17.0
@@ -35,6 +39,9 @@ zsh_sha256=36fa734374b44783582cec09bcd67822e2f992c779ec1624ab5596df078d2f81
 # The tag's source, as GitHub makes it an archive.
 vim_version=9.2.1202
 vim_sha256=9e97414b85bdcb2d28d5264c65dd730d86b9a75319b005c63da0bc130c715a2f
+# The tag's source, as GitHub makes it an archive.
+uutils_version=0.12.0
+uutils_sha256=4fb327655cb4ffcbf2f16550cf9234079ffe839692f7aa1a6eda104af684e122
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 work=$root/target/userland
@@ -67,8 +74,8 @@ if [[ -d $out && $(cat "$work/built" 2>/dev/null) == "$stamp" ]]; then
     overlay
     exit 0
 fi
-echo "userland: building busybox $busybox_version, zsh $zsh_version and vim $vim_version" \
-    "into $out" >&2
+echo "userland: building busybox $busybox_version, zsh $zsh_version, vim $vim_version" \
+    "and uutils $uutils_version into $out" >&2
 
 # Download $1 as $2 unless it's there, and check it's what was pinned, $3.
 fetch() {
@@ -94,6 +101,8 @@ fetch "https://invisible-island.net/archives/ncurses/ncurses-$ncurses_version.ta
 fetch "https://www.zsh.org/pub/zsh-$zsh_version.tar.xz" "zsh-$zsh_version.tar.xz" "$zsh_sha256"
 fetch "https://github.com/vim/vim/archive/refs/tags/v$vim_version.tar.gz" \
     "vim-$vim_version.tar.gz" "$vim_sha256"
+fetch "https://github.com/uutils/coreutils/archive/refs/tags/$uutils_version.tar.gz" \
+    "coreutils-$uutils_version.tar.gz" "$uutils_sha256"
 
 # Every build afresh, from the sources as they came.
 rm -rf "$build" "$out" "$work/built"
@@ -176,6 +185,36 @@ step ./configure --prefix=/usr CC="$cc" PKG_CONFIG=false \
     --with-compiledby=simplos vim_cv_timer_create=no vim_cv_timer_create_with_lrt=no
 step make -j"$jobs"
 step make DESTDIR="$out" install
+
+echo "userland: uutils' coreutils" >&2
+cd "$build/coreutils-$uutils_version"
+# One program for every command, as busybox is, run by the name it's run
+# by: the commands its musl feature set has, all but stdbuf. Linked by the
+# toolchain's rust-lld, as user/probe is, so no C toolchain for musl is
+# needed. Built for speed rather than size, and stripped: the 12 MB of its
+# code is read from the disk once, and every program running it shares it,
+# through the page cache.
+uutils=$build/uutils-target/x86_64-unknown-linux-musl/release/coreutils
+step env CARGO_TARGET_DIR="$build/uutils-target" RUSTFLAGS="-C linker=rust-lld" \
+    CARGO_PROFILE_RELEASE_STRIP=true \
+    cargo build --locked --release --target x86_64-unknown-linux-musl \
+    --features feat_os_unix_musl
+install -m 755 "$uutils" "$out/usr/bin/coreutils"
+# Its link for each command where busybox put its own, in its place, or in
+# /usr/bin for those busybox hasn't: replaced, not written through, which
+# would put uutils over busybox itself.
+for name in $("$out/usr/bin/coreutils" --list); do
+    link=usr/bin/$name
+    for dir in bin sbin usr/bin usr/sbin; do
+        if [[ -L $out/$dir/$name ]]; then
+            link=$dir/$name
+            break
+        fi
+    done
+    rm -f "$out/$link"
+    ln -s "$(realpath --relative-to="$(dirname "$out/$link")" "$out/usr/bin/coreutils")" \
+        "$out/$link"
+done
 
 overlay
 # The sources and objects, half a gigabyte, aren't needed again.

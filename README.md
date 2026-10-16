@@ -32,7 +32,7 @@ Any other argument is passed straight through to QEMU.
 A release's images need none of this — download `bios.img` or `uefi.img` from
 [the latest release](../../releases/latest) and boot it. Its `disk.qcow2` is
 the ext4 disk `cargo run` would make, userland, GCC and all, 1 GiB to the
-guest in a file of 79 MB; attach it after the image with
+guest in a file of 89 MB; attach it after the image with
 `-drive format=qcow2,file=disk.qcow2`. To compile on it, attach it to AHCI
 instead, as `cargo run` does, which reads four times as fast, and for more
 than hello world, give it more memory than QEMU's 128 MiB with `-m 1G`:
@@ -174,7 +174,8 @@ length with `truncate` and `ftruncate`; making a file sets all three of its
 times, writing to it when it was modified, and any change when it was
 changed. `access`, `faccessat` and `faccessat2` answer as for root, who may
 read and write anything but where nothing can be written (`EROFS`), and run
-what anyone may. `sendfile` copies from one descriptor to another. For now:
+what anyone may. `sendfile` copies from one descriptor to another, and
+`splice` into a pipe or out of one, as uutils' `cat` copies. For now:
 
 - a file removed or renamed over while it's open stays until it's closed, as
   on Linux, but in `/lost+found`, as `.open-` and its inode, where Linux
@@ -419,16 +420,28 @@ its `/sbin/init`, a script that logs root in to zsh.
 ## Userland
 
 `scripts/userland.sh` builds the programs that make a disk a system to use:
-busybox 1.38.0, with a link for each of its applets where Linux keeps them
-(`/bin/sh`, `/bin/ls`, `/usr/bin/awk` and the rest), zsh 5.9.2 with its
-shell functions, and vim 9.2.1202 with its runtime files, its help and
-syntax highlighting among them, on ncurses 6.6 with the terminals it knows
-built in.
-They're static programs for x86-64 Linux, linked with musl by zig cc 0.17.0,
-from the sources the script pins and checks by their SHA-256, into
-`target/userland/root`. The first build takes a few minutes and needs the
-network; after that it's done, until the script changes. It builds on x86-64
-Linux only.
+uutils' coreutils 0.12.0, GNU's commands rewritten in Rust, one program,
+`/usr/bin/coreutils`, for its 104 (`ls`, `cp`, `sort`, `du`, `dd`, `timeout`
+and the rest); busybox 1.38.0 for what they aren't, with a link for each of
+its applets where Linux keeps them (`/bin/sh`, `/bin/grep`, `/usr/bin/awk`,
+`/bin/vi`, `/bin/ps` and so on), but those uutils has, whose links are
+uutils'; zsh 5.9.2 with its shell functions; and vim 9.2.1202 with its
+runtime files, its help and syntax highlighting among them, on ncurses 6.6
+with the terminals it knows built in.
+They're static programs for x86-64 Linux, linked with musl: the C by zig cc
+0.17.0, uutils by the Rust toolchain `rust-toolchain.toml` pins, for
+`x86_64-unknown-linux-musl`, as `user/probe` is; from the sources the script
+pins and checks by their SHA-256, and for uutils the crates its `Cargo.lock`
+pins, into `target/userland/root`. The first build takes a few minutes and
+needs the network, crates.io's included; after that it's done, until the
+script changes. It builds on x86-64 Linux only.
+
+uutils' commands, being Rust's, ask more of the kernel than busybox's: hash
+maps keyed by `getrandom`; threads, which `sort`, `du` and `dd` always start;
+POSIX timers and `sigwait`, which `timeout` waits by; `splice`, which `cat`
+copies with; a socket pair, which Rust's `Command` hears of a failed `exec`
+by; and `AT_FDCWD` as rustix passes it. Its 13 MB are read from the disk
+once, and each program running it after shares them, in the page cache.
 
 Over them go the files in `userland/`, copied every time, so changing them
 needs no new build:
@@ -452,6 +465,9 @@ kernel's own shell. For now:
 
 - busybox is built without `init`, which the kernel would run first, and
   which wants a console and an `inittab` there aren't; and without `tc`;
+- uutils is built without `stdbuf`, which its musl build leaves out; and its
+  `chroot`, `mknod` and `mkfifo` fail, as busybox's did, as there are no
+  `chroot` and no FIFOs here;
 - the disk's files belong to whoever made it, as `mke2fs -d` copies owners,
   which is why `/etc/zshrc` has `compinit -u`;
 - vim is built without `timer_create`, whose `SIGEV_THREAD` takes a thread,
@@ -459,10 +475,10 @@ kernel's own shell. For now:
   and the `flock` it puts on its temporary directory, against cleaners
   that there aren't, isn't there.
 
-busybox is GPL-2.0, as simplos is; zsh and ncurses are MIT-style; vim is
-under the Vim license, which is GPL-compatible. A disk made with them holds
-their programs, built from the upstream releases the script names (vim's,
-from its tag), unchanged, configured as it says.
+busybox is GPL-2.0, as simplos is; uutils is MIT; zsh and ncurses are
+MIT-style; vim is under the Vim license, which is GPL-compatible. A disk made
+with them holds their programs, built from the upstream releases the script
+names (vim's and uutils', from their tags), unchanged, configured as it says.
 
 ## GCC
 
@@ -590,7 +606,7 @@ the right firmware and the right framebuffer mode.
 | `vendor/ps2/` | the `ps2` crate, with its `x86_64` dependency bumped. |
 | `fs/ext4/` | ext4 (and ext3 and ext2) file systems, read and written with a journal: a Rust interface over the vendored lwext4, tested on the host against e2fsprogs. |
 | `vendor/lwext4/` | [lwext4](https://github.com/gkostka/lwext4), the C library `fs/ext4` uses for now. |
-| `scripts/` | `build-images.sh`, `smoke-test.sh`, `boot-test.sh`, `mutants.sh`, `userland.sh`, which builds busybox, zsh and vim for the disk, and `toolchain.sh`, which builds GCC for it. |
+| `scripts/` | `build-images.sh`, `smoke-test.sh`, `boot-test.sh`, `mutants.sh`, `userland.sh`, which builds busybox, uutils, zsh and vim for the disk, and `toolchain.sh`, which builds GCC for it. |
 
 There is no cargo workspace: `kernel` builds for `x86_64-unknown-none` with
 `build-std`, the host tools and `fs/ext4`'s tests build for the host, `user/probe` builds for

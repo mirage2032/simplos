@@ -1721,6 +1721,42 @@ fn main() {
                  {made_mine} {to_me} {deleted:?} {refused:?}"
             );
         }
+        // splice, as uutils' cat moves what it copies: from PATH, from the
+        // place given, into a pipe, that place moved on and the file's own
+        // left as it was; out of the pipe into another file; from the file's
+        // own place; 0 at its end. Then what it refuses: neither end a pipe,
+        // a place for a pipe, flags there aren't, a descriptor not open.
+        Some("splice") => {
+            let path = arg(2);
+            let copy_path = format!("{path}.copy");
+            or_fail(&path, fs::write(&path, "0123456789"));
+            let file = or_fail(&path, fs::File::open(&path));
+            let copy = or_fail(&copy_path, fs::File::create(&copy_path));
+            let (reader, writer) = or_fail("pipe", io::pipe());
+            let [f, c, r, w] =
+                [file.as_raw_fd(), copy.as_raw_fd(), reader.as_raw_fd(), writer.as_raw_fd()]
+                    .map(|fd| fd as usize);
+            let splice = |input: usize, at: usize, output: usize, len: usize, flags: usize| {
+                syscall6(275, [input, at, output, 0, len], flags)
+            };
+            let mut place = 2i64;
+            let into = splice(f, &raw mut place as usize, w, 4, 0);
+            let own = syscall(8, f, 0, 1);
+            let out = splice(r, 0, c, 16, 0);
+            let rest = splice(f, 0, w, 64, 0);
+            let drained = splice(r, 0, c, 64, 0);
+            let end = splice(f, 0, w, 64, 0);
+            let copied = or_fail(&copy_path, fs::read_to_string(&copy_path));
+            let refused = [
+                splice(f, 0, c, 4, 0),
+                splice(r, &raw mut place as usize, c, 4, 0),
+                splice(f, 0, w, 4, 0x100),
+                splice(1000, 0, w, 4, 0),
+            ];
+            or_fail(&path, fs::remove_file(&path));
+            or_fail(&copy_path, fs::remove_file(&copy_path));
+            println!("{into} {place} {own} {out} {rest} {drained} {end} {copied:?} {refused:?}");
+        }
         // Symbolic links: made and read back, followed, and lstat'd as
         // themselves; through a directory, after which `..` is the
         // directory's parent, not the link's; one that leads nowhere, which

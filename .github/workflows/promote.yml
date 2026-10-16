@@ -202,5 +202,5 @@ jobs:
             echo "master and develop now point at this commit. Both images boot at"
             echo "1920x1080; pass \`-fw_cfg name=opt/simplos/fb,string=WIDTHxHEIGHT\`"
             echo "to ask the kernel for something smaller. Attach \`disk.qcow2\` with"
-            echo "\`-drive format=qcow2,file=disk.qcow2\` for busybox and zsh."
+            echo "\`-drive format=qcow2,file=disk.qcow2\` for busybox, uutils and zsh."
           } >> "$GITHUB_STEP_SUMMARY"

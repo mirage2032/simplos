@@ -1315,6 +1315,61 @@ pub fn sendfile(process: &Process, out_fd: u64, in_fd: u64, offset: u64, count: 
     })())
 }
 
+/// `splice`: move up to `len` bytes from `fd_in` to `fd_out`, one of them a
+/// pipe, as uutils' `cat` and `tee` move what they copy: the other read or
+/// written at the place `off_in` or `off_out` points at, moving that on, if
+/// it isn't 0, or else at its own place. A pipe has no place (ESPIPE, as
+/// `read_data` and `write_data` say), and neither a pipe is EINVAL. What's read from a file and can't be written is
+/// left to be read again.
+///
+/// shortcut: copied, as `sendfile` copies, rather than its pages moved;
+/// what's read from a pipe and can't be written is lost, where Linux leaves
+/// it in the pipe; and SPLICE_F_NONBLOCK counts for nothing, only O_NONBLOCK
+/// does.
+pub fn splice(process: &Process, input: [u64; 2], output: [u64; 2], len: u64, flags: u64) -> i64 {
+    const SPLICE_F_ALL: u64 = 0xF;
+    let ([fd_in, off_in], [fd_out, off_out]) = (input, output);
+    ret((|| {
+        if flags & !SPLICE_F_ALL != 0 {
+            return Err(EINVAL);
+        }
+        let pipe =
+            |fd: u64| -> Result<bool> { Ok(matches!(*handle(process, fd)?, Handle::Pipe { .. })) };
+        let (from_pipe, to_pipe) = (pipe(fd_in)?, pipe(fd_out)?);
+        if !from_pipe && !to_pipe {
+            return Err(EINVAL);
+        }
+        let place = |addr: u64| -> Result<Option<u64>> {
+            if addr == 0 {
+                return Ok(None);
+            }
+            let mut place = [0u8; 8];
+            process.memory.lock().space.read(addr, &mut place).ok_or(EFAULT)?;
+            Ok(Some(at(u64::from_le_bytes(place))?))
+        };
+        let (from, to) = (place(off_in)?, place(off_out)?);
+        let most = most_written(process, fd_out) as u64;
+        let data = read_data(process, fd_in, len.min(most), from)?;
+        let written = write_data(process, fd_out, &data, to);
+        let moved = *written.as_ref().unwrap_or(&0) as u64;
+        let put = |addr: u64, place: u64| {
+            process.memory.lock().space.write(addr, &place.to_le_bytes()).ok_or(EFAULT)
+        };
+        match from {
+            Some(from) => put(off_in, from + moved)?,
+            None => {
+                if let Handle::File { offset, .. } = &*handle(process, fd_in)? {
+                    offset.fetch_sub(data.len() as u64 - moved, Relaxed);
+                }
+            }
+        }
+        if let Some(to) = to {
+            put(off_out, to + moved)?;
+        }
+        written
+    })())
+}
+
 /// What `fd` refers to, for `poll`: `None` if it isn't open.
 pub fn open_handle(process: &Process, fd: i32) -> Option<Arc<Handle>> {
     handle(process, fd as u64).ok()
