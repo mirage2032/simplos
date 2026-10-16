@@ -108,7 +108,8 @@ impl Shell {
                     return String::from("run: no program in the ramdisk");
                 };
                 argv.insert(0, "probe");
-                process::spawn_with(elf, &argv, env, files).map_err(|error| format!("run: {error}"))
+                process::spawn_with(elf, &argv, env, files)
+                    .map_err(|errno| format!("run: {}", syscall::strerror(errno)))
             }
         };
         let settings = self.tty.termios();

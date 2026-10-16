@@ -385,11 +385,13 @@ fn the_system_shows_itself_in_proc() {
     // free and top, from /proc/meminfo and /proc/stat; ps, the processes
     // there are and what they're doing, the shell, a job of its and ps
     // itself; df, from /proc/mounts and statfs, and stat's of it; mount;
-    // and what a process reads of itself.
+    // and what a process reads of itself. ps once the job is sleep, not
+    // still the shell it was forked from.
     let script = "free | awk 'NR == 2 { print $1, ($2 > 0), ($4 > 0) }'; \
                   top -b -n 1 | awk 'NR == 1 { print $1, ($2 + 0 > 0), ($4 + 0 > 0) } \
                                      NR == 2 || NR == 3 { print $1 }'; \
-                  sleep 10 & listed=$(ps -o stat,comm); kill $!; echo \"$listed\" | tail -n +2; \
+                  sleep 10 & until read job < /proc/$!/comm && [ $job = sleep ]; do :; done; \
+                  listed=$(ps -o stat,comm); kill $!; echo \"$listed\" | tail -n +2; \
                   df / | awk 'NR == 2 { print $1, $2, ($3 > 0), $6 }'; stat -f -c '%T %b' /; \
                   mount; cat /proc/self/cmdline | tr '\\0' ' '; echo; \
                   readlink /proc/self | grep -c '^[0-9][0-9]*$'";

@@ -110,6 +110,22 @@ fn a_program_bigger_than_the_kernel_s_heap_runs() {
 }
 
 #[test_case]
+fn a_program_starts_in_the_interpreter_it_names() {
+    // /bin/interp-probe, which tools/boot-test makes: user/probe naming
+    // /bin/probe as its interpreter (PT_INTERP), as a dynamically linked
+    // program names its loader. It's probe that runs, told where it is
+    // (AT_BASE) and where the program is (AT_PHDR, AT_ENTRY), as on Linux.
+    assert_eq!(run(&["exec", "/bin/interp-probe", "auxv"]), ok("true true true true\n"));
+    // Named by a path from where the program's run: as probe, from /bin.
+    let relative = run(&["exec-in", "/bin", "/bin/interp-relative", "auxv"]);
+    assert_eq!(relative, ok("true true true true\n"));
+    // What it maps comes from past where the interpreter is.
+    assert_eq!(run(&["exec", "/bin/interp-probe", "madvise"]), ok("0 true 0 [-22, -12, -22] 0\n"));
+    // Without one: AT_BASE is 0, and there's the one copy.
+    assert_eq!(run(&["auxv"]), ok("false false true true\n"));
+}
+
+#[test_case]
 fn execve_refuses_what_isnt_a_program() {
     let refused = |path, error| (path, failed(path, error));
     for (path, expected) in [
@@ -120,6 +136,14 @@ fn execve_refuses_what_isnt_a_program() {
         refused("/dir", "Permission denied (os error 13)"),
         refused("/dev/null", "Permission denied (os error 13)"),
         refused("/bin/script", "No such file or directory (os error 2)"),
+        // Interpreters (PT_INTERP) that aren't there; too short to be an ELF
+        // program, and long enough but not one; that can't be run; and one
+        // whose path has no NUL.
+        refused("/bin/interp-missing", "No such file or directory (os error 2)"),
+        refused("/bin/interp-script", "I/O error (os error 5)"),
+        refused("/bin/interp-long-script", "No error information (os error 80)"),
+        refused("/bin/interp-text", "Permission denied (os error 13)"),
+        refused("/bin/interp-unterminated", "Exec format error (os error 8)"),
     ] {
         assert_eq!(run(&["exec", path]), expected, "{path}");
     }

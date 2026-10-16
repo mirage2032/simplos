@@ -175,10 +175,10 @@ fn run(
     // And an ext4 one, made by Linux's own mke2fs and checked afterwards by
     // its e2fsck, for what the kernel's file system code does to it.
     let ext4_scratch = file("ext4.img");
-    // A program bigger than the kernel's heap, for tests/processes.rs.
-    let big =
+    // Programs made from user/probe, for tests/processes.rs.
+    let crafted =
         kernel.file_name().is_some_and(|name| name.to_string_lossy().starts_with("processes"));
-    make_ext4(&ext4_scratch, userland, toolchain, big)?;
+    make_ext4(&ext4_scratch, userland, toolchain, crafted)?;
 
     let mut qemu = Command::new("qemu-system-x86_64");
     if let Firmware::Uefi = firmware {
@@ -271,13 +271,13 @@ const EXT4_TREE: &[(&str, &str)] =
 /// A 16 MiB ext4 file system holding `EXT4_TREE`, as Linux makes them, and in
 /// /bin, user/probe for programs to run, and a script whose interpreter isn't
 /// there. With `userland`'s tree too, 128 MiB, and /bin/sh is; with
-/// `toolchain`'s as well, 1 GiB, and GCC; with `big`, 64 MiB, and /bin/big,
-/// from `big_program`.
+/// `toolchain`'s as well, 1 GiB, and GCC; with `crafted`, 64 MiB, and in
+/// /bin what `crafted` makes.
 fn make_ext4(
     image: &Path,
     userland: Option<&Path>,
     toolchain: Option<&Path>,
-    big: bool,
+    crafted: bool,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     use std::os::unix::fs::PermissionsExt;
     let tree = image.with_extension("tree");
@@ -292,10 +292,13 @@ fn make_ext4(
     let script = tree.join("bin/script");
     std::fs::write(&script, "#!/bin/sh\necho a script\n")?;
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
-    if big {
+    if crafted {
         let probe = std::fs::read(env!("CARGO_BIN_FILE_PROBE_probe"))?;
-        std::fs::write(tree.join("bin/big"), big_program(&probe))?;
-        std::fs::set_permissions(tree.join("bin/big"), std::fs::Permissions::from_mode(0o755))?;
+        for (name, program) in self::crafted(&probe) {
+            let path = tree.join("bin").join(name);
+            std::fs::write(&path, program)?;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+        }
     }
     // Links and modes as they are; and what's there replaced, not written
     // through, as the toolchain's binutils replace busybox's links.
@@ -315,7 +318,7 @@ fn make_ext4(
         .args(["-q", "-F", "-t", "ext4", "-b", "4096", "-d"])
         .arg(&tree)
         .arg(image)
-        .arg(match (toolchain.is_some(), userland.is_some(), big) {
+        .arg(match (toolchain.is_some(), userland.is_some(), crafted) {
             (true, _, _) => "1G",
             (false, true, _) => "128M",
             (false, false, true) => "64M",
@@ -335,12 +338,41 @@ fn make_ext4(
 const BIG_AT: u64 = 0x1000_0000;
 const BIG_LEN: usize = 24 << 20;
 
-/// user/probe, with a segment more: its PT_GNU_STACK header, which simplos
-/// doesn't look at, made a PT_LOAD of `BIG_LEN` bytes, each its offset in it
-/// modulo 251, read-only, at `BIG_AT`, from past the end of the file as it
-/// was. Its mode `peek` tells whether they're there.
-fn big_program(probe: &[u8]) -> Vec<u8> {
+/// What tests/processes.rs runs that's made from user/probe, by name in
+/// /bin: `big`, with a segment of `BIG_LEN` bytes more, each its offset in
+/// it modulo 251, at `BIG_AT`, which its mode `peek` checks; and copies that
+/// name an interpreter (PT_INTERP): probe, which then runs as theirs, by a
+/// path from the root and from where they're run; one that isn't there; a
+/// script too short to hold an ELF header, and one long enough that isn't
+/// ELF, `long-script`; a file that can't be run; and a path without its
+/// NUL.
+fn crafted(probe: &[u8]) -> Vec<(&'static str, Vec<u8>)> {
+    const PT_LOAD: u32 = 1;
+    const PT_INTERP: u32 = 3;
+    let big: Vec<u8> = (0..BIG_LEN).map(|i| (i % 251) as u8).collect();
+    let naming =
+        |path: &str| with_header(probe, PT_INTERP, &[path.as_bytes(), b"\0"].concat(), 0, 1);
+    let long_script =
+        "#!/bin/sh\n# Long enough to hold an ELF header, which it isn't.\necho a script\n";
+    vec![
+        ("big", with_header(probe, PT_LOAD, &big, BIG_AT, 4096)),
+        ("interp-probe", naming("/bin/probe")),
+        ("interp-relative", naming("probe")),
+        ("interp-missing", naming("/lib/missing.so")),
+        ("interp-script", naming("/bin/script")),
+        ("interp-long-script", naming("/bin/long-script")),
+        ("interp-text", naming("/hello.txt")),
+        ("interp-unterminated", with_header(probe, PT_INTERP, b"/bin/probe", 0, 1)),
+        ("long-script", long_script.as_bytes().to_vec()),
+    ]
+}
+
+/// user/probe with its PT_GNU_STACK header, which simplos doesn't look at,
+/// made one of `kind`, readable, for `contents`, put past the end of the
+/// file, aligned to `align`, and in memory at `vaddr`.
+fn with_header(probe: &[u8], kind: u32, contents: &[u8], vaddr: u64, align: usize) -> Vec<u8> {
     const PT_GNU_STACK: u32 = 0x6474_e551;
+    const PF_R: u32 = 4;
     let at = |at: usize, len: usize| {
         u64::from_le_bytes(probe[at..at + 8].try_into().unwrap()) as usize & len
     };
@@ -349,18 +381,20 @@ fn big_program(probe: &[u8]) -> Vec<u8> {
         .map(|i| phoff + i * 56)
         .find(|&header| at(header, 0xffff_ffff) as u32 == PT_GNU_STACK)
         .expect("user/probe has a PT_GNU_STACK header");
-    let offset = probe.len().next_multiple_of(4096);
-    let mut big = probe.to_vec();
-    // PT_LOAD, PF_R; then where in the file, where in memory twice, how
-    // long in each, and its alignment.
-    big[header..header + 8].copy_from_slice(&[1, 0, 0, 0, 4, 0, 0, 0]);
-    let fields = [offset as u64, BIG_AT, BIG_AT, BIG_LEN as u64, BIG_LEN as u64, 4096];
+    let offset = probe.len().next_multiple_of(align);
+    let mut program = probe.to_vec();
+    program[header..header + 4].copy_from_slice(&kind.to_le_bytes());
+    program[header + 4..header + 8].copy_from_slice(&PF_R.to_le_bytes());
+    // Where in the file, where in memory twice, how long in each, and its
+    // alignment.
+    let len = contents.len() as u64;
+    let fields = [offset as u64, vaddr, vaddr, len, len, align as u64];
     for (i, field) in fields.into_iter().enumerate() {
-        big[header + 8 + i * 8..header + 16 + i * 8].copy_from_slice(&field.to_le_bytes());
+        program[header + 8 + i * 8..header + 16 + i * 8].copy_from_slice(&field.to_le_bytes());
     }
-    big.resize(offset, 0);
-    big.extend((0..BIG_LEN).map(|i| (i % 251) as u8));
-    big
+    program.resize(offset, 0);
+    program.extend_from_slice(contents);
+    program
 }
 
 /// What's wrong with the ext4 disk after a run: anything e2fsck finds,

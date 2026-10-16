@@ -214,7 +214,7 @@ pub fn execve(process: &Process, path: u64, argv: u64, envp: u64) -> Result<Regi
     let elf = process::program_for(&cwd, &path, &mut args)?;
     let args: Vec<&[u8]> = args.iter().map(Vec::as_slice).collect();
     let env: Vec<&[u8]> = env.iter().map(Vec::as_slice).collect();
-    let start = process::exec(process, &elf, &args, &env).map_err(process::load_errno)?;
+    let start = process::exec(process, &elf, &args, &env)?;
     *process.command.lock() = process::Command::new(path.as_bytes(), &args);
     files::close_on_exec(process);
     Ok(start)

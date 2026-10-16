@@ -174,7 +174,12 @@ from the disk, closing the descriptors marked close-on-exec, and `wait4`
 waits for its copies and tells how each ended; `getpid` and `getppid` say
 who's who. `execve` runs a script through what its first line names
 (`#!/bin/sh -e` and the like), as Linux does, with the line's one argument
-and the script's path; that can be a script too, five deep. So Rust's `std::process::Command` works: its `spawn`, `status`,
+and the script's path; that can be a script too, five deep. A program
+that names an interpreter (`PT_INTERP`), as a dynamically linked one names
+its loader, starts in that, as on Linux: `execve` loads it too, where
+`mmap` starts handing memory out, and tells it where it and the program
+are (`AT_BASE`, `AT_PHDR`, `AT_ENTRY`), for it to map the shared libraries
+the program needs and start it. So Rust's `std::process::Command` works: its `spawn`, `status`,
 `output` and `exec`. `cargo run`'s
 disk has the user program as `/bin/probe` (a `disk.img` made before this
 doesn't: delete it), so in the shell, `run spawn /bin/probe hello` has it
@@ -236,7 +241,11 @@ its hash maps' keys, and `/dev/random` and `/dev/urandom` give random bytes
 - a program that ended keeps its memory until it's waited for, and those
   never waited for go with their parent rather than to an init;
 - `execve` reads all of a program's segments into memory as it starts it,
-  rather than as they're used;
+  rather than as they're used; and `mmap` all it maps of a file, so a
+  shared library is read from the disk into each program that loads it,
+  rather than shared between them;
+- an interpreter must be position-independent, as loaders are, rather than
+  at addresses of its own;
 - random bytes come from RDRAND when the CPU has it, which QEMU's default
   CPU hasn't, and otherwise from the timestamp counter, stirred, which is
   guessable;
@@ -421,34 +430,45 @@ from its tag), unchanged, configured as it says.
 
 `scripts/toolchain.sh` builds a compiler for the disk, so programs can be
 compiled on simplos and run there: gcc and g++ 14.3.0, binutils 2.44, and
-musl 1.2.6's headers and `libc.a`, with `cc` for gcc, all under `/usr`.
+musl 1.2.6, with `cc` for gcc, all under `/usr`; and musl's loader,
+`/lib/ld-musl-x86_64.so.1`, and `ldd`.
 
 ```sh
 gcc -O2 -o hello hello.c && ./hello
 g++ -O2 -o hello hello.cc && ./hello
+gcc -O2 -fPIC -shared -o libgreet.so greet.c && gcc -o greeted greeted.c -L. -lgreet
+LD_LIBRARY_PATH=. ./greeted && LD_LIBRARY_PATH=. ldd ./greeted
 ```
 
 They're static programs for x86-64 Linux with musl, as the userland's are,
 made by musl-cross-make from the sources the script pins and checks by their
 SHA-256: first a cross compiler, with the host's gcc, then with that one the
-compiler itself. What they compile is static too, as simplos runs nothing
-else, unless it's asked for otherwise. Before it's done, the script compiles
-C and C++ with it on the host, which can run what it makes. The first build
-takes 13 minutes on 32 cores, needs the network and a few GB of room while
-it runs, and leaves 155 MB in `target/toolchain/root`; after that it's done,
-until the script changes. It builds on x86-64 Linux only.
+compiler itself. What they compile is linked as on Linux: dynamically, to
+musl's `libc.so` and, for C++, `libstdc++.so.6` and `libgcc_s.so.1`, which
+the loader the program names loads as it starts, as `dlopen` does as it
+runs; or with `-static`, not. It's position-independent unless asked
+otherwise, as Alpine's is, so that the loader, run as `ldd`, can put it
+anywhere. Before it's done, the script compiles C and C++ with it on the
+host, which can run what it makes, both ways. The first build takes 13
+minutes on 32 cores, needs the network and a few GB of room while it runs,
+and leaves 163 MB in `target/toolchain/root`; after that it's done, until
+the script changes. It builds on x86-64 Linux only.
 
 `cargo run`'s disk gets it over the userland, which makes it 1 GiB, on an
 AHCI controller, and `cargo run` gives the guest 1 GiB of memory unless `-m`
 is given; a hello world, even in C++ with `<iostream>`, compiles in QEMU's
 default 128 MiB. Under emulation, `gcc -O2` compiles a C hello world there
-in 5 s and `g++ -O2` an `<iostream>` one in 35 s. For now:
+in 4 s, and `g++ -O2` an `<iostream>` one in 9 s, or in 28 s with
+`-static`, which reads what it needs of `libstdc++.a` into it. For now:
 
 - a program is read whole as it starts, and that's most of the time it
   takes: `cc1`, 36 MB, takes 6 s to start from an AHCI disk, read by DMA,
   and 25 s from an IDE one, read a word at a time by port I/O;
-- there's no LTO, no sanitizers, and no shared libraries, as simplos can't
-  load them.
+- a program linked dynamically reads its shared libraries from the disk
+  each time it starts, simplos having nowhere to keep them, so one linked
+  statically starts sooner: that C++ hello world in 0.09 s rather than
+  0.23 s;
+- there's no LTO and no sanitizers.
 
 gcc and binutils are GPL-3.0, with GCC's runtime library exception for what's
 linked into programs; musl is MIT; gmp, mpfr and mpc, which gcc is linked
@@ -478,7 +498,9 @@ copies of and run again; `tests/tty.rs` types into a terminal for it to read;
 `tests/shells.rs` runs busybox's sh and zsh, as commands and typed at on a
 terminal: its disk is 128 MiB and holds the userland too, which the runner
 builds with `scripts/userland.sh` the first time. `tests/toolchain.rs`
-compiles C and C++ with gcc and g++ and runs what they made: its disk is
+compiles C and C++ with gcc and g++, linked dynamically and statically, a
+shared library and a program that loads one with `dlopen`, and runs what
+they made: its disk is
 1 GiB, with GCC from `scripts/toolchain.sh` as well, and it gets as long as
 compiling takes. After a run that passes, e2fsck must find nothing wrong with it, and it must have been
 unmounted, so the tests need e2fsprogs installed.
