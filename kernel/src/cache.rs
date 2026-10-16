@@ -20,8 +20,8 @@ use spin::Mutex;
 use x86_64::structures::paging::PhysFrame;
 
 /// The most pages kept: 256 MiB, room for rustc's 230 MB librustc_driver.
-/// Each costs the kernel's heap, which is a fixed 20 MiB, about 35 bytes in
-/// the index.
+/// Each costs the kernel's heap about 70 bytes in the index, its nodes
+/// rounded up to the allocator's 512-byte blocks: 4.5 MiB in all.
 const MOST: usize = 65536;
 
 /// Bytes in a page.

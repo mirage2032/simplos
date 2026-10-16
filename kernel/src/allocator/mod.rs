@@ -1,3 +1,4 @@
+use core::sync::atomic::{AtomicUsize, Ordering};
 use fixed_size_block::FixedSizeBlockAllocator;
 use x86_64::{
     VirtAddr,
@@ -10,18 +11,39 @@ pub mod fixed_size_block;
 
 /// Upper half, with a PML4 entry to itself; see the layout in `lib.rs`.
 pub const HEAP_START: usize = 0xFFFF_C000_0000_0000;
-pub const HEAP_SIZE: usize = 1024 * 1024 * 20; // 20 MiB
+
+/// How big the heap is: a sixteenth of the machine's memory, at least
+/// 20 MiB and at most 256 MiB, mapped whole as it's set up. What a bigger
+/// machine runs takes more of it: the page cache's index; lwext4's
+/// journal, which keeps a copy of each block a transaction writes until
+/// it's committed; and each program's reads and writes, 64 KiB at a time.
+/// A copy of the screen takes 8 MiB of it, for 1920x1080.
+pub fn heap_size(memory: u64) -> usize {
+    const SMALLEST: usize = 20 << 20;
+    const LARGEST: usize = 256 << 20;
+    (memory as usize / 16).clamp(SMALLEST, LARGEST).next_multiple_of(4096)
+}
+
+/// What `init_heap` made it.
+static SIZE: AtomicUsize = AtomicUsize::new(0);
+
+/// How big the heap is.
+pub fn size() -> usize {
+    SIZE.load(Ordering::Relaxed)
+}
 
 #[global_allocator]
 static ALLOCATOR: Locked<FixedSizeBlockAllocator> = Locked::new(FixedSizeBlockAllocator::new());
 
+/// Map `size` bytes of heap, and hand them to the allocator.
 pub fn init_heap(
     mapper: &mut impl Mapper<Size4KiB>,
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+    size: usize,
 ) -> Result<(), MapToError<Size4KiB>> {
     let page_range = {
         let heap_start = VirtAddr::new(HEAP_START as u64);
-        let heap_end = heap_start + HEAP_SIZE as u64 - 1u64;
+        let heap_end = heap_start + size as u64 - 1u64;
         let heap_start_page = Page::containing_address(heap_start);
         let heap_end_page = Page::containing_address(heap_end);
         Page::range_inclusive(heap_start_page, heap_end_page)
@@ -34,8 +56,9 @@ pub fn init_heap(
     }
 
     unsafe {
-        ALLOCATOR.lock().init(HEAP_START, HEAP_SIZE);
+        ALLOCATOR.lock().init(HEAP_START, size);
     }
+    SIZE.store(size, Ordering::Relaxed);
 
     Ok(())
 }

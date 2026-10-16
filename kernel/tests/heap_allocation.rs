@@ -18,7 +18,7 @@ use alloc::boxed::Box;
 use alloc::vec;
 use bootloader_api::{BootInfo, entry_point};
 use core::panic::PanicInfo;
-use simplos::allocator::HEAP_SIZE;
+use simplos::allocator;
 
 entry_point!(main, config = &simplos::BOOTLOADER_CONFIG);
 
@@ -39,7 +39,7 @@ fn freed_blocks_are_reused() {
     let long_lived = Box::new(42u64);
     // More blocks in total than the heap holds: this only finishes if freeing
     // one makes room for the next.
-    for i in 0..HEAP_SIZE / BLOCK + 1000 {
+    for i in 0..allocator::size() / BLOCK + 1000 {
         let block = Box::new([i as u8; BLOCK]);
         assert_eq!(block[BLOCK - 1], i as u8);
     }
