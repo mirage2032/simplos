@@ -77,7 +77,8 @@ install -m 644 "$uefi" "$root/$out/uefi.img"
 
 # The ext4 disk, made as `cargo run` makes its own (`disk` in
 # fullkernel/src/main.rs; keep the two in step): hello.txt, the user program
-# as /bin/probe, the userland, GCC, and Rust's rustc and cargo. Unlike
+# as /bin/probe, the userland, GCC, and Rust's rustc and cargo, and
+# compinit's record of their completions (scripts/completions.sh). Unlike
 # `cargo run`, they have to build: a release without busybox, uutils, zsh,
 # vim, gcc and cargo isn't one. 2 GiB to the guest, but compressed qcow2
 # holds only what mke2fs wrote, so the file is a fraction of that, and QEMU
@@ -95,7 +96,12 @@ cp "$probe" "$work/tree/bin/probe"
 cp -a "$root/target/userland/root/." "$work/tree/"
 cp -a --remove-destination "$root/target/toolchain/root/." "$work/tree/"
 cp -a --remove-destination "$root/target/rust/root/." "$work/tree/"
-PATH=$PATH:/usr/sbin:/sbin mke2fs -q -t ext4 -d "$work/tree" "$work/disk.img" 2G
+"$root/scripts/completions.sh" "$work/tree"
+# Inode tables zeroed now, and marked so: lwext4 would zero each group's as
+# it first allocates in it, 10 MiB through the journal on the first write.
+# Zeros cost the compressed qcow2 nothing.
+PATH=$PATH:/usr/sbin:/sbin mke2fs -q -t ext4 -E lazy_itable_init=0 -d "$work/tree" \
+    "$work/disk.img" 2G
 qemu-img convert -c -f raw -O qcow2 "$work/disk.img" "$root/$out/disk.qcow2"
 
 echo "Images in $out/:" >&2

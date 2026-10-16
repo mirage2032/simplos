@@ -1229,7 +1229,15 @@ int jbd_recover(struct jbd_fs *jbd_fs)
 	if (r != EOK)
 		return r;
 
+	/* LOCAL PATCH: replayed into the cache and written from there once
+	 * it's done, each block once, where a block in many transactions was
+	 * written once for each of them; before the journal's marked empty,
+	 * so a crash in between replays it all again. */
+	ext4_block_cache_write_back(jbd_fs->bdev, 1);
 	r = jbd_iterate_log(jbd_fs, &info, ACTION_RECOVER);
+	ext4_block_cache_write_back(jbd_fs->bdev, 0);
+	if (r == EOK)
+		r = ext4_block_cache_flush(jbd_fs->bdev);
 	if (r == EOK) {
 		/* If we successfully replay the journal,
 		 * clear EXT4_FINCOM_RECOVER flag on the
@@ -2111,8 +2119,6 @@ static void jbd_trans_end_write(struct ext4_bcache *bc __unused,
 	struct jbd_trans *trans = jbd_buf->trans;
 	struct jbd_block_rec *block_rec = jbd_buf->block_rec;
 	struct jbd_journal *journal = trans->journal;
-	bool first_in_queue =
-		trans == TAILQ_FIRST(&journal->cp_queue);
 	if (res != EOK)
 		trans->error = res;
 
@@ -2141,7 +2147,13 @@ static void jbd_trans_end_write(struct ext4_bcache *bc __unused,
 		 * transaction, and remove subsequent written
 		 * transactions from checkpoint queue until we find
 		 * an unwritten one. */
-		if (first_in_queue) {
+		/* LOCAL PATCH: first now, not as this began: the
+		 * callback above can finish the transactions before it,
+		 * which then stop at it, unwritten as it was; asked
+		 * first, it stayed in the queue for good, written, and
+		 * the journal's start with it, for a crash to replay
+		 * everything after. */
+		if (trans == TAILQ_FIRST(&journal->cp_queue)) {
 			journal->start = trans->start_iblock +
 				trans->alloc_blocks;
 			wrap(&journal->jbd_fs->sb, journal->start);

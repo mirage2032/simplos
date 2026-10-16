@@ -127,6 +127,10 @@ ext4_balloc_verify_bitmap_csum(struct ext4_sblock *sb,
 			       struct ext4_bgroup *bg,
 			       void *bitmap __unused)
 {
+	/* LOCAL PATCH: a mismatch is only ever logged, by ext4_dbg: not
+	 * worked out when that logs nothing, as it's most of a lookup's time. */
+	if (!CONFIG_DEBUG_PRINTF)
+		return true;
 	int desc_size = ext4_sb_get_desc_size(sb);
 	uint32_t checksum = ext4_balloc_bitmap_csum(sb, bitmap);
 	uint16_t lo_checksum = to_le16(checksum & 0xFFFF),

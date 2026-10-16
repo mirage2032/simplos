@@ -84,9 +84,9 @@ jobs:
           # none), and the paths its result depends on besides those.
           JOBS: |
             lint        lint   rustfmt.toml kernel fullkernel tools user fs vendor
-            test-kernel test   kernel tools user fs vendor userland scripts/boot-test.sh scripts/userland.sh scripts/toolchain.sh
-            test-rust   -      kernel tools user fs vendor userland scripts/boot-test.sh scripts/userland.sh scripts/toolchain.sh scripts/rust.sh
-            images      images kernel fullkernel user fs vendor userland scripts/build-images.sh scripts/smoke-test.sh scripts/userland.sh scripts/toolchain.sh scripts/rust.sh
+            test-kernel test   kernel tools user fs vendor userland scripts/boot-test.sh scripts/userland.sh scripts/toolchain.sh scripts/completions.sh
+            test-rust   -      kernel tools user fs vendor userland scripts/boot-test.sh scripts/userland.sh scripts/toolchain.sh scripts/rust.sh scripts/completions.sh
+            images      images kernel fullkernel user fs vendor userland scripts/build-images.sh scripts/smoke-test.sh scripts/userland.sh scripts/toolchain.sh scripts/rust.sh scripts/completions.sh
         run: .github/scripts/plan.sh
 
   lint:

@@ -35,13 +35,14 @@ extern crate alloc;
 mod memory;
 
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::ffi::CString;
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ffi::{CStr, c_char, c_int, c_void};
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use spin::{Mutex, MutexGuard};
 
 pub const SECTOR: usize = 512;
@@ -246,7 +247,19 @@ struct Mount {
     failed: Mutex<Option<Error>>,
     /// Who's told what changes in files: `Ext4::watch`.
     watcher: Mutex<Option<Watcher>>,
+    /// Where paths led, by lwext4's path: to an inode, or to nothing.
+    /// Forgotten whole as any name is made, moved or removed (`forget`).
+    names: Mutex<BTreeMap<CString, Option<u32>>>,
+    /// Whether anything has been done on it since `Ext4::flush` last
+    /// looked.
+    used: AtomicBool,
 }
+
+/// How many paths `Mount::names` keeps.
+///
+/// shortcut: forgotten whole when full; keep the most used instead if a
+/// workload looks up more paths than this, over and over.
+const NAMES: usize = 4096;
 
 /// Writes to an open file, one after another from `offset` on, not made
 /// yet: by `Mount::lock`, before anything else is done on the mount, so
@@ -321,6 +334,8 @@ impl Ext4 {
             pending: Mutex::new(None),
             failed: Mutex::new(None),
             watcher: Mutex::new(None),
+            names: Mutex::new(BTreeMap::new()),
+            used: AtomicBool::new(false),
         };
         // The slot stays taken until `mount`'s `Drop` has undone whatever
         // `attach` managed, if it fails: that takes the lock, so it runs
@@ -349,9 +364,7 @@ impl Ext4 {
     pub fn metadata(&self, path: &str) -> Result<Metadata, Error> {
         let path = self.path(path)?;
         let _lwext4 = self.mount.lock();
-        let mut inode = 0;
-        // Safety: a NUL-terminated path on our mount.
-        check(unsafe { ffi::simplos_ext4_inode_of(path.as_ptr(), &mut inode) })?;
+        let inode = self.mount.inode_of(&path)?;
         self.mount.stat(inode)
     }
 
@@ -438,6 +451,10 @@ impl Ext4 {
         };
         let path = self.path(path)?;
         let _lwext4 = self.mount.lock();
+        // Made by this open, as it is now, with the lock held.
+        if flags & O_CREAT != 0 && self.mount.inode_of(&path).is_err() {
+            self.mount.forget();
+        }
         let mut error = 0;
         // Safety: as in `metadata`.
         let raw = unsafe { ffi::simplos_ext4_file_open(path.as_ptr(), flags, &mut error) };
@@ -477,6 +494,7 @@ impl Ext4 {
         self.check_parent(path)?;
         let at = self.path(path)?;
         let lwext4 = self.mount.lock();
+        self.mount.forget();
         // Safety: as in `metadata`.
         check(unsafe { ffi::ext4_dir_mk(at.as_ptr()) })?;
         drop(lwext4);
@@ -508,6 +526,7 @@ impl Ext4 {
         }
         let path = self.path(path)?;
         let lwext4 = self.mount.lock();
+        self.mount.forget();
         self.keep(&path, &metadata)?;
         // Safety: as in `metadata`.
         check(unsafe { ffi::ext4_fremove(path.as_ptr()) })?;
@@ -561,6 +580,7 @@ impl Ext4 {
         if self.mount.open.lock().contains(&metadata.inode) {
             return Err(Error::Busy);
         }
+        self.mount.forget();
         // Safety: as in `metadata`.
         check(unsafe { ffi::ext4_dir_rm(path.as_ptr()) })
     }
@@ -600,6 +620,7 @@ impl Ext4 {
         self.check_parent(to)?;
         let (from, to) = (self.path(from)?, self.path(to)?);
         let lwext4 = self.mount.lock();
+        self.mount.forget();
         if let Some(replaced) = &replaced {
             self.keep(&to, replaced)?;
         }
@@ -627,6 +648,7 @@ impl Ext4 {
         let target = CString::new(target).map_err(|_| Error::InvalidArgument)?;
         let at = self.path(path)?;
         let lwext4 = self.mount.lock();
+        self.mount.forget();
         // Safety: two NUL-terminated strings, the second a path on our mount.
         check(unsafe { ffi::ext4_fsymlink(target.as_ptr(), at.as_ptr()) })?;
         drop(lwext4);
@@ -649,9 +671,22 @@ impl Ext4 {
     }
 
     /// Write the small writes held to be made as one, as `sync` does, but
-    /// leave telling whether they could be to it.
+    /// leave telling whether they could be to it. And if nothing else was
+    /// done on it since this was last called, the blocks lwext4 holds in
+    /// memory too, the journal's changes, where they go: then the power
+    /// going leaves the journal nothing to replay. For a thread that calls
+    /// it every so often, as the disk is idle.
     pub fn flush(&self) {
-        drop(self.mount.lock());
+        let _lwext4 = LWEXT4.lock();
+        let idle = !self.mount.used.swap(false, Ordering::Relaxed);
+        self.mount.flush();
+        if idle && self.mount.write_back {
+            // Safety: the mount point is NUL-terminated and mounted.
+            let written = check(unsafe { ffi::ext4_cache_flush(self.mount.mount_point.as_ptr()) });
+            if let Err(error) = written {
+                self.mount.failed.lock().get_or_insert(error);
+            }
+        }
     }
 
     /// Where the symbolic link at `path` points, as it was given.
@@ -684,6 +719,7 @@ impl Ext4 {
         self.check_parent(to)?;
         let (from_at, to_at) = (self.path(from)?, self.path(to)?);
         let lwext4 = self.mount.lock();
+        self.mount.forget();
         // Safety: as in `rename`.
         check(unsafe { ffi::ext4_flink(from_at.as_ptr(), to_at.as_ptr()) })?;
         drop(lwext4);
@@ -727,8 +763,37 @@ impl Mount {
     /// is written first.
     fn lock(&self) -> MutexGuard<'static, [bool; MOUNTS]> {
         let lwext4 = LWEXT4.lock();
+        self.used.store(true, Ordering::Relaxed);
         self.flush();
         lwext4
+    }
+
+    /// The inode at `path`, lwext4's path: where it led last time, if it's
+    /// been looked up since names last changed, as looking it up again
+    /// reads every directory on the way; `LWEXT4` is held.
+    fn inode_of(&self, path: &CStr) -> Result<u32, Error> {
+        let mut names = self.names.lock();
+        if let Some(found) = names.get(path) {
+            return found.ok_or(Error::NotFound);
+        }
+        let mut inode = 0;
+        // Safety: a NUL-terminated path on our mount.
+        let found = match check(unsafe { ffi::simplos_ext4_inode_of(path.as_ptr(), &mut inode) }) {
+            Ok(()) => Some(inode),
+            Err(Error::NotFound) => None,
+            Err(error) => return Err(error),
+        };
+        if names.len() >= NAMES {
+            names.clear();
+        }
+        names.insert(path.into(), found);
+        found.ok_or(Error::NotFound)
+    }
+
+    /// Forget where paths led, before a name is made, moved or removed;
+    /// `LWEXT4` is held.
+    fn forget(&self) {
+        self.names.lock().clear();
     }
 
     /// Write what `Pending` holds, if anything; `LWEXT4` is held.
@@ -1123,6 +1188,7 @@ impl Drop for File {
         {
             kept.swap_remove(at);
             // The last of a file whose other names are gone: it goes too.
+            self.mount.forget();
             // Safety: as in `Ext4::metadata`.
             unsafe { ffi::ext4_fremove(self.mount.keeper(self.inode).as_ptr()) };
             gone = true;
@@ -1239,6 +1305,7 @@ mod ffi {
         pub fn simplos_ext4_read_only(mount_point: *const c_char) -> c_int;
         pub fn simplos_ext4_journaled(mount_point: *const c_char) -> c_int;
         pub fn ext4_cache_write_back(mount_point: *const c_char, on: bool) -> c_int;
+        pub fn ext4_cache_flush(mount_point: *const c_char) -> c_int;
         pub fn simplos_ext4_file_open(
             path: *const c_char,
             flags: c_int,

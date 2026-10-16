@@ -22,6 +22,12 @@ debug = 2
 opt-level = 0
 debug = 2
 
+# But the file system, lwext4 and all, optimised, as the tests have it:
+# everything on the disk is reached through it, and it's C nobody steps
+# through.
+[profile.dev.package.ext4]
+opt-level = 2
+
 # The kernel is an *artifact build-dependency*, so cargo builds it under
 # `build-override`, not under `[profile.release]`. Without this a release build
 # still ships an unoptimised kernel — which matters most when the guest CPU is

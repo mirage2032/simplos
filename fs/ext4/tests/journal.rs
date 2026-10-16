@@ -22,6 +22,12 @@ fn recovers_what_linux_left_in_its_journal() {
     assert_eq!(Ext4::mount(Box::new(image.clone())).err(), Some(Error::NeedsRecovery));
 
     let fs = Ext4::mount_writable(Box::new(image.clone())).unwrap();
+    // The power going as soon as it's recovered: what was replayed is on
+    // the disk by the time the journal's marked empty, not only in memory.
+    let crashed = dir.join("crashed.img");
+    image.save(&crashed);
+    replay(&crashed).unwrap();
+    fsck(&crashed).unwrap();
     let entry = |name: &str, kind| (String::from(name), kind);
     assert_eq!(
         names(fs.read_dir("/").unwrap()),
@@ -85,6 +91,11 @@ fn survives_a_crash_at_any_write() {
         fs.rename(&format!("{time}/swap.txt"), "target.txt").unwrap();
         fs.create_dir(&format!("{time}/gone")).unwrap();
         fs.remove_dir(&format!("{time}/gone")).unwrap();
+        // Idle, as simplos's writer would find it: what the journal holds
+        // written where it goes, a crash at any write of which must be
+        // safe too.
+        fs.flush();
+        fs.flush();
     }
 
     let writes = image.writes.lock().unwrap().clone();

@@ -105,7 +105,9 @@ cargo run -- -drive format=raw,file=disk.img
 ```
 
 Nothing unmounts it when QEMU is closed, which to the disk is a power cut:
-the next boot replays the journal, as Linux would. Small writes to a file,
+the next boot replays what its journal holds, as Linux would; which is
+nothing once a second has passed with nothing done on the disk, as what the
+journal holds is then written where it goes. Small writes to a file,
 one after another, wait in memory to be written as one, as each write
 costs the disk a handful of its own however little it writes: until
 anything else is done on the disk, the file is closed, a program calls
@@ -474,10 +476,12 @@ needs no new build:
   history, kept in `~/.zsh_history`; Emacs's keys and the console's Home,
   End and Delete; and a prompt saying who, where and in which directory.
 
-What the completion system knows of its 998 functions it keeps in
-`~/.zcompdump`, which the build makes for root, by running the same zsh:
-made on simplos, it takes ten seconds under emulation, most of it reading
-the functions a byte at a time, a system call for each.
+What the completion system knows of its functions, zsh's 998 and Rust's
+`_cargo`, it keeps in `~/.zcompdump`, which the build makes for root once
+the disk's trees are all in (`scripts/completions.sh`), by running the same
+zsh. compinit uses it only if it counts as many functions as there are, and
+otherwise makes it again as root's zsh starts, which takes seconds under
+emulation, ten thousand lookups on the disk.
 
 `cargo run`'s disk gets all of it as it's made: delete `fullkernel/disk.img`
 for one that has it. Then zsh is what you type at, and once it ends, the
@@ -682,7 +686,7 @@ be added to the others that need it.
 `vendor/lwext4` is upstream [lwext4](https://github.com/gkostka/lwext4) at
 commit `58bcf89` (2022-09-22): its `src/` and `include/` without the mkfs and
 MBR code, which nothing uses. It is GPL-2.0 (its extents and xattr code are
-"GPL-2.0 or later"), like simplos. It has seven local fixes, each marked
+"GPL-2.0 or later"), like simplos. It has eight local fixes, each marked
 `LOCAL PATCH` in the source, all found by `fs/ext4`'s tests:
 
 - **`metadata_csum_seed`, which e2fsprogs 1.47.4's `mke2fs` turns on for
@@ -713,6 +717,10 @@ MBR code, which nothing uses. It is GPL-2.0 (its extents and xattr code are
 - **`src/ext4.c`, a symbolic link too long for its inode** — its target went
   into a block of its own, after whatever a file freed before had left
   there, where Linux zeroes the rest: e2fsck took such links to be broken.
+- **`src/ext4_journal.c`, a transaction written where it goes** — whether it
+  was the oldest in the journal was asked before the transactions older than
+  it were finished, which writing it can do: then it stayed, written, and
+  the journal's start with it, so a crash replayed everything after.
 
 And two additions, also marked: **`src/ext4.c`, renaming onto a file that's
 there** replaces it in the rename's own transaction, as `rename(2)` promises,
@@ -721,6 +729,15 @@ refuses (`EEXIST`). And **`ext4_inode_attrs_set`** changes a file's
 permissions, owner, group and times by inode, in one transaction: upstream
 sets each by path, in a transaction of its own, and the path of a file that's
 open may have changed.
+
+And three for speed, marked too. Its checksums of metadata are checked
+(`src/ext4_dir.c` and the others) only where a mismatch is logged, which with
+debug `printf` off is nowhere: checking them was most of what a lookup took,
+each directory block's 4 KiB on each lookup. Its crc32c (`src/ext4_crc32.c`)
+takes eight bytes at a time rather than one, five times as fast. And
+replaying a journal (`src/ext4_journal.c`) writes each block once, from its
+cache, before the journal's marked empty, rather than once for each
+transaction it's in.
 
 `fs/ext4` compiles it with the host's C compiler, the same way for the
 kernel as for its tests on the host: freestanding, with no C library but the
@@ -751,9 +768,12 @@ file (writing past the end fills the gap with zeros). A new file's permissions a
 set just after it's made, in a transaction of their own. Every call is a
 transaction of its own, in the journal before the call returns, where
 there's one: lwext4's cache then writes the blocks to their places in its
-own time (its write-back mode), or as the file system is unmounted. Without
-a journal, it writes them through. So `fs/ext4` holds a stream of small
-writes to a file, and makes them in one call.
+own time (its write-back mode), or as the file system is unmounted, or as
+nothing else is being done on it (`Ext4::flush`). Without a journal, it
+writes them through. So `fs/ext4` holds a stream of small writes to a file,
+and makes them in one call. And it keeps where paths led, to an inode or to
+nothing, as lwext4 would read every directory on the way again: forgotten
+whole as any name is made, moved or removed.
 
 Building and running `fs/ext4`'s tests needs e2fsprogs (`mke2fs`, `e2fsck`,
 `debugfs`) and `gzip`. Every test that writes ends with `e2fsck -fn` on the

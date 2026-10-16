@@ -51,8 +51,10 @@ pub fn init() {
     ext4::set_clock(|| (crate::time::now() / crate::time::NANOS) as u32);
     // Small writes wait in memory to be made as one (see `ext4`): a second
     // at most, so the power going loses no more. If they can't be made, the
-    // program's next fsync is told. Once, however often the disk is mounted
-    // again.
+    // program's next fsync is told. And a second in which nothing was done
+    // on the disk, its journal's changes are written where they go, so the
+    // power going then leaves nothing to replay. Once, however often the
+    // disk is mounted again.
     static WRITER: spin::Once = spin::Once::new();
     WRITER.call_once(|| {
         thread::spawn(|| {
