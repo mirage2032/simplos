@@ -16,6 +16,7 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use alloc::vec;
+use alloc::vec::Vec;
 use bootloader_api::{BootInfo, entry_point};
 use core::panic::PanicInfo;
 use simplos::allocator;
@@ -50,5 +51,21 @@ fn freed_blocks_are_reused() {
 fn large_allocation() {
     // Too big for any block list, so this is the fallback heap's job.
     let buffer = vec![7u8; 1 << 20];
+    assert!(buffer.iter().all(|&b| b == 7));
+}
+
+#[test_case]
+fn small_blocks_freed_can_be_had_again_in_one_piece() {
+    // Three quarters of what's free, in small blocks, as the page cache's
+    // index takes it; then freed, and half of it had again as one buffer,
+    // which only works if the blocks went back to be joined up.
+    let free = allocator::free();
+    let count = free / 4 * 3 / 512;
+    let mut blocks = Vec::with_capacity(count);
+    for i in 0..count {
+        blocks.push(Box::new([i as u8; 512]));
+    }
+    drop(blocks);
+    let buffer = vec![7u8; free / 2];
     assert!(buffer.iter().all(|&b| b == 7));
 }

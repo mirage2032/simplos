@@ -107,6 +107,17 @@ pub const STACKS_START: u64 = 0xFFFF_D000_0000_0000;
 /// boot thread, so code that runs there runs on any thread.
 const STACK_PAGES: u64 = 20;
 
+/// `attempt`, and if memory ran out, `attempt` again once the page cache has
+/// given back what it can: the frames it keeps are free memory, as far as
+/// anything that wants one goes. Whatever `attempt` did before running out
+/// must be done again, or kept, the second time.
+fn reclaiming<T>(mut attempt: impl FnMut() -> Option<T>) -> Option<T> {
+    attempt().or_else(|| {
+        crate::cache::shrink();
+        attempt()
+    })
+}
+
 /// A kernel thread's stack, with an unmapped guard page below it so that an
 /// overflow faults instead of running into whatever is mapped underneath.
 /// Unmapped, and its frames freed, when dropped.
@@ -118,6 +129,10 @@ pub struct KernelStack {
 impl KernelStack {
     /// `None` when memory runs out.
     pub fn new() -> Option<KernelStack> {
+        reclaiming(Self::try_new)
+    }
+
+    fn try_new() -> Option<KernelStack> {
         // shortcut: a slot's addresses are never reused, only its frames, so
         // after about 6 million stacks this returns None; keep a free list of
         // slots if anything ever spawns that many.
@@ -175,7 +190,7 @@ impl Drop for KernelStack {
 /// a pointer the kernel can use. `None` once memory runs out or before boot.
 /// Give it back through `FRAMES` with `deallocate_frame` when the device is done.
 pub fn alloc_dma_frame() -> Option<(PhysAddr, *mut u8)> {
-    let frame = FRAMES.lock().as_mut()?.allocate_frame()?;
+    let frame = reclaiming(|| FRAMES.lock().as_mut()?.allocate_frame())?;
     let ptr = phys_ptr(frame.start_address())?;
     // Safety: the frame is ours alone and mapped at the physical-memory offset.
     unsafe { ptr.write_bytes(0, 4096) };
@@ -189,6 +204,12 @@ pub fn alloc_dma_frame() -> Option<(PhysAddr, *mut u8)> {
 /// shared again rather than copied by `fork`. One of the bits the CPU
 /// leaves to the OS.
 pub const SHARED: PageTableFlags = PageTableFlags::BIT_9;
+
+/// A `SHARED` page a program mapped with MAP_SHARED, whose writes would
+/// have to reach the file: which nothing here does, so it's never made
+/// writable (`mprotect` refuses), where a copy would quietly keep them from
+/// it. Kept with `SHARED` as its protection changes, and by `fork`.
+pub const FILE_SHARED: PageTableFlags = PageTableFlags::BIT_10;
 
 /// A user program's memory: a PML4 of its own, whose upper half is the
 /// kernel's and whose lower half starts empty. Pages are mapped with fresh,
@@ -204,9 +225,10 @@ pub struct AddressSpace {
 }
 
 impl AddressSpace {
-    /// `None` when memory runs out.
+    /// `None` when memory runs out, even once the page cache has given back
+    /// what it can.
     pub fn new() -> Option<AddressSpace> {
-        let pml4 = FRAMES.lock().as_mut()?.allocate_frame()?;
+        let pml4 = reclaiming(|| FRAMES.lock().as_mut()?.allocate_frame())?;
         let space = AddressSpace { pml4, pages: 0, stack: 0..0 };
         let table = table(pml4);
         table.zero();
@@ -230,10 +252,7 @@ impl AddressSpace {
     /// shortcut: every page is copied at once; share them copy-on-write when
     /// forking big programs gets slow.
     pub fn duplicate(&self) -> Option<AddressSpace> {
-        self.try_duplicate().or_else(|| {
-            crate::cache::shrink();
-            self.try_duplicate()
-        })
+        reclaiming(|| self.try_duplicate())
     }
 
     fn try_duplicate(&self) -> Option<AddressSpace> {
@@ -289,10 +308,7 @@ impl AddressSpace {
     /// the page cache has given back what it can.
     pub fn map(&mut self, pages: PageRange, flags: PageTableFlags) -> Option<()> {
         // Again from the start: what's mapped already stays as it is.
-        self.try_map(pages, flags).or_else(|| {
-            crate::cache::shrink();
-            self.try_map(pages, flags)
-        })
+        reclaiming(|| self.try_map(pages, flags))
     }
 
     fn try_map(&mut self, pages: PageRange, flags: PageTableFlags) -> Option<()> {
@@ -354,18 +370,20 @@ impl AddressSpace {
             | PageTableFlags::USER_ACCESSIBLE;
         let table_flags =
             PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
-        let mut frames = FRAMES.lock();
-        let frames = frames.as_mut()?;
-        // Safety: a lower-half page of this address space, unmapped just now;
-        // and a frame whose holders only read it.
-        match unsafe {
-            self.mapper().map_to_with_table_flags(page, frame, flags, table_flags, frames)
-        } {
-            Ok(flush) => flush.flush(),
-            Err(_) => {
-                frames.release(frame);
-                return None;
-            }
+        // What can run out is memory for its page tables.
+        let mapped = reclaiming(|| {
+            let mut frames = FRAMES.lock();
+            let frames = frames.as_mut()?;
+            // Safety: a lower-half page of this address space, unmapped just
+            // now; and a frame whose holders only read it.
+            let mapping = unsafe {
+                self.mapper().map_to_with_table_flags(page, frame, flags, table_flags, frames)
+            };
+            mapping.ok().map(|flush| flush.flush())
+        });
+        if mapped.is_none() {
+            FRAMES.lock().as_mut()?.release(frame);
+            return None;
         }
         self.pages += 1;
         Some(())
@@ -417,10 +435,7 @@ impl AddressSpace {
     /// once the page cache has given back what it can.
     pub fn protect(&mut self, pages: PageRange, flags: PageTableFlags) -> Option<()> {
         // Again from the start: what's done stays done.
-        self.try_protect(pages, flags).or_else(|| {
-            crate::cache::shrink();
-            self.try_protect(pages, flags)
-        })
+        reclaiming(|| self.try_protect(pages, flags))
     }
 
     fn try_protect(&mut self, pages: PageRange, flags: PageTableFlags) -> Option<()> {
@@ -438,7 +453,8 @@ impl AddressSpace {
                 continue;
             }
             // Safety: the program's own pages, keeping their frames.
-            if let Ok(flush) = unsafe { mapper.update_flags(page, flags | (old & SHARED)) } {
+            let kept = old & (SHARED | FILE_SHARED);
+            if let Ok(flush) = unsafe { mapper.update_flags(page, flags | kept) } {
                 flush.flush();
             }
         }
@@ -455,7 +471,8 @@ impl AddressSpace {
             else {
                 continue;
             };
-            let flags = PageTableFlags::PRESENT | PageTableFlags::NO_EXECUTE | (old & SHARED);
+            let kept = old & (SHARED | FILE_SHARED);
+            let flags = PageTableFlags::PRESENT | PageTableFlags::NO_EXECUTE | kept;
             // Safety: the program's own pages, keeping their frames.
             if let Ok(flush) = unsafe { mapper.update_flags(page, flags) } {
                 flush.flush();
@@ -662,7 +679,8 @@ fn unshare(
     frames.release(shared);
     // Safety: the page just unmapped, whose tables are still there, now with
     // a frame no one else has.
-    unsafe { mapper.map_to_with_table_flags(page, own, flags - SHARED, table_flags, frames) }
+    let flags = flags - SHARED - FILE_SHARED;
+    unsafe { mapper.map_to_with_table_flags(page, own, flags, table_flags, frames) }
         .expect("a page's tables stay as it's unmapped")
         .flush();
     Some(())
@@ -728,12 +746,14 @@ pub struct BootInfoFrameAllocator {
     /// holder (`SHARED` pages), by the frame's number; 0 for the rest. The
     /// last to let go of one frees it. Made by `count_holders` as big as the
     /// highest usable frame needs, once and in one piece, so that counting
-    /// takes no more of the heap as more is shared: 512 KiB for 1 GiB.
+    /// takes no more of the heap as more is shared: 1 MiB for 1 GiB. Four
+    /// bytes each, as a program can map one page of a file as often as it
+    /// likes, each time holding it once more: two would run out at 65536.
     ///
-    /// shortcut: a machine with more than about 16 GiB has more frames than
-    /// the kernel's 20 MiB heap could count this way; count only those
-    /// shared, by number, if one turns up.
-    shared: Vec<u16>,
+    /// shortcut: on a machine with more than about 64 GiB, these take more
+    /// than a quarter of the kernel's heap; count only those shared, by
+    /// number, if one turns up.
+    shared: Vec<u32>,
 }
 
 /// Ends the `freed` stack. Not 0, because frame 0 can be usable memory.
@@ -775,7 +795,7 @@ impl BootInfoFrameAllocator {
     }
 
     /// The count of `frame`'s holders.
-    fn holders_of(&mut self, frame: PhysFrame) -> &mut u16 {
+    fn holders_of(&mut self, frame: PhysFrame) -> &mut u32 {
         &mut self.shared[(frame.start_address().as_u64() / 4096) as usize]
     }
 
@@ -802,7 +822,8 @@ impl BootInfoFrameAllocator {
     pub fn hold(&mut self, frame: PhysFrame) {
         let holders = self.holders_of(frame);
         assert!(*holders > 0, "a shared frame");
-        *holders = holders.checked_add(1).expect("fewer than 65536 holders");
+        // Each holder is a page-table entry, or the cache: never 2^32.
+        *holders = holders.checked_add(1).expect("fewer holders than page-table entries");
     }
 
     /// Let go of `frame`, a shared one: the last holder to frees it.
@@ -819,7 +840,7 @@ impl BootInfoFrameAllocator {
     /// How many hold `frame`, a shared one: 0 for one that isn't.
     pub fn holders(&self, frame: PhysFrame) -> u32 {
         let index = (frame.start_address().as_u64() / 4096) as usize;
-        self.shared.get(index).copied().map_or(0, u32::from)
+        self.shared.get(index).copied().unwrap_or(0)
     }
 
     /// The most recently freed frame, or else the next never handed out.
@@ -929,4 +950,23 @@ fn a_shared_page_made_writable_is_copied_first() {
     }
     FRAMES.lock().as_mut().unwrap().release(frame);
     assert_eq!(holders(), 0);
+}
+
+#[test_case]
+fn a_frame_takes_more_holders_than_a_u16_counts() {
+    // As one page of a file mapped 70000 times over by one program: each
+    // mapping holds the cache's frame once more.
+    let mut frames = FRAMES.lock();
+    let frames = frames.as_mut().unwrap();
+    let frame = frames.allocate_shared().unwrap();
+    for _ in 0..70_000 {
+        frames.hold(frame);
+    }
+    assert_eq!(frames.holders(frame), 70_001);
+    for _ in 0..70_000 {
+        frames.release(frame);
+    }
+    assert_eq!(frames.holders(frame), 1);
+    frames.release(frame);
+    assert_eq!(frames.holders(frame), 0);
 }
