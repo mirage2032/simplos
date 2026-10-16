@@ -1839,40 +1839,53 @@ int ext4_fread(ext4_file *file, void *buf, size_t size, size_t *rcnt)
 		iblock_idx++;
 	}
 
-	fblock_start = 0;
-	fblock_count = 0;
+	/* LOCAL PATCH: upstream read the whole blocks between as runs of
+	 * blocks contiguous on the disk, and took a hole, a block with none
+	 * (fblock 0), as one more of them, or as the start of the next run:
+	 * what it read there was the disk's first blocks, not the zeros a
+	 * hole holds. mke2fs -d makes holes of a file's blocks of zeros, as
+	 * Rust's .rmeta files have many of. Now a run is either blocks
+	 * contiguous on the disk, read as one, or holes, zeroed; and the last
+	 * block's part, below, is zeroed for a hole too, as the first's is. */
+	(void)iblock_last;
 	while (size >= block_size) {
-		while (iblock_idx < iblock_last) {
-			r = ext4_fs_get_inode_dblk_idx(&ref, iblock_idx,
+		uint32_t most = (uint32_t)(size / block_size);
+		r = ext4_fs_get_inode_dblk_idx(&ref, iblock_idx, &fblock_start,
+					       true);
+		if (r != EOK)
+			goto Finish;
+
+		fblock_count = 1;
+		while (fblock_count < most) {
+			r = ext4_fs_get_inode_dblk_idx(&ref,
+						       iblock_idx + fblock_count,
 						       &fblock, true);
 			if (r != EOK)
 				goto Finish;
 
-			iblock_idx++;
-
-			if (!fblock_start)
-				fblock_start = fblock;
-
-			if ((fblock_start + fblock_count) != fblock)
+			if (fblock_start ? fblock != fblock_start + fblock_count
+					 : fblock != 0)
 				break;
 
 			fblock_count++;
 		}
 
-		r = ext4_blocks_get_direct(file->mp->fs.bdev, u8_buf, fblock_start,
-					   fblock_count);
-		if (r != EOK)
-			goto Finish;
+		if (fblock_start) {
+			r = ext4_blocks_get_direct(file->mp->fs.bdev, u8_buf,
+						   fblock_start, fblock_count);
+			if (r != EOK)
+				goto Finish;
+		} else {
+			memset(u8_buf, 0, block_size * fblock_count);
+		}
 
+		iblock_idx += fblock_count;
 		size -= block_size * fblock_count;
 		u8_buf += block_size * fblock_count;
 		file->fpos += block_size * fblock_count;
 
 		if (rcnt)
 			*rcnt += block_size * fblock_count;
-
-		fblock_start = fblock;
-		fblock_count = 1;
 	}
 
 	if (size) {
@@ -1882,7 +1895,11 @@ int ext4_fread(ext4_file *file, void *buf, size_t size, size_t *rcnt)
 			goto Finish;
 
 		off = fblock * block_size;
-		r = ext4_block_readbytes(file->mp->fs.bdev, off, u8_buf, size);
+		if (fblock)
+			r = ext4_block_readbytes(file->mp->fs.bdev, off, u8_buf,
+						 size);
+		else
+			memset(u8_buf, 0, size);
 		if (r != EOK)
 			goto Finish;
 
