@@ -6,20 +6,22 @@
 //! of it are kept: ext4 tells of every change to a file, whoever makes it
 //! (`changed`).
 //!
-//! Pages no program maps are given back as free memory runs low, and past
-//! `MOST` of them, those used longest ago first; and all of them when
-//! memory runs out (`shrink`).
+//! Pages no program maps are given back as free memory runs low, those
+//! used longest ago first, and all of them when memory runs out (`shrink`).
+//! Past `MOST` pages, the oldest go whether programs map them or not: those
+//! that do keep their frames, which the cache no longer knows of. So the
+//! cache's index, which the kernel's heap holds, stays the size `MOST`
+//! makes it, and nothing it does takes more of the heap besides.
 
 use crate::memory::{self, FRAMES};
 use alloc::collections::BTreeMap;
-use alloc::vec::Vec;
 use ext4::{Change, Error, File};
 use spin::Mutex;
 use x86_64::structures::paging::PhysFrame;
 
-/// The most pages kept, but for what programs map: 256 MiB, room for
-/// rustc's 230 MB librustc_driver. Each costs the kernel's heap, which is a
-/// fixed 20 MiB, about 70 bytes.
+/// The most pages kept: 256 MiB, room for rustc's 230 MB librustc_driver.
+/// Each costs the kernel's heap about 70 bytes in the index, its nodes
+/// rounded up to the allocator's 512-byte blocks: 4.5 MiB in all.
 const MOST: usize = 65536;
 
 /// Bytes in a page.
@@ -33,8 +35,9 @@ struct Page {
 }
 
 struct Cache {
-    /// By file, its inode's number, and page, from the file's start.
-    pages: BTreeMap<(u32, u64), Page>,
+    /// By file, its inode's number, and page, from the file's start: ext4
+    /// files have fewer than 2^32 pages.
+    pages: BTreeMap<(u32, u32), Page>,
     /// Counts each use of a page.
     clock: u64,
     /// Pages read in since `make_room` last looked for some to give back.
@@ -81,7 +84,7 @@ pub fn page(file: &File, index: u64) -> Result<PhysFrame, Error> {
 /// Run `f` on the frame of page `index` of `file`, read in first if it
 /// isn't kept: with the cache held, so it's kept until `f` is done.
 fn with_frame<R>(file: &File, index: u64, f: impl FnOnce(PhysFrame) -> R) -> Result<R, Error> {
-    let key = (file.inode(), index);
+    let key = (file.inode(), u32::try_from(index).map_err(|_| Error::InvalidArgument)?);
     {
         let mut cache = CACHE.lock();
         cache.clock += 1;
@@ -147,15 +150,17 @@ pub fn release(frame: PhysFrame) {
 /// that map them see the change, as on Linux; those given back stay with
 /// the programs that map them, as they were.
 pub fn changed(inode: u32, change: Change<'_>) {
+    // A page's number, as the index has it: ext4 files have fewer pages.
+    let index = |page: u64| u32::try_from(page).unwrap_or(u32::MAX);
     let mut cache = CACHE.lock();
     let gone_from = match change {
-        Change::Written { offset, bytes: written } => {
+        Change::Written { offset, bytes: written } if !written.is_empty() => {
             let end = offset + written.len() as u64;
-            let pages = (inode, offset / PAGE)..(inode, end.div_ceil(PAGE));
-            for (&(_, index), page) in cache.pages.range(pages) {
-                let start = (index * PAGE).max(offset);
-                let stop = ((index + 1) * PAGE).min(end);
-                let into = (start - index * PAGE) as usize..(stop - index * PAGE) as usize;
+            let pages = (inode, index(offset / PAGE))..=(inode, index((end - 1) / PAGE));
+            for (&(_, number), page) in cache.pages.range(pages) {
+                let at = u64::from(number) * PAGE;
+                let (start, stop) = (at.max(offset), (at + PAGE).min(end));
+                let into = (start - at) as usize..(stop - at) as usize;
                 let from = (start - offset) as usize..(stop - offset) as usize;
                 // Safety: a frame of the cache's, written only here, with
                 // the cache held; others only read it.
@@ -164,34 +169,35 @@ pub fn changed(inode: u32, change: Change<'_>) {
             }
             return;
         }
+        Change::Written { .. } => return,
         // What's past the end goes; what's left of the last page past it
         // is zeros.
         Change::Resized { size } => {
-            if let Some(page) = cache.pages.get(&(inode, size / PAGE)) {
+            if let Some(page) = cache.pages.get(&(inode, index(size / PAGE))) {
                 // Safety: as above.
                 let page = unsafe { &mut *bytes(page.frame) };
                 page[(size % PAGE) as usize..].fill(0);
             }
-            size.div_ceil(PAGE)
+            index(size.div_ceil(PAGE))
         }
         Change::Gone => 0,
     };
-    let gone: Vec<_> =
-        cache.pages.range((inode, gone_from)..=(inode, u64::MAX)).map(|(k, _)| *k).collect();
+    // One at a time, rather than all of a big file's numbers gathered first.
     let mut frames = FRAMES.lock();
     let frames = frames.as_mut().expect("memory is set up");
-    for key in gone {
+    while let Some((&key, _)) = cache.pages.range((inode, gone_from)..=(inode, u32::MAX)).next() {
         let page = cache.pages.remove(&key).expect("just found");
         frames.release(page.frame);
     }
 }
 
 /// Give back pages no program maps if free memory is down to a sixteenth
-/// of all of it, or `MOST` are kept: an eighth of them. Looked into once an
-/// eighth as many pages as are kept have been read in since the last time,
-/// as looking goes through them all: while programs map most of them, as
-/// rustc maps its 230 MB library, there may be nothing to give back for a
-/// long while.
+/// of all of it: an eighth of them. And if more than `MOST` are kept, the
+/// oldest, mapped or not, down to seven eighths of that. Looked into once
+/// an eighth as many pages as are kept have been read in since the last
+/// time, as looking goes through them all: while programs map most of
+/// them, as rustc maps its 230 MB library, there may be nothing to give
+/// back for a long while.
 fn make_room() {
     let kept = {
         let mut cache = CACHE.lock();
@@ -203,8 +209,12 @@ fn make_room() {
         cache.pages.len()
     };
     let (total, free) = FRAMES.lock().as_ref().map_or((0, 0), |frames| frames.memory());
-    if free < total / 16 || kept >= MOST {
-        give_back(kept / 8 + 1);
+    if free < total / 16 {
+        forget_oldest(kept / 8 + 1, true);
+    }
+    let kept = CACHE.lock().pages.len();
+    if kept > MOST {
+        forget_oldest(kept - MOST / 8 * 7, false);
     }
 }
 
@@ -221,24 +231,99 @@ pub fn clear() {
 
 /// Give back every page no program maps: for when memory has run out.
 pub fn shrink() {
-    give_back(usize::MAX);
+    forget_oldest(usize::MAX, true);
 }
 
-/// Give back up to `count` of the pages no program maps, those used
-/// longest ago first.
-fn give_back(count: usize) {
+/// Give back up to `count` pages, those used longest ago first, by the
+/// clock: of those no program maps, if `idle`; or of any, those programs
+/// map staying with them. Without gathering and sorting them, which would
+/// take the heap that the cache is to leave be: the oldest found in two
+/// goes, the first counting them by when they were used, in 64 spans of
+/// the clock, and the second giving back those older than the span that
+/// makes `count`.
+fn forget_oldest(count: usize, idle: bool) {
+    const SPANS: usize = 64;
     let mut cache = CACHE.lock();
     let mut frames = FRAMES.lock();
     let Some(frames) = frames.as_mut() else { return };
-    let mut idle: Vec<(u64, (u32, u64))> = cache
-        .pages
-        .iter()
-        .filter(|(_, page)| frames.holders(page.frame) == 1)
-        .map(|(key, page)| (page.used, *key))
-        .collect();
-    idle.sort_unstable();
-    for (_, key) in idle.into_iter().take(count) {
-        let page = cache.pages.remove(&key).expect("just found");
+    let Cache { pages, clock, .. } = &mut *cache;
+    let wanted = |page: &Page, frames: &memory::BootInfoFrameAllocator| {
+        !idle || frames.holders(page.frame) == 1
+    };
+    let Some(oldest) =
+        pages.values().filter(|page| wanted(page, frames)).map(|page| page.used).min()
+    else {
+        return;
+    };
+    let span = (*clock - oldest) / SPANS as u64 + 1;
+    let mut counts = [0; SPANS];
+    for page in pages.values().filter(|page| wanted(page, frames)) {
+        counts[((page.used - oldest) / span) as usize] += 1;
+    }
+    // Before the end of the first span by which `count` have been used.
+    let mut seen = 0;
+    let before = counts.iter().position(|&n| {
+        seen += n;
+        seen >= count
+    });
+    let before = before.map_or(u64::MAX, |at| oldest + (at as u64 + 1) * span);
+    let mut gone = 0;
+    pages.retain(|_, page| {
+        if gone == count || page.used >= before || !wanted(page, frames) {
+            return true;
+        }
         frames.release(page.frame);
+        gone += 1;
+        false
+    });
+}
+
+#[test_case]
+fn gives_back_the_oldest_and_leaves_programs_their_pages() {
+    use alloc::vec::Vec;
+    // Thirty pages of a made-up file, used last to first, so the oldest
+    // aren't the first by number: every third one also held, as a program
+    // that maps it would.
+    const INODE: u32 = u32::MAX;
+    let mut held = Vec::new();
+    {
+        let mut cache = CACHE.lock();
+        let mut frames = FRAMES.lock();
+        let frames = frames.as_mut().unwrap();
+        for number in (0..30).rev() {
+            let frame = frames.allocate_shared().unwrap();
+            if number % 3 == 0 {
+                frames.hold(frame);
+                held.push((number, frame));
+            }
+            cache.clock += 1;
+            let used = cache.clock;
+            cache.pages.insert((INODE, number), Page { frame, used });
+        }
+    }
+    let kept = || {
+        let cache = CACHE.lock();
+        cache.pages.range((INODE, 0)..=(INODE, u32::MAX)).map(|(key, _)| key.1).collect::<Vec<_>>()
+    };
+    let but = |gone: &[u32]| (0..30).filter(|n| !gone.contains(n)).collect::<Vec<_>>();
+    // The five used longest ago of those no program maps.
+    forget_oldest(5, true);
+    assert_eq!(kept(), but(&[29, 28, 26, 25, 23]));
+    // Then the four used longest ago of any, whose frames the programs keep.
+    forget_oldest(4, false);
+    assert_eq!(kept(), but(&[29, 28, 27, 26, 25, 24, 23, 22, 21]));
+    let holders = |frame| FRAMES.lock().as_ref().unwrap().holders(frame);
+    let given_back: Vec<_> =
+        held.iter().filter(|(number, _)| *number >= 21).map(|&(_, frame)| holders(frame)).collect();
+    assert_eq!(given_back, [1, 1, 1]);
+    // Out of memory: everything no program maps.
+    shrink();
+    assert_eq!(kept(), [0, 3, 6, 9, 12, 15, 18]);
+    // The file gone, nothing of it.
+    changed(INODE, Change::Gone);
+    assert!(kept().is_empty());
+    for (_, frame) in held {
+        assert_eq!(holders(frame), 1, "a program's page let go of");
+        release(frame);
     }
 }
