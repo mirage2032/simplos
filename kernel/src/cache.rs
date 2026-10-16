@@ -281,19 +281,20 @@ fn forget_oldest(count: usize, idle: bool) {
 #[test_case]
 fn gives_back_the_oldest_and_leaves_programs_their_pages() {
     use alloc::vec::Vec;
-    // Thirty pages of a made-up file, used in turn: every third one also
-    // held, as a program that maps it would.
+    // Thirty pages of a made-up file, used last to first, so the oldest
+    // aren't the first by number: every third one also held, as a program
+    // that maps it would.
     const INODE: u32 = u32::MAX;
     let mut held = Vec::new();
     {
         let mut cache = CACHE.lock();
         let mut frames = FRAMES.lock();
         let frames = frames.as_mut().unwrap();
-        for number in 0..30 {
+        for number in (0..30).rev() {
             let frame = frames.allocate_shared().unwrap();
             if number % 3 == 0 {
                 frames.hold(frame);
-                held.push(frame);
+                held.push((number, frame));
             }
             cache.clock += 1;
             let used = cache.clock;
@@ -307,19 +308,21 @@ fn gives_back_the_oldest_and_leaves_programs_their_pages() {
     let but = |gone: &[u32]| (0..30).filter(|n| !gone.contains(n)).collect::<Vec<_>>();
     // The five used longest ago of those no program maps.
     forget_oldest(5, true);
-    assert_eq!(kept(), but(&[1, 2, 4, 5, 7]));
+    assert_eq!(kept(), but(&[29, 28, 26, 25, 23]));
     // Then the four used longest ago of any, whose frames the programs keep.
     forget_oldest(4, false);
-    assert_eq!(kept(), but(&[0, 1, 2, 3, 4, 5, 6, 7, 8]));
+    assert_eq!(kept(), but(&[29, 28, 27, 26, 25, 24, 23, 22, 21]));
     let holders = |frame| FRAMES.lock().as_ref().unwrap().holders(frame);
-    assert_eq!(held[..3].iter().map(|&frame| holders(frame)).collect::<Vec<_>>(), [1, 1, 1]);
+    let given_back: Vec<_> =
+        held.iter().filter(|(number, _)| *number >= 21).map(|&(_, frame)| holders(frame)).collect();
+    assert_eq!(given_back, [1, 1, 1]);
     // Out of memory: everything no program maps.
     shrink();
-    assert_eq!(kept(), [9, 12, 15, 18, 21, 24, 27]);
+    assert_eq!(kept(), [0, 3, 6, 9, 12, 15, 18]);
     // The file gone, nothing of it.
     changed(INODE, Change::Gone);
     assert!(kept().is_empty());
-    for frame in held {
+    for (_, frame) in held {
         assert_eq!(holders(frame), 1, "a program's page let go of");
         release(frame);
     }
