@@ -375,6 +375,19 @@ fn a_program_finds_the_devices_it_expects() {
 }
 
 #[test_case]
+fn a_program_gets_random_bytes() {
+    // What Linux says, from the same program: getrandom's bytes, as many as
+    // asked for, different each time, as Rust's std needs for its hash maps;
+    // EINVAL for flags there aren't and for GRND_RANDOM with GRND_INSECURE,
+    // EFAULT into the kernel's half; and /dev/urandom and /dev/random, read,
+    // written to, and character devices anyone can use.
+    let devices = r#"["true 3 true 666", "true 3 true 666"]"#;
+    let expected = alloc::format!("[32, 32, 32, 32, 32] true [-22, -22, -14] {devices} 42\n");
+    assert_eq!(run(&["random"]), ok(&expected));
+    assert_eq!(run(&["stat", "/dev/urandom"]), ok("0 file 666\n0 file 666\n"));
+}
+
+#[test_case]
 fn bad_pipe_calls_are_refused() {
     // EBADF for a descriptor that isn't open and one past the most there can
     // be, EFAULT for ends to go in the kernel's half, EINVAL for a flag
@@ -393,7 +406,10 @@ fn programs_waiting_to_write_into_a_pipe_leave_the_kernel_room() {
 #[test_case]
 fn the_devices_are_in_dev() {
     // Wherever the disk has it or not: mounted over it, as on Linux.
-    assert_eq!(run(&["ls", "/dev"]), ok("fd/\nnull\nstderr\nstdin\nstdout\ntty\nzero\n"));
+    assert_eq!(
+        run(&["ls", "/dev"]),
+        ok("fd/\nnull\nrandom\nstderr\nstdin\nstdout\ntty\nurandom\nzero\n")
+    );
     assert_eq!(run(&["stat", "/dev"]), ok("0 dir 755\n0 dir 755\n"));
     assert_eq!(run(&["cd", "/dev", "null"]), ok("/dev\n"));
     assert_eq!(run(&["cd", "/dev/..", "hello.txt"]), ok("/\nhello from ext4\n"));

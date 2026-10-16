@@ -118,6 +118,15 @@ fn madvise_zeroes_what_isn_t_needed() {
 }
 
 #[test_case]
+fn mprotect_hides_memory_and_gives_it_back() {
+    // What Linux says, from the same program: PROT_NONE keeps what's in the
+    // pages, which come back with it; memory reserved with PROT_NONE given
+    // to the program, zeroed, below a guard page that isn't, as musl lays
+    // out a thread's stack; and a read-only page that read(2) can't fill.
+    assert_eq!(run(&["mprotect"]), (0, String::from("[0, 0] true true true 0 -14 true\n")));
+}
+
+#[test_case]
 fn mremap_grows_moves_and_shrinks_mappings() {
     // What Linux says, from the same program, but for the last: there,
     // where nothing's been mapped after it, it grows where it is.

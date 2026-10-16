@@ -188,6 +188,8 @@ pub fn open(process: &Process, dirfd: u64, path: u64, flags: u64, mode: u64) -> 
             let handle = match device {
                 Device::Null => Handle::Null,
                 Device::Zero => Handle::Zero,
+                Device::Random => Handle::Random { urandom: false },
+                Device::Urandom => Handle::Random { urandom: true },
                 Device::Tty => Handle::tty(process.tty.lock().clone().ok_or(ENXIO)?),
             };
             set_nonblocking(&handle, flags);
@@ -375,6 +377,11 @@ fn read_data(process: &Process, fd: u64, count: u64, at: Option<u64>) -> Result<
         }
         Handle::Null => Ok(Vec::new()),
         Handle::Zero => Ok(vec![0; count]),
+        Handle::Random { .. } => {
+            let mut data = vec![0; count];
+            crate::random::fill(&mut data);
+            Ok(data)
+        }
         Handle::Pipe { end, .. } if end.write => Err(EBADF),
         // Not even for nothing: with no data, it would wait.
         Handle::Pipe { .. } if count == 0 => Ok(Vec::new()),
@@ -422,7 +429,7 @@ fn write_data(process: &Process, fd: u64, data: &[u8], at: Option<u64>) -> Resul
             tty.write(data);
             Ok(data.len() as i64)
         }
-        Handle::Null | Handle::Zero => Ok(data.len() as i64),
+        Handle::Null | Handle::Zero | Handle::Random { .. } => Ok(data.len() as i64),
         Handle::Pipe { end, .. } if !end.write => Err(EBADF),
         Handle::Pipe { end, nonblocking } => match end.write(data, !nonblocking.load(Relaxed)) {
             Ok(written) => Ok(written as i64),
@@ -522,7 +529,7 @@ pub fn lseek(process: &Process, fd: u64, offset: u64, whence: u64) -> i64 {
         let offset = offset as i64;
         match &*handle(process, fd)? {
             Handle::Tty { .. } | Handle::Pipe { .. } => Err(ESPIPE),
-            Handle::Null | Handle::Zero => Ok(0),
+            Handle::Null | Handle::Zero | Handle::Random { .. } => Ok(0),
             handle @ (Handle::File { offset: place, .. } | Handle::Proc { offset: place, .. }) => {
                 let _tree = fs::lock();
                 let from = match (whence, handle) {
@@ -733,7 +740,7 @@ pub fn fcntl(process: &Process, fd: u64, command: u64, arg: u64) -> i64 {
             }
             F_GETFL => Ok(match &*handle {
                 Handle::Tty { nonblocking, .. } => 2 | nonblocking_flag(nonblocking),
-                Handle::Null | Handle::Zero => 2,
+                Handle::Null | Handle::Zero | Handle::Random { .. } => 2,
                 Handle::Pipe { end, nonblocking } => {
                     end.write as i64 | nonblocking_flag(nonblocking)
                 }

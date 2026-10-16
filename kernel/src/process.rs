@@ -954,7 +954,9 @@ fn build_stack(
         top = top.checked_sub(bytes.len() as u64).filter(|&top| top > bottom + 4096)?;
         space.load(top, bytes).map(|()| top)
     };
-    let random = push(space, &random_bytes()).ok_or(TOO_LONG)?;
+    let mut random = [0; 16];
+    crate::random::fill(&mut random);
+    let random = push(space, &random).ok_or(TOO_LONG)?;
     let mut words = vec![args.len() as u64];
     for strings in [args, env] {
         for string in strings {
@@ -988,25 +990,6 @@ fn build_stack(
     }
     space.load(rsp, &bytes).ok_or(TOO_LONG)?;
     Ok(rsp)
-}
-
-/// The 16 bytes behind `AT_RANDOM`, which seed the program's stack canaries
-/// and hash maps.
-///
-/// shortcut: RDRAND when the CPU has it, else the timestamp counter, which is
-/// guessable; take entropy from somewhere better once there is somewhere.
-fn random_bytes() -> [u8; 16] {
-    let rdrand = x86_64::instructions::random::RdRand::new();
-    let word = || {
-        rdrand
-            .and_then(|r| r.get_u64())
-            // Safety: rdtsc reads a counter, nothing more.
-            .unwrap_or_else(|| unsafe { core::arch::x86_64::_rdtsc() }.rotate_left(17))
-    };
-    let mut bytes = [0; 16];
-    bytes[..8].copy_from_slice(&word().to_le_bytes());
-    bytes[8..].copy_from_slice(&word().to_le_bytes());
-    bytes
 }
 
 /// The pages covering `start..end`.

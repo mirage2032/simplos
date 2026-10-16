@@ -8,6 +8,7 @@ use super::{EFAULT, EINVAL, EPERM};
 use crate::process::{self, Process};
 use crate::{memory, time};
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering::Relaxed;
 
@@ -48,6 +49,25 @@ pub fn set_id(id: u64) -> i64 {
 /// keep it once something does.
 pub fn groups(count: u64) -> i64 {
     if (count as i32) < 0 { -EINVAL } else { 0 }
+}
+
+/// `getrandom`: `len` random bytes at `buf`, from `random::fill`, which
+/// never has to wait, whatever the flags ask: how many, at most a mebibyte
+/// at a time, as with `read`, where Linux gives up to 32.
+pub fn getrandom(process: &Process, buf: u64, len: u64, flags: u64) -> i64 {
+    const GRND_NONBLOCK: u64 = 1;
+    const GRND_RANDOM: u64 = 2;
+    const GRND_INSECURE: u64 = 4;
+    let both = GRND_RANDOM | GRND_INSECURE;
+    if flags & !(GRND_NONBLOCK | both) != 0 || flags & both == both {
+        return -EINVAL;
+    }
+    let mut bytes = vec![0; len.min(1 << 20) as usize];
+    crate::random::fill(&mut bytes);
+    match process.memory.lock().space.write(buf, &bytes) {
+        Some(()) => bytes.len() as i64,
+        None => -EFAULT,
+    }
 }
 
 /// `sysinfo`'s `struct sysinfo`: seconds since boot, the memory there is and

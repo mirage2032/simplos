@@ -346,6 +346,20 @@ impl AddressSpace {
         }
     }
 
+    /// Put the mapped pages among `pages` out of the program's reach, as
+    /// PROT_NONE does, their frames and what's in them kept: until `protect`
+    /// or `map` gives them back.
+    pub fn hide(&mut self, pages: PageRange) {
+        let mut mapper = self.mapper();
+        for page in pages {
+            let flags = PageTableFlags::PRESENT | PageTableFlags::NO_EXECUTE;
+            // Safety: the program's own pages, keeping their frames.
+            if let Ok(flush) = unsafe { mapper.update_flags(page, flags) } {
+                flush.flush();
+            }
+        }
+    }
+
     /// The flags of `page`, if it's mapped.
     pub fn flags(&mut self, page: Page) -> Option<PageTableFlags> {
         match self.mapper().translate(page.start_address()) {

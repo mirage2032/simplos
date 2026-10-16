@@ -368,6 +368,7 @@ fn call(frame: &Frame) -> i64 {
         // syncfs.
         306 => files::fsync(&process, a0),
         316 => files::renameat2(&process, a0, a1, a2, a3, a4),
+        318 => system::getrandom(&process, a0, a1, a2),
         439 => files::faccessat(&process, a0, a1, a2, a3),
         _ => {
             serial_println!("simplos: process {}: no system call {}", process.id, frame.nr);
@@ -826,16 +827,26 @@ fn page(addr: u64) -> Page {
     Page::containing_address(VirtAddr::new(addr))
 }
 
+/// What the program may do with the pages at `addr`: with PROT_NONE,
+/// nothing, but what's in them is kept for when it may again, as Linux
+/// keeps it. Otherwise what `prot` says, of pages that `mmap` reserved with
+/// PROT_NONE, which here aren't mapped, too: mapped now, zeroed, as musl
+/// does with a thread's stack, and its guard page kept out of reach.
+///
+/// shortcut: a page nothing reserved is mapped as well, where Linux says
+/// ENOMEM; keep track of what's reserved when something needs telling.
 fn mprotect(process: &Process, addr: u64, len: u64, prot: u64) -> i64 {
     let Some((start, end)) = user_range(addr, len) else { return -EINVAL };
     let mut memory = process.memory.lock();
     if prot == 0 {
-        // shortcut: PROT_NONE unmaps, so its pages lose their contents and
-        // come back unmapped; keep the frames when a program needs them back.
-        memory.space.unmap(pages(start, end));
-    } else {
-        memory.space.protect(pages(start, end), page_flags(prot));
+        memory.space.hide(pages(start, end));
+        return 0;
     }
+    // Those mapped get these flags and more; then just these.
+    if memory.space.map(pages(start, end), page_flags(prot)).is_none() {
+        return -ENOMEM;
+    }
+    memory.space.protect(pages(start, end), page_flags(prot));
     0
 }
 
