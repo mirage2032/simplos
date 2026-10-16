@@ -313,7 +313,11 @@ the kernel sends SIGCHLD as a child ends, stops or continues, and SIGPIPE
 as a pipe no one reads is written. Each does what the program asked with
 `rt_sigaction`, or else its default: ending the program, stopping it until
 SIGCONT, or nothing. One that's blocked (`rt_sigprocmask`) waits, pending
-(`rt_sigpending`), until it isn't; `rt_sigsuspend` and `pause` wait for one.
+(`rt_sigpending`), until it isn't; `rt_sigsuspend` and `pause` wait for one,
+and `rt_sigtimedwait`, which `sigwait` comes to, waits for one it blocks and
+takes it rather than have its handler run, with its `siginfo_t`, for as long
+as it's told: as uutils' `timeout` waits for its child's SIGCHLD or its
+timer's SIGALRM.
 
 A handler runs on the program's stack, or the one `sigaltstack` gave it,
 with the frame Linux puts there: what the program was doing, its registers
@@ -357,13 +361,22 @@ tick is counted to the program it interrupts, as its own time or the
 kernel's for it, which `getrusage`, `times` and `wait4` report, its waited-for
 children's too. `setitimer` and `alarm` set a program's alarm, which the
 alarm thread sends as SIGALRM when it's due, and every so often after if
-asked. For now:
+asked; and `timer_create` makes as many timers as a program likes, by the
+time of day or since boot, each sending the signal it's set to, to the
+program or one of its threads (musl's `SIGEV_THREAD`), or nothing, with
+`SI_TIMER` and its value; `timer_settime` sets one for a time or after a
+while, and every so often after, `timer_gettime` says when it comes and
+`timer_delete` takes it away. A program's timers go as it `execve`s, and
+its copies don't have them. For now:
 
 - the clock is taken to be UTC, as QEMU keeps it, and can't be set;
 - CPU time is counted to the tick, 10 ms;
 - an alarm can come up to a tick late, though never early, and only the
   real-time one is there: none that counts CPU time (`ITIMER_VIRTUAL`,
-  `ITIMER_PROF`).
+  `ITIMER_PROF`); nor timers by the CPU-time clocks, and 256 at most;
+- a timer that comes again before its signal was taken sends it again,
+  where Linux counts the overrun: `timer_getoverrun` always says 0; and its
+  value is the low 32 bits of what it was given.
 
 ## The first program
 

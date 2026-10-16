@@ -1525,6 +1525,145 @@ fn main() {
             syscall(38, 0, [0u64; 4].as_ptr() as usize, 0);
             println!("{set} {none} {} {one}", left[2] > 1 << 32);
         }
+        // rt_sigtimedwait, as sigwait comes to it: a signal of the set, which
+        // the program blocks, taken rather than handled, with who sent it;
+        // none within 50 ms, EAGAIN, and not before; at once for a time of
+        // 0; a signal not in the set ending the wait, EINTR, its handler run;
+        // a child's SIGCHLD, with how the child ended; the set still blocked
+        // after, and no handler run for what was taken; and EINVAL for a
+        // set's size that isn't 8, and a time that isn't one.
+        Some("sigtimedwait") => {
+            const USR1: usize = 10;
+            const USR2: usize = 12;
+            const ALRM: usize = 14;
+            const CHLD: usize = 17;
+            let set = bit(USR1) | bit(USR2) | bit(CHLD);
+            sigprocmask(0, set);
+            sigaction(USR1, record, 0);
+            sigaction(ALRM, record, 0);
+            let mut info = [0u8; 128];
+            let int = |info: &[u8; 128], at: usize| {
+                i32::from_le_bytes(info[at..at + 4].try_into().unwrap())
+            };
+            let wait = |set: u64, timeout: Option<[i64; 2]>, info: &mut [u8; 128], size: usize| {
+                let timeout = timeout.as_ref().map_or(0, |time| time.as_ptr() as usize);
+                syscall5(
+                    128,
+                    [&raw const set as usize, info.as_mut_ptr() as usize, timeout, size, 0],
+                )
+            };
+            kill(getpid(), USR1);
+            let got = wait(bit(USR1) | bit(USR2), None, &mut info, 8);
+            let sender = (int(&info, 8), int(&info, 16) as isize == getpid());
+            let start = Instant::now();
+            let none = wait(bit(USR2), Some([0, 50_000_000]), &mut info, 8);
+            let waited = start.elapsed() >= Duration::from_millis(50);
+            let start = Instant::now();
+            let at_once = wait(bit(USR2), Some([0, 0]), &mut info, 8);
+            let quick = start.elapsed() < Duration::from_millis(50);
+            // SIGALRM, which isn't waited for, in 30 ms.
+            let alarm = [0i64, 0, 0, 30_000];
+            syscall(38, 0, alarm.as_ptr() as usize, 0);
+            let interrupted = wait(bit(USR2), None, &mut info, 8);
+            let handled = LAST.load(Ordering::SeqCst) == ALRM;
+            let child = syscall(57, 0, 0, 0);
+            if child == 0 {
+                syscall(60, 3, 0, 0);
+            }
+            let ended = wait(bit(CHLD), None, &mut info, 8);
+            let how = (int(&info, 8), int(&info, 16) as isize == child, int(&info, 24));
+            syscall(61, child as usize, 0, 0);
+            let blocked = sigprocmask(0, 0) & set == set;
+            let caught = CAUGHT.load(Ordering::SeqCst);
+            let refused = [
+                wait(bit(USR2), Some([0, 0]), &mut info, 7),
+                wait(bit(USR2), Some([0, 2_000_000_000]), &mut info, 8),
+            ];
+            println!(
+                "{got} {sender:?} {none} {waited} {at_once} {quick} {interrupted} {handled} \
+                 {ended} {how:?} {blocked} {caught} {refused:?}"
+            );
+        }
+        // POSIX timers: one by CLOCK_MONOTONIC sending SIGUSR1, which comes no
+        // sooner than set, and is taken with SI_TIMER, its id and the value
+        // given; again every 20 ms, three times; then off. One by the time of
+        // day, set for a time already past (TIMER_ABSTIME), at once. One that
+        // sends nothing, whose time left timer_gettime tells. SIGALRM with its
+        // id as the value, for none given. One for this thread alone. One
+        // deleted, which then isn't there to delete. And EINVAL for a clock
+        // there isn't, timers there aren't, and a signal there isn't.
+        Some("timers") => {
+            const USR1: usize = 10;
+            const ALRM: usize = 14;
+            sigprocmask(0, bit(USR1) | bit(ALRM));
+            let mut info = [0u8; 128];
+            let int = |info: &[u8; 128], at: usize| {
+                i32::from_le_bytes(info[at..at + 4].try_into().unwrap())
+            };
+            let take = |signal: usize, info: &mut [u8; 128]| {
+                let set = bit(signal);
+                syscall5(128, [&raw const set as usize, info.as_mut_ptr() as usize, 0, 8, 0])
+            };
+            let event = |notify: i32, signal: usize, value: i32, tid: isize| {
+                let mut event = [0u8; 64];
+                event[..4].copy_from_slice(&value.to_le_bytes());
+                event[8..12].copy_from_slice(&(signal as i32).to_le_bytes());
+                event[12..16].copy_from_slice(&notify.to_le_bytes());
+                event[16..20].copy_from_slice(&(tid as i32).to_le_bytes());
+                event
+            };
+            let create = |clock: usize, event: Option<[u8; 64]>| {
+                let mut id = -1i32;
+                let event = event.as_ref().map_or(0, |event| event.as_ptr() as usize);
+                (syscall(222, clock, event, &raw mut id as usize), id)
+            };
+            let set = |id: i32, flags: usize, every: i64, at: [i64; 2]| {
+                let spec = [every / 1_000_000_000, every % 1_000_000_000, at[0], at[1]];
+                syscall5(223, [id as usize, flags, spec.as_ptr() as usize, 0, 0])
+            };
+            let left = |id: i32| {
+                let mut spec = [0i64; 4];
+                syscall(224, id as usize, spec.as_mut_ptr() as usize, 0);
+                spec
+            };
+            let (made, one) = create(1, Some(event(0, USR1, 42, 0)));
+            let start = Instant::now();
+            set(one, 0, 0, [0, 50_000_000]);
+            let got = take(USR1, &mut info);
+            let late = start.elapsed() >= Duration::from_millis(50);
+            let sent = (int(&info, 8), int(&info, 16) == one, int(&info, 24));
+            set(one, 0, 20_000_000, [0, 20_000_000]);
+            let repeated: Vec<isize> = (0..3).map(|_| take(USR1, &mut info)).collect();
+            set(one, 0, 0, [0, 0]);
+            let off = left(one) == [0; 4];
+            let (_, past) = create(0, Some(event(0, USR1, 7, 0)));
+            let start = Instant::now();
+            set(past, 1, 0, [1, 0]);
+            let at_once = take(USR1, &mut info) == USR1 as isize
+                && int(&info, 24) == 7
+                && start.elapsed() < Duration::from_millis(500);
+            let (_, quiet) = create(1, Some(event(1, 0, 0, 0)));
+            set(quiet, 0, 0, [10, 0]);
+            let left_ns = |spec: [i64; 4]| spec[2] * 1_000_000_000 + spec[3];
+            let counting = (9_000_000_000..=10_000_000_000).contains(&left_ns(left(quiet)));
+            let (_, plain) = create(1, None);
+            set(plain, 0, 0, [0, 10_000_000]);
+            let alarmed = take(ALRM, &mut info) == ALRM as isize && int(&info, 24) == plain;
+            let (made_mine, mine) = create(1, Some(event(4, USR1, 5, gettid())));
+            set(mine, 0, 0, [0, 10_000_000]);
+            let to_me = take(USR1, &mut info) == USR1 as isize && int(&info, 24) == 5;
+            let deleted = [syscall(226, past as usize, 0, 0), syscall(226, past as usize, 0, 0)];
+            let refused = [
+                create(99, None).0,
+                syscall(224, 999, info.as_mut_ptr() as usize, 0),
+                syscall(225, 999, 0, 0),
+                create(1, Some(event(0, 99, 0, 0))).0,
+            ];
+            println!(
+                "{made} {got} {late} {sent:?} {repeated:?} {off} {at_once} {counting} {alarmed} \
+                 {made_mine} {to_me} {deleted:?} {refused:?}"
+            );
+        }
         // Symbolic links: made and read back, followed, and lstat'd as
         // themselves; through a directory, after which `..` is the
         // directory's parent, not the link's; one that leads nowhere, which

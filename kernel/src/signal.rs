@@ -69,6 +69,7 @@ const SA_RESETHAND: u64 = 0x8000_0000;
 /// `si_code`s: sent by `kill`, by `tkill`, by the kernel; and why a child's
 /// SIGCHLD came.
 pub const SI_USER: i32 = 0;
+pub const SI_TIMER: i32 = -2;
 pub const SI_TKILL: i32 = -6;
 pub const SI_KERNEL: i32 = 0x80;
 pub const CLD_EXITED: i32 = 1;
@@ -275,9 +276,15 @@ impl core::default::Default for Signals {
 /// A thread's own signals: those sent to it alone and not yet taken, which
 /// it blocks, and where its handlers run.
 pub struct ThreadSignals {
-    /// By bit; taken by anyone, with interrupts on or off, as is `blocked`.
+    /// By bit; taken by anyone, with interrupts on or off, as are `blocked`
+    /// and `waited`.
     pending: AtomicU64,
     blocked: AtomicU64,
+    /// Those `rt_sigtimedwait` waits for now, which it unblocks meanwhile:
+    /// kept when they come even if ignored, as if still blocked, as Linux
+    /// keeps them (its `real_blocked`). A child's SIGCHLD, ignored unless
+    /// handled, would otherwise go.
+    waited: AtomicU64,
     /// Each pending signal's sender. Taken with interrupts on, as are the
     /// next two.
     info: Mutex<[Info; COUNT]>,
@@ -297,6 +304,7 @@ impl ThreadSignals {
         ThreadSignals {
             pending: AtomicU64::new(0),
             blocked: AtomicU64::new(blocked),
+            waited: AtomicU64::new(0),
             info: Mutex::new([Info::default(); COUNT]),
             altstack: Mutex::new(altstack),
             saved_mask: Mutex::new(None),
@@ -352,6 +360,22 @@ impl ThreadSignals {
 
     pub fn altstack(&self) -> AltStack {
         *self.altstack.lock()
+    }
+
+    /// For `rt_sigtimedwait`: the signals in `set` it waits for, unblocked
+    /// meanwhile, then blocked again as they were; none once it's done.
+    pub fn wait_for(&self, set: u64) {
+        match set {
+            0 => self.end_suspend(),
+            set => self.suspend_with(self.blocked() & !set),
+        }
+        self.waited.store(set, Ordering::Release);
+    }
+
+    /// Whether `signal` is to be kept when it comes, as one the thread
+    /// blocks or waits for.
+    fn keeps(&self, signal: usize) -> bool {
+        (self.blocked() | self.waited.load(Ordering::Acquire)) & bit(signal) != 0
     }
 
     pub fn set_altstack(&self, altstack: AltStack) {
@@ -431,7 +455,10 @@ fn prepare(target: &Process, signal: usize, blocked: bool) -> bool {
 pub fn send(target: &Process, signal: usize, info: Info) {
     let threads = target.threads();
     let blocked = |task: &Task| task.signals.blocked() & bit(signal) != 0;
-    if !prepare(target, signal, !threads.is_empty() && threads.iter().all(|task| blocked(task))) {
+    let waited =
+        threads.iter().any(|task| task.signals.waited.load(Ordering::Acquire) & bit(signal) != 0);
+    let kept = waited || !threads.is_empty() && threads.iter().all(|task| blocked(task));
+    if !prepare(target, signal, kept) {
         return;
     }
     let signals = &target.signals;
@@ -444,7 +471,7 @@ pub fn send(target: &Process, signal: usize, info: Info) {
 /// as `tgkill` does: it's the one to take it.
 pub fn send_thread(target: &Process, task: &Task, signal: usize, info: Info) {
     let own = &task.signals;
-    if !prepare(target, signal, own.blocked() & bit(signal) != 0) {
+    if !prepare(target, signal, own.keeps(signal)) {
         return;
     }
     own.info.lock()[signal - 1] = info;
@@ -486,11 +513,23 @@ impl Syscall {
 /// the lowest first, as Linux takes them; then the program's, which another
 /// thread may take first.
 fn take(process: &Process, task: &Task) -> Option<(usize, Info)> {
+    take_of(process, task, None)
+}
+
+/// `take`, but of the signals in `set`, blocked or not, as `rt_sigtimedwait`
+/// takes those it waits for: the caller blocks them, so that no handler
+/// runs for them.
+pub fn take_waited(process: &Process, task: &Task, set: u64) -> Option<(usize, Info)> {
+    take_of(process, task, Some(set))
+}
+
+/// `take` of the signals in `set`, or else of those `task` doesn't block.
+fn take_of(process: &Process, task: &Task, set: Option<u64>) -> Option<(usize, Info)> {
     let (shared, own) = (&process.signals, &task.signals);
     loop {
-        let blocked = own.blocked();
-        let mine = own.pending() & !blocked;
-        let theirs = shared.pending() & !blocked;
+        let wanted = set.unwrap_or_else(|| !own.blocked());
+        let mine = own.pending() & wanted;
+        let theirs = shared.pending() & wanted;
         let kill = bit(SIGKILL);
         let (pending, info, ready) = if mine & kill == 0 && theirs & kill != 0 || mine == 0 {
             (&shared.pending, &shared.info, theirs)
@@ -608,10 +647,23 @@ fn wait_while_stopped(process: &Process, task: &Task) {
     own.waiting_in(None);
 }
 
+/// The `siginfo_t` for `signal`, sent as `info` says: its number, why it
+/// came, then who sent it and, for SIGCHLD, how the child ended, its status;
+/// for a timer's, the timer, and in `si_value` what it was set to send.
+pub fn siginfo(signal: usize, info: Info) -> [u8; SIGINFO] {
+    let mut bytes = [0u8; SIGINFO];
+    let mut put = |at: usize, value: i32| bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    put(0, signal as i32);
+    put(8, info.code);
+    put(16, info.pid as i32);
+    put(24, info.status);
+    bytes
+}
+
 /// A signal frame's parts and size: the restorer's address, the
 /// `ucontext`, then the `siginfo_t`.
 const UCONTEXT: usize = 304;
-const SIGINFO: usize = 128;
+pub const SIGINFO: usize = 128;
 const FRAME: usize = 8 + UCONTEXT + SIGINFO;
 /// Where the general registers are in the `ucontext`: `uc_mcontext`, as
 /// `struct sigcontext` has them; then the FPU state's address, and the mask.
@@ -672,12 +724,7 @@ fn setup_frame(
     put(uc + FPSTATE, fpstate);
     put(uc + SIGMASK, old_mask);
     let si = 8 + UCONTEXT;
-    let mut put_int =
-        |at: usize, value: i32| bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
-    put_int(si, signal as i32);
-    put_int(si + 8, info.code);
-    put_int(si + 16, info.pid as i32);
-    put_int(si + 24, info.status);
+    bytes[si..].copy_from_slice(&siginfo(signal, info));
 
     let fpu = process::save_fpu();
     let mut memory = process.memory.lock();

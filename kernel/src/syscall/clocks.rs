@@ -1,11 +1,12 @@
 //! System calls on time: what time it is by each clock, how much of the CPU
-//! a program and its children have had, and alarms.
+//! a program and its children have had, alarms, and timers.
 
 use super::files::{Result, ret};
 use super::{EFAULT, EINVAL};
 use crate::process::{Process, Times};
+use crate::signal;
 use crate::thread;
-use crate::time::{self, Alarm, NANOS, TICK};
+use crate::time::{self, Alarm, MOST_TIMERS, NANOS, TICK, Timer};
 use core::sync::atomic::Ordering::Relaxed;
 
 const CLOCK_REALTIME: u64 = 0;
@@ -165,17 +166,17 @@ fn timeval_nanos(bytes: &[u8]) -> Result<u64> {
     Ok((seconds as u64).saturating_mul(NANOS).saturating_add(micros as u64 * 1000))
 }
 
-/// The caller's alarm as a `struct itimerval`: how often it repeats, and how
-/// long until it's next due.
-fn itimerval(alarm: Alarm) -> [u8; 32] {
+/// `alarm` as a `struct itimerval`, in `micros`, or as a `struct
+/// itimerspec`: how often it repeats, and how long until it's next due.
+fn itimerval(alarm: Alarm, micros: bool) -> [u8; 32] {
     let left = match alarm.due {
         0 => 0,
-        // Due, but not yet sent: a microsecond, then, as Linux would say.
-        due => due.saturating_sub(time::since_boot()).max(1000),
+        // Due, but not yet sent: the least there can be, as Linux says.
+        due => due.saturating_sub(time::since_boot()).max(if micros { 1000 } else { 1 }),
     };
     let mut value = [0u8; 32];
-    value[..16].copy_from_slice(&split(alarm.every, true));
-    value[16..].copy_from_slice(&split(left, true));
+    value[..16].copy_from_slice(&split(alarm.every, micros));
+    value[16..].copy_from_slice(&split(left, micros));
     value
 }
 
@@ -197,7 +198,7 @@ pub fn setitimer(process: &Process, which: u64, new: u64, old: u64) -> i64 {
         let (every, after) = (timeval_nanos(&value[..16])?, timeval_nanos(&value[16..])?);
         let mut alarm = process.alarm.lock();
         if old != 0 {
-            put(process, old, &itimerval(*alarm))?;
+            put(process, old, &itimerval(*alarm, true))?;
         }
         if new != 0 {
             // One too far off to count to never comes, as on Linux.
@@ -215,7 +216,7 @@ pub fn getitimer(process: &Process, which: u64, value: u64) -> i64 {
         return -EINVAL;
     }
     let alarm = *process.alarm.lock();
-    ret(put(process, value, &itimerval(alarm)).map(|()| 0))
+    ret(put(process, value, &itimerval(alarm, true)).map(|()| 0))
 }
 
 /// SIGALRM in `seconds`, or none for 0: the seconds that were left of the
@@ -234,4 +235,141 @@ pub fn alarm(process: &Process, seconds: u64) -> i64 {
         }
     };
     left as i64
+}
+
+/// The `struct timespec` in `bytes`, in nanoseconds.
+fn timespec_nanos(bytes: &[u8]) -> Result<u64> {
+    let seconds = i64::from_le_bytes(bytes[..8].try_into().unwrap());
+    let nanos = i64::from_le_bytes(bytes[8..16].try_into().unwrap());
+    if seconds < 0 || !(0..NANOS as i64).contains(&nanos) {
+        return Err(EINVAL);
+    }
+    Ok((seconds as u64).saturating_mul(NANOS).saturating_add(nanos as u64))
+}
+
+/// `timer_create`: a timer for the program, by `clock`, which when it comes
+/// sends what the `struct sigevent` at `event` says: a signal to the program
+/// (SIGEV_SIGNAL), or to one of its threads (SIGEV_THREAD_ID, which musl's
+/// SIGEV_THREAD comes to), or nothing (SIGEV_NONE); for none given, SIGALRM
+/// to the program, with the timer's id as its value. Its id, written at
+/// `id`, the lowest free. Not set to come until `timer_settime` sets it.
+///
+/// shortcut: by the clocks that count time, not those that count CPU time.
+pub fn timer_create(process: &Process, clock: u64, event: u64, id: u64) -> i64 {
+    const SIGEV_SIGNAL: i32 = 0;
+    const SIGEV_NONE: i32 = 1;
+    const SIGEV_THREAD_ID: i32 = 4;
+    const EAGAIN: i64 = 11;
+    ret((|| {
+        if ![CLOCK_REALTIME, CLOCK_MONOTONIC, CLOCK_BOOTTIME].contains(&clock) {
+            return Err(EINVAL);
+        }
+        // The signal, the thread it's for, and the value it carries.
+        let sent = match event {
+            0 => None,
+            event => {
+                let mut sigevent = [0u8; 64];
+                process.memory.lock().space.read(event, &mut sigevent).ok_or(EFAULT)?;
+                let int = |at: usize| i32::from_le_bytes(sigevent[at..at + 4].try_into().unwrap());
+                let (value, number, notify, tid) = (int(0), int(8), int(12), int(16));
+                let number = || match usize::try_from(number) {
+                    Ok(number @ 1..=signal::COUNT) => Ok(number),
+                    _ => Err(EINVAL),
+                };
+                Some(match notify {
+                    SIGEV_NONE => (0, None, value),
+                    SIGEV_SIGNAL => (number()?, None, value),
+                    SIGEV_THREAD_ID => {
+                        let tid = u64::try_from(tid).map_err(|_| EINVAL)?;
+                        if !process.threads().iter().any(|task| task.id() == tid) {
+                            return Err(EINVAL);
+                        }
+                        (number()?, Some(tid), value)
+                    }
+                    _ => return Err(EINVAL),
+                })
+            }
+        };
+        let index = {
+            let mut timers = process.timers.lock();
+            let index = match timers.iter().position(Option::is_none) {
+                Some(index) => index,
+                None if timers.len() < MOST_TIMERS => {
+                    timers.push(None);
+                    timers.len() - 1
+                }
+                None => return Err(EAGAIN),
+            };
+            let (signal, thread, value) = sent.unwrap_or((signal::SIGALRM, None, index as i32));
+            let alarm = Alarm::default();
+            timers[index] = Some(Timer { alarm, clock, signal, thread, value });
+            index
+        };
+        if put(process, id, &(index as i32).to_le_bytes()).is_err() {
+            process.timers.lock()[index] = None;
+            return Err(EFAULT);
+        }
+        Ok(0)
+    })())
+}
+
+/// Run `f` on the program's timer `id`: EINVAL if it has none by that id.
+fn with_timer<T>(process: &Process, id: u64, f: impl FnOnce(&mut Timer) -> T) -> Result<T> {
+    let index = usize::try_from(id as i32).map_err(|_| EINVAL)?;
+    let mut timers = process.timers.lock();
+    timers.get_mut(index).and_then(Option::as_mut).map(f).ok_or(EINVAL)
+}
+
+/// `timer_settime`: set timer `id` to come as the `struct itimerspec` at
+/// `new` says, when its clock says the time in it, with TIMER_ABSTIME, or
+/// else after that long; and every so often after that, if asked; or off,
+/// for 0. What it was before, at `old`, if that isn't 0.
+pub fn timer_settime(process: &Process, id: u64, flags: u64, new: u64, old: u64) -> i64 {
+    const TIMER_ABSTIME: u64 = 1;
+    ret((|| {
+        let mut value = [0u8; 32];
+        process.memory.lock().space.read(new, &mut value).ok_or(EFAULT)?;
+        let (every, at) = (timespec_nanos(&value[..16])?, timespec_nanos(&value[16..])?);
+        let clock = with_timer(process, id, |timer| timer.clock)?;
+        // How long until then, by the clock the alarm thread goes by.
+        let after = match flags & TIMER_ABSTIME {
+            0 => at,
+            _ => at.saturating_sub(now(process, clock)?),
+        };
+        let alarm = match at {
+            0 => Alarm::default(),
+            // Its time already past, it comes at once: as soon as can be.
+            _ => Alarm { due: time::since_boot().saturating_add(after).max(1), every },
+        };
+        let before = with_timer(process, id, |timer| core::mem::replace(&mut timer.alarm, alarm))?;
+        if old != 0 {
+            put(process, old, &itimerval(before, false))?;
+        }
+        Ok(0)
+    })())
+}
+
+/// `timer_gettime`: how often timer `id` comes, and how long until it next
+/// does, as a `struct itimerspec` at `value`; 0 for one that's off.
+pub fn timer_gettime(process: &Process, id: u64, value: u64) -> i64 {
+    ret(with_timer(process, id, |timer| timer.alarm)
+        .and_then(|alarm| put(process, value, &itimerval(alarm, false)))
+        .map(|()| 0))
+}
+
+/// `timer_getoverrun`: how many more times timer `id` came before its last
+/// signal was taken. None, as each time sends its signal again (see the
+/// alarm thread in `time.rs`).
+pub fn timer_getoverrun(process: &Process, id: u64) -> i64 {
+    ret(with_timer(process, id, |_| 0))
+}
+
+/// `timer_delete`: timer `id` goes, and its id is free again.
+pub fn timer_delete(process: &Process, id: u64) -> i64 {
+    ret((|| {
+        let index = usize::try_from(id as i32).map_err(|_| EINVAL)?;
+        let mut timers = process.timers.lock();
+        timers.get_mut(index).and_then(Option::take).ok_or(EINVAL)?;
+        Ok(0)
+    })())
 }

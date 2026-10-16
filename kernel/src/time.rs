@@ -1,12 +1,14 @@
 //! The time: of day, as the CMOS real-time clock tells it at boot and the HPET
 //! carries on from there; since boot; and programs' alarms, which the alarm
-//! thread sends them as SIGALRM.
+//! thread sends them as SIGALRM, and their timers (`timer_create`), whose
+//! signals it sends too.
 
 use crate::io::hpet;
 use crate::io::interrupts::pit::TIMER_HZ;
 use crate::process;
 use crate::signal::{self, Info};
 use crate::thread;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use x86_64::instructions::port::Port;
 
@@ -35,28 +37,55 @@ pub fn init() {
     thread::spawn(alarms).expect("memory for the alarm thread");
 }
 
-/// Every tick, SIGALRM to the programs whose alarm has come, set again for
-/// the next if it repeats. By the clock programs read, which the timer's
-/// ticks can run ahead of when the host is busy: an alarm can come a tick
-/// late, but never early.
+/// Every tick, SIGALRM to the programs whose alarm has come, and each
+/// timer's signal for those of theirs that have, each set again for the
+/// next if it repeats. By the clock programs read, which the timer's ticks
+/// can run ahead of when the host is busy: an alarm can come a tick late,
+/// but never early.
+///
+/// shortcut: a timer that comes again before its last signal was taken
+/// sends it again, where Linux counts the overrun (`timer_getoverrun`).
 fn alarms() {
     loop {
         thread::sleep(1000 / TIMER_HZ as u64);
         let now = since_boot();
         for program in process::all() {
-            let due = {
-                let mut alarm = program.alarm.lock();
-                let due = alarm.due != 0 && alarm.due <= now;
-                if due {
-                    alarm.due = if alarm.every == 0 { 0 } else { now.saturating_add(alarm.every) };
-                }
-                due
-            };
+            let due = come(&mut program.alarm.lock(), now);
             if due {
                 signal::send(&program, signal::SIGALRM, Info::kernel());
             }
+            let mut fired: Vec<(usize, Timer)> = Vec::new();
+            for (id, timer) in program.timers.lock().iter_mut().enumerate() {
+                if let Some(timer) = timer
+                    && come(&mut timer.alarm, now)
+                {
+                    fired.push((id, *timer));
+                }
+            }
+            for (id, timer) in fired {
+                let info = Info { code: signal::SI_TIMER, pid: id as u64, status: timer.value };
+                match timer.thread {
+                    _ if timer.signal == 0 => {}
+                    None => signal::send(&program, timer.signal, info),
+                    Some(tid) => {
+                        if let Some(task) = program.threads().into_iter().find(|t| t.id() == tid) {
+                            signal::send_thread(&program, &task, timer.signal, info);
+                        }
+                    }
+                }
+            }
         }
     }
+}
+
+/// Whether `alarm` has come by `now`, and if so set it again for the next
+/// time if it repeats, or else off.
+fn come(alarm: &mut Alarm, now: u64) -> bool {
+    let due = alarm.due != 0 && alarm.due <= now;
+    if due {
+        alarm.due = if alarm.every == 0 { 0 } else { now.saturating_add(alarm.every) };
+    }
+    due
 }
 
 /// A program's alarm: when it's due, in nanoseconds since boot, 0 for none;
@@ -66,6 +95,27 @@ pub struct Alarm {
     pub due: u64,
     pub every: u64,
 }
+
+/// A program's timer, as `timer_create` makes one: when it's due and how
+/// often it repeats, as an alarm; and what it sends then: `signal` to the
+/// program, or to one of its threads, `thread`, or nothing for `signal` 0,
+/// as SIGEV_NONE asks; with `value` in the `siginfo_t`'s `si_value`.
+/// `clock` is the one its times are by, as `timer_settime` and
+/// `timer_gettime` read and write them.
+#[derive(Clone, Copy)]
+pub struct Timer {
+    pub alarm: Alarm,
+    pub clock: u64,
+    pub signal: usize,
+    pub thread: Option<u64>,
+    pub value: i32,
+}
+
+/// The most timers a program can have at once.
+///
+/// shortcut: Linux's limit is the signals that can be queued; this one
+/// is to keep a program from emptying the kernel's heap.
+pub const MOST_TIMERS: usize = 256;
 
 /// Seconds since 1970 by the CMOS clock, which QEMU keeps in UTC, as Linux
 /// expects of it.
