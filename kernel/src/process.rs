@@ -71,6 +71,8 @@ pub const KILLED_SIGSEGV: i32 = 128 + signal::SIGSEGV as i32;
 pub const NO_MEMORY: &str = "out of memory";
 pub const TOO_LONG: &str = "arguments too long for the stack";
 
+const ENOMEM: i64 = 12;
+
 pub struct Process {
     pub id: u64,
     /// Taken only with interrupts on, by the program's own system calls.
@@ -415,23 +417,24 @@ pub fn spawn(
     elf: &(impl Source + ?Sized),
     args: &[&str],
     output: impl FnMut(&[u8]) + Send + 'static,
-) -> Result<Arc<Process>, &'static str> {
+) -> Result<Arc<Process>, i64> {
     let tty = Arc::new(fs::Handle::tty(Arc::new(Tty::capture(Box::new(output)))));
     spawn_with(elf, args, &[], vec![Some(tty); 3])
 }
 
 /// `spawn`, with `env` as the program's environment, and `files` as its
 /// descriptors to start with, by number: what its standard input, output
-/// and error are, for one.
+/// and error are, for one. In the root, where an interpreter it names by a
+/// relative path is looked for.
 pub fn spawn_with(
     elf: &(impl Source + ?Sized),
     args: &[&str],
     env: &[&str],
     files: Vec<Option<Arc<fs::Handle>>>,
-) -> Result<Arc<Process>, &'static str> {
+) -> Result<Arc<Process>, i64> {
     let args: Vec<&[u8]> = args.iter().map(|arg| arg.as_bytes()).collect();
     let env: Vec<&[u8]> = env.iter().map(|variable| variable.as_bytes()).collect();
-    let (memory, start) = program(elf, &args, &env)?;
+    let (memory, start) = program(elf, &args, &env, "")?;
     let pml4 = memory.space.pml4();
     let tty = files.iter().flatten().find_map(|handle| match &**handle {
         fs::Handle::Tty { tty, .. } => Some(tty.clone()),
@@ -480,7 +483,7 @@ pub fn spawn_with(
         fs_base: 0,
         fpu: FpuState::new(),
     };
-    thread::spawn_user(Box::new(user)).ok_or(NO_MEMORY)?;
+    thread::spawn_user(Box::new(user)).ok_or(ENOMEM)?;
     Ok(process)
 }
 
@@ -499,7 +502,7 @@ pub fn spawn_program(
         Command::new(path.as_bytes(), &args.iter().map(Vec::as_slice).collect::<Vec<_>>());
     let args: Vec<String> = args.iter().map(|arg| String::from_utf8_lossy(arg).into()).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let process = spawn_with(&elf, &args, env, files).map_err(load_errno)?;
+    let process = spawn_with(&elf, &args, env, files)?;
     *process.command.lock() = command;
     Ok(process)
 }
@@ -571,10 +574,9 @@ fn interpreter(program: &[u8]) -> Option<(&[u8], Option<&[u8]>)> {
 }
 
 /// The errno for why a program couldn't be loaded.
-pub fn load_errno(error: &str) -> i64 {
+fn load_errno(error: &str) -> i64 {
     const E2BIG: i64 = 7;
     const ENOEXEC: i64 = 8;
-    const ENOMEM: i64 = 12;
     const EIO: i64 = 5;
     match error {
         NO_MEMORY => ENOMEM,
@@ -585,18 +587,60 @@ pub fn load_errno(error: &str) -> i64 {
 }
 
 /// `elf` loaded into a new address space, with `args` and `env` on its
-/// stack, and the registers to start it with.
+/// stack, and the registers to start it with; or the errno saying why it
+/// couldn't be. A program that names an interpreter (PT_INTERP), a dynamic
+/// loader such as musl's, starts in it, as Linux starts it: loaded too,
+/// where `mmap` starts handing memory out, and told where both are
+/// (AT_BASE, AT_PHDR, AT_ENTRY), to load what else the program needs and
+/// start it. Its path is looked for from `cwd` if it's relative.
 fn program(
     elf: &(impl Source + ?Sized),
     args: &[&[u8]],
     env: &[&[u8]],
-) -> Result<(Memory, Registers), &'static str> {
-    let mut space = AddressSpace::new().ok_or(NO_MEMORY)?;
+    cwd: &str,
+) -> Result<(Memory, Registers), i64> {
+    let mut space = AddressSpace::new().ok_or(ENOMEM)?;
     space.grow_stack(STACK_TOP - STACK_MOST..STACK_TOP);
-    let image = load(&mut space, elf)?;
-    let rsp = build_stack(&mut space, args, env, &image)?;
-    let memory = Memory { space, brk_start: image.end, brk: image.end, mmap_next: MMAP_START };
-    Ok((memory, Registers { rip: image.entry, rsp, ..Registers::default() }))
+    let parsed = Elf::parse(elf).map_err(load_errno)?;
+    let image = load(&mut space, &parsed, elf, PIE_BASE, MMAP_START).map_err(load_errno)?;
+    let interpreter = match parsed.interpreter(elf).map_err(load_errno)? {
+        Some(path) => Some(load_interpreter(&mut space, cwd, &path)?),
+        None => None,
+    };
+    let base = interpreter.as_ref().map_or(0, |interpreter| interpreter.base);
+    let rsp = build_stack(&mut space, args, env, &image, base).map_err(load_errno)?;
+    let mmap_next = interpreter.as_ref().map_or(MMAP_START, |interpreter| interpreter.end);
+    let entry = interpreter.map_or(image.entry, |interpreter| interpreter.entry);
+    let memory = Memory { space, brk_start: image.end, brk: image.end, mmap_next };
+    Ok((memory, Registers { rip: entry, rsp, ..Registers::default() }))
+}
+
+/// The interpreter at `path`, from `cwd`, loaded into `space` where `mmap`
+/// starts handing memory out: a program, as `execve` would take it, and an
+/// ELF one for x86-64, else ELIBBAD, as Linux has it; whose own PT_INTERP,
+/// if it has one, is passed over, as Linux passes it over.
+///
+/// shortcut: it must be position-independent, as every loader is, rather
+/// than at addresses of its own, which could be the program's.
+fn load_interpreter(space: &mut AddressSpace, cwd: &str, path: &[u8]) -> Result<Image, i64> {
+    const ENOENT: i64 = 2;
+    const EIO: i64 = 5;
+    const ELIBBAD: i64 = 80;
+    let path = core::str::from_utf8(path).map_err(|_| ENOENT)?;
+    if path.is_empty() {
+        return Err(ENOENT);
+    }
+    let file = fs::open_program(&fs::lookup(cwd, path, true)?)?;
+    // Linux reads its ELF header whole first: a shorter file is EIO.
+    if file.size() < 64 {
+        return Err(EIO);
+    }
+    let elf = match Elf::parse(&file) {
+        Ok(elf) if elf.pie => elf,
+        Err(elf::UNREADABLE) => return Err(EIO),
+        _ => return Err(ELIBBAD),
+    };
+    load(space, &elf, &file, MMAP_START, MMAP_END).map_err(load_errno)
 }
 
 /// Where `clone` is to write a new thread's id, those that aren't 0: in the
@@ -728,19 +772,21 @@ pub fn spawn_thread(
 /// Replace `process`, the current thread's program, with `elf`, given `args`
 /// and `env`: its memory, `fs` and SSE registers start afresh, and its other
 /// threads end, the current one taking the program's id, as on Linux. The
-/// registers to enter it with; or why it couldn't be loaded, and nothing has
-/// changed, or that the program is ending, which the current thread is to
-/// do too.
+/// registers to enter it with; or the errno saying why it couldn't be
+/// loaded, and nothing has changed; or ENOEXEC if the program is ending,
+/// which the current thread is to do too.
 pub fn exec(
     process: &Process,
     elf: &(impl Source + ?Sized),
     args: &[&[u8]],
     env: &[&[u8]],
-) -> Result<Registers, &'static str> {
-    let (memory, start) = program(elf, args, env)?;
+) -> Result<Registers, i64> {
+    const ENOEXEC: i64 = 8;
+    let cwd = process.cwd.lock().clone();
+    let (memory, start) = program(elf, args, env, &cwd)?;
     let task = thread::current_task().expect("a program execs");
     if !process.alone(&task) {
-        return Err("the program is ending");
+        return Err(ENOEXEC);
     }
     let pml4 = memory.space.pml4();
     let old = core::mem::replace(&mut *process.memory.lock(), memory);
@@ -1128,6 +1174,9 @@ pub fn enter_user(registers: Registers) -> ! {
 
 /// Where the loader put things, for the stack and the heap.
 struct Image {
+    /// What was added to the addresses in its headers: where a
+    /// position-independent program went, or 0.
+    base: u64,
     entry: u64,
     /// The program headers, in the program's memory, and how many.
     phdr: u64,
@@ -1136,9 +1185,17 @@ struct Image {
     end: u64,
 }
 
-fn load(space: &mut AddressSpace, file: &(impl Source + ?Sized)) -> Result<Image, &'static str> {
-    let elf = Elf::parse(file)?;
-    let base = if elf.pie { PIE_BASE } else { 0 };
+/// `elf`, read from `file`, loaded into `space`: at `pie_base` if it's
+/// position-independent, else where its headers say, all of it below
+/// `limit`.
+fn load(
+    space: &mut AddressSpace,
+    elf: &Elf,
+    file: &(impl Source + ?Sized),
+    pie_base: u64,
+    limit: u64,
+) -> Result<Image, &'static str> {
+    let base = if elf.pie { pie_base } else { 0 };
     let outside = "a segment outside the program's area";
     let mut end = 0;
     let mut phdr = None;
@@ -1150,7 +1207,7 @@ fn load(space: &mut AddressSpace, file: &(impl Source + ?Sized)) -> Result<Image
             elf::PT_LOAD => {
                 let start = base.checked_add(segment.vaddr).ok_or(outside)?;
                 let stop = start.checked_add(segment.memsz).ok_or(outside)?;
-                if start < LOWEST || stop > MMAP_START {
+                if start < LOWEST || stop > limit {
                     return Err(outside);
                 }
                 let mut flags = PageTableFlags::empty();
@@ -1182,6 +1239,7 @@ fn load(space: &mut AddressSpace, file: &(impl Source + ?Sized)) -> Result<Image
     }
     let entry = base.checked_add(elf.entry).filter(|&entry| entry >= LOWEST && entry < end);
     Ok(Image {
+        base,
         entry: entry.ok_or("an entry point outside the program")?,
         phdr: phdr.ok_or("no program headers in the program's memory")?,
         phnum: u64::from(elf.phnum),
@@ -1192,19 +1250,29 @@ fn load(space: &mut AddressSpace, file: &(impl Source + ?Sized)) -> Result<Image
 /// Map the stack and lay it out as Linux does for a new program: from the
 /// stack pointer up, `argc`, the `argv` pointers, the `envp` pointers, and
 /// the auxiliary vector, which tells musl where its program headers (and so
-/// its thread-local storage) are; the strings above them.
+/// its thread-local storage) are, a loader where it was loaded itself,
+/// `interpreter`, 0 for a program without one, and who it runs as, and that
+/// it isn't setuid: without those, musl's loader takes it to be, and
+/// ignores LD_LIBRARY_PATH; the strings above them.
 fn build_stack(
     space: &mut AddressSpace,
     args: &[&[u8]],
     env: &[&[u8]],
     image: &Image,
+    interpreter: u64,
 ) -> Result<u64, &'static str> {
     const AT_NULL: u64 = 0;
     const AT_PHDR: u64 = 3;
     const AT_PHENT: u64 = 4;
     const AT_PHNUM: u64 = 5;
     const AT_PAGESZ: u64 = 6;
+    const AT_BASE: u64 = 7;
     const AT_ENTRY: u64 = 9;
+    const AT_UID: u64 = 11;
+    const AT_EUID: u64 = 12;
+    const AT_GID: u64 = 13;
+    const AT_EGID: u64 = 14;
+    const AT_SECURE: u64 = 23;
     const AT_RANDOM: u64 = 25;
 
     let bottom = STACK_TOP - STACK_SIZE;
@@ -1237,8 +1305,21 @@ fn build_stack(
         image.phnum,
         AT_PAGESZ,
         4096,
+        AT_BASE,
+        interpreter,
         AT_ENTRY,
         image.entry,
+        // Root, as everyone is.
+        AT_UID,
+        0,
+        AT_EUID,
+        0,
+        AT_GID,
+        0,
+        AT_EGID,
+        0,
+        AT_SECURE,
+        0,
         AT_RANDOM,
         random,
         AT_NULL,

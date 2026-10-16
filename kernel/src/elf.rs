@@ -6,6 +6,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 pub const PT_LOAD: u32 = 1;
+pub const PT_INTERP: u32 = 3;
 pub const PT_PHDR: u32 = 6;
 pub const PF_X: u32 = 1;
 pub const PF_W: u32 = 2;
@@ -18,6 +19,9 @@ const MOST_HEADERS: u64 = 64 << 10;
 
 /// Why a program couldn't be loaded, when it was its file.
 pub const UNREADABLE: &str = "the program couldn't be read";
+
+/// The longest path of an interpreter, its NUL and all, as Linux has it.
+const PATH_MAX: u64 = 4096;
 
 /// Where a program is read from: its file on the disk, or memory, as the
 /// ramdisk's is. A piece at a time, as a program can be bigger than the
@@ -110,6 +114,28 @@ impl Elf {
         Ok(elf)
     }
 
+    /// The path of the program that loads this one, its interpreter, if
+    /// its first PT_INTERP names one: as Linux takes it, in the file, two
+    /// bytes to PATH_MAX, ending in a NUL; up to its first NUL.
+    pub fn interpreter(
+        &self,
+        file: &(impl Source + ?Sized),
+    ) -> Result<Option<Vec<u8>>, &'static str> {
+        let Some(segment) = self.segments().find(|segment| segment.kind == PT_INTERP) else {
+            return Ok(None);
+        };
+        if !(2..=PATH_MAX).contains(&segment.filesz) {
+            return Err("an interpreter path of the wrong length");
+        }
+        let mut path = vec![0; segment.filesz as usize];
+        file.read_at(segment.offset, &mut path).ok_or(UNREADABLE)?;
+        if path.last() != Some(&0) {
+            return Err("an interpreter path without its NUL");
+        }
+        path.truncate(path.iter().position(|&byte| byte == 0).unwrap_or(path.len()));
+        Ok(Some(path))
+    }
+
     pub fn segments(&self) -> impl Iterator<Item = Segment> + '_ {
         self.headers.as_chunks::<{ PHENT_SIZE as usize }>().0.iter().map(|header| Segment {
             // In bounds: each is a whole program header.
@@ -174,4 +200,33 @@ fn refuses_broken_files() {
     let filesz_at = (elf.phoff + index * PHENT_SIZE + 32) as usize;
     bad[filesz_at..filesz_at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
     assert_eq!(Elf::parse(&bad[..]).err(), Some("a segment past the end of the file"));
+}
+
+#[test_case]
+fn reads_an_interpreter_path_as_linux_does() {
+    let file = probe();
+    let elf = Elf::parse(&file[..]).unwrap();
+    assert_eq!(elf.interpreter(&file[..]), Ok(None), "probe is static");
+    // probe, its PT_GNU_STACK made a PT_INTERP for `path`, past its end:
+    // what interpreter it then names.
+    let stack = elf.segments().position(|s| s.kind == 0x6474_e551).unwrap() as u64;
+    let header = (elf.phoff + stack * PHENT_SIZE) as usize;
+    let named = |path: &[u8], offset: u64| {
+        let mut file = file.clone();
+        file[header..header + 4].copy_from_slice(&PT_INTERP.to_le_bytes());
+        file[header + 8..header + 16].copy_from_slice(&offset.to_le_bytes());
+        file[header + 32..header + 40].copy_from_slice(&(path.len() as u64).to_le_bytes());
+        file.extend_from_slice(path);
+        let elf = Elf::parse(&file[..]).unwrap();
+        elf.interpreter(&file[..])
+            .map(|path| path.map(|path| alloc::string::String::from_utf8(path).unwrap()))
+    };
+    let end = file.len() as u64;
+    assert_eq!(named(b"/lib/ld.so\0", end), Ok(Some("/lib/ld.so".into())));
+    assert_eq!(named(b"/lib/ld.so\0and more\0", end), Ok(Some("/lib/ld.so".into())));
+    assert_eq!(named(b"/lib/ld.so", end), Err("an interpreter path without its NUL"));
+    assert_eq!(named(b"\0", end), Err("an interpreter path of the wrong length"));
+    assert_eq!(named(b"/lib/ld.so\0", end + 1), Err(UNREADABLE));
+    let long = [b"/".repeat(4096).as_slice(), b"\0"].concat();
+    assert_eq!(named(&long, end), Err("an interpreter path of the wrong length"));
 }

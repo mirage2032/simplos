@@ -43,6 +43,7 @@ pub fn strerror(errno: i64) -> &'static str {
         12 => "Cannot allocate memory",
         13 => "Permission denied",
         20 => "Not a directory",
+        80 => "Accessing a corrupted shared library",
         _ => "Unknown error",
     }
 }

@@ -5,8 +5,9 @@
 # made by musl-cross-make from the sources pinned below, which have to match
 # their checksums: first a cross compiler, with the host's, then with that
 # one the compiler itself, built to run where it compiles. What it makes is
-# static too, as simplos runs nothing else: `-static` unless asked
-# otherwise.
+# linked as on Linux: dynamically, to musl's libc.so and, for C++,
+# libstdc++.so and libgcc_s.so, which musl's loader,
+# /lib/ld-musl-x86_64.so.1, loads; or with `-static`, not.
 #
 # Usage: scripts/toolchain.sh
 #
@@ -118,8 +119,9 @@ step() {
 # library has: not the host's, glibc's, which would have it emit what only
 # glibc has. Its root is where it's installed, as it's moved there: /usr,
 # from /usr/bin, so its headers are in the root's /include. What it compiles
-# is static unless it's asked for otherwise, there being no libc.so,
-# libgcc_s.so or libstdc++.so to link to.
+# is position-independent unless asked otherwise, as Alpine's is, so that
+# musl's loader, run as `ldd`, can map any program where it likes: simplos's
+# mmap takes no address as a hint.
 cat >config.mak <<EOF
 TARGET = x86_64-linux-musl
 SOURCES = $downloads
@@ -131,9 +133,7 @@ MPC_VER = $mpc_version
 MPFR_VER = $mpfr_version
 LINUX_VER = headers-$linux_headers_version
 COMMON_CONFIG += --disable-nls CFLAGS="-g0 -O2" CXXFLAGS="-g0 -O2" LDFLAGS="-s"
-GCC_CONFIG += --disable-lto --disable-libsanitizer --disable-shared \\
-    --with-specs=%{!shared:%{!static-pie:-static}}
-MUSL_CONFIG += --disable-shared
+GCC_CONFIG += --disable-lto --disable-libsanitizer --enable-default-pie
 ifeq (\$(NATIVE),)
 COMMON_CONFIG += CC="gcc -std=gnu17" CXX="g++ -std=gnu++17"
 else
@@ -154,23 +154,40 @@ mkdir -p "$out/usr"
 cp -a "$build/native/." "$out/usr/"
 rm -rf "$out/usr/share/man" "$out/usr/share/info"
 ln -sf gcc "$out/usr/bin/cc"
+# The loader, where programs name it (PT_INTERP): musl's libc.so, which is
+# it. musl links it there to /lib/libc.so, where it went before the move.
+mkdir -p "$out/lib"
+rm -f "$out/usr/lib/ld-musl-x86_64.so.1"
+ln -s ../usr/lib/libc.so "$out/lib/ld-musl-x86_64.so.1"
+# Run as ldd, it lists what a program loads.
+ln -s ../../lib/ld-musl-x86_64.so.1 "$out/usr/bin/ldd"
 
 # It compiles, links and runs, here, which can run what it makes, from
-# where it is in the tree, as it will from /usr/bin.
+# where it is in the tree, as it will from /usr/bin: static, and dynamic,
+# run by the loader it built, which finds the libraries it built first.
 echo "toolchain: checking it" >&2
 check=$build/check
 mkdir -p "$check"
 printf '#include <stdio.h>\nint main(void) { puts("hello from gcc"); }\n' >"$check/hello.c"
 printf '#include <iostream>\n#include <vector>\nint main() { std::vector<int> v{1, 2, 3};\n%s\n}\n' \
     'std::cout << "hello from g++ " << v.size() << "\n";' >"$check/hello.cc"
-step "$out/usr/bin/gcc" -O2 -o "$check/hello" "$check/hello.c"
-step "$out/usr/bin/g++" -O2 -o "$check/hello++" "$check/hello.cc"
-[[ $("$check/hello") == "hello from gcc" && $("$check/hello++") == "hello from g++ 3" ]] || {
+for how in static dynamic; do
+    flags=$([[ $how == static ]] && echo -static || true)
+    step "$out/usr/bin/gcc" $flags -O2 -o "$check/hello-$how" "$check/hello.c"
+    step "$out/usr/bin/g++" $flags -O2 -o "$check/hello++-$how" "$check/hello.cc"
+done
+loaded() { LD_LIBRARY_PATH=$out/usr/lib "$out/lib/ld-musl-x86_64.so.1" "$@"; }
+[[ $("$check/hello-static") == "hello from gcc" && $("$check/hello++-static") == "hello from g++ 3" &&
+    $(loaded "$check/hello-dynamic") == "hello from gcc" &&
+    $(loaded "$check/hello++-dynamic") == "hello from g++ 3" ]] || {
     echo "toolchain: what it compiled didn't run as it should" >&2
     exit 1
 }
-file "$check/hello" "$check/hello++" | grep -v "statically linked" && {
-    echo "toolchain: what it compiled isn't static" >&2
+# Static PIEs, as -static makes them by default; the compiler, not PIE.
+static=$(file "$check"/hello*-static "$out/usr/bin/gcc" | grep -vcE "static(ally|-pie) linked" || true)
+dynamic=$(file "$check"/hello*-dynamic | grep -c "interpreter /lib/ld-musl-x86_64.so.1" || true)
+[[ $static == 0 && $dynamic == 2 ]] || {
+    echo "toolchain: what it compiled isn't linked as asked" >&2
     exit 1
 }
 

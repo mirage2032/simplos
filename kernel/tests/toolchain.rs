@@ -1,7 +1,8 @@
 //! GCC: gcc and g++, as `scripts/toolchain.sh` builds them and
 //! `tools/boot-test` puts them on this kernel's disk, as it does for a
 //! kernel whose name starts with `toolchain`, compiling programs on simplos
-//! that then run on it.
+//! that then run on it: linked dynamically, to shared libraries musl's
+//! loader loads, or statically.
 
 #![no_std]
 #![no_main]
@@ -12,6 +13,7 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -82,10 +84,14 @@ fn gcc_compiles_c_that_runs() {
         "#include <stdio.h>\n#include \"add.h\"\n\n\
          int main(void) {\n    printf(\"%d\\n\", add(40, 2));\n    return 0;\n}\n",
     );
-    // Compiled and linked apart, then from a library, and run each time.
+    // Compiled and linked apart, then statically from an archive, and run
+    // each time: the first to musl's libc.so, which its loader, named in
+    // its headers, loads; the second with what it needs of libc.a in it.
     let script = "cd /tmp && gcc -O2 -c add.c && gcc -O2 -o sum main.c add.o && ./sum && \
-                  ar rcs libadd.a add.o && cc -o sum2 main.c -L. -ladd && ./sum2";
-    assert_eq!(sh(script), ok("42\n42\n"));
+                  ar rcs libadd.a add.o && cc -static -o sum2 main.c -L. -ladd && ./sum2 && \
+                  readelf -l sum sum2 | grep interpreter";
+    let loader = "      [Requesting program interpreter: /lib/ld-musl-x86_64.so.1]\n";
+    assert_eq!(sh(script), ok(&format!("42\n42\n{loader}")));
 }
 
 #[test_case]
@@ -111,7 +117,68 @@ int main() {
 }
 "#,
     );
-    assert_eq!(sh("cd /tmp && g++ -O2 -o hello hello.cc && ./hello"), ok("hello from g++ 3\n"));
+    // To libstdc++.so, and libgcc_s.so, which unwinds; and statically.
+    let script = "cd /tmp && g++ -O2 -o hello hello.cc && ./hello && \
+                  g++ -O2 -static -o hello-static hello.cc && ./hello-static && \
+                  readelf -d hello | grep NEEDED";
+    let needed = [
+        " 0x0000000000000001 (NEEDED)             Shared library: [libstdc++.so.6]\n",
+        " 0x0000000000000001 (NEEDED)             Shared library: [libgcc_s.so.1]\n",
+        " 0x0000000000000001 (NEEDED)             Shared library: [libc.so]\n",
+    ];
+    assert_eq!(sh(script), ok(&format!("hello from g++ 3\nhello from g++ 3\n{}", needed.concat())));
+}
+
+#[test_case]
+fn gcc_makes_a_shared_library_programs_load() {
+    simplos::take_longer(270);
+    write("tmp/greet.h", "const char *greet(void);\n");
+    write("tmp/greet.c", "#include \"greet.h\"\nconst char *greet(void) { return \"greeted\"; }\n");
+    write(
+        "tmp/greeted.c",
+        "#include <stdio.h>\n#include \"greet.h\"\nint main(void) { puts(greet()); }\n",
+    );
+    // Not where musl's loader looks, until LD_LIBRARY_PATH says it is; and
+    // what ldd, the loader by that name, says it loads, but where.
+    let script = "cd /tmp && gcc -O2 -fPIC -shared -o libgreet.so greet.c && \
+                  gcc -O2 -o greeted greeted.c -L. -lgreet && { ./greeted; echo $?; } && \
+                  LD_LIBRARY_PATH=/tmp ./greeted && \
+                  LD_LIBRARY_PATH=/tmp ldd ./greeted | sed 's/ (0x[0-9a-f]*)$//'";
+    let expected = "Error loading shared library libgreet.so: No such file or directory \
+                    (needed by ./greeted)\n\
+                    Error relocating ./greeted: greet: symbol not found\n\
+                    127\n\
+                    greeted\n\
+                    \t/lib/ld-musl-x86_64.so.1\n\
+                    \tlibgreet.so => /tmp/libgreet.so\n\
+                    \tlibc.so => /lib/ld-musl-x86_64.so.1\n";
+    assert_eq!(sh(script), ok(expected));
+}
+
+#[test_case]
+fn a_program_loads_a_library_as_it_runs() {
+    simplos::take_longer(270);
+    write("tmp/twice.c", "int twice(int n) { return 2 * n; }\n");
+    write(
+        "tmp/dl.c",
+        r#"#include <dlfcn.h>
+#include <stdio.h>
+
+int main(void) {
+    void *library = dlopen("/tmp/libtwice.so", RTLD_NOW);
+    if (!library) return puts(dlerror()), 1;
+    int (*twice)(int) = (int (*)(int))dlsym(library, "twice");
+    printf("twice 21 is %d\n", twice(21));
+    dlclose(library);
+    if (!dlopen("/tmp/missing.so", RTLD_NOW)) puts(dlerror());
+}
+"#,
+    );
+    let script = "cd /tmp && gcc -O2 -fPIC -shared -o libtwice.so twice.c && \
+                  gcc -O2 -o dl dl.c && ./dl";
+    let expected = "twice 21 is 42\n\
+                    Error loading shared library /tmp/missing.so: No such file or directory\n";
+    assert_eq!(sh(script), ok(expected));
 }
 
 #[test_case]

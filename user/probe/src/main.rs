@@ -334,6 +334,40 @@ fn main() {
             let wrong = bytes.iter().enumerate().position(|(i, &b)| b != (i % 251) as u8);
             println!("{}", wrong.map_or(String::from("ok"), |at| format!("wrong at {at}")));
         }
+        // How the kernel says it loaded the program (the auxiliary vector):
+        // whether AT_BASE is where this code is, as when this is another
+        // program's interpreter (PT_INTERP), it being 0 otherwise; whether
+        // the program AT_PHDR's headers are of is another copy, loaded
+        // first; whether AT_ENTRY is that program's entry point; and whether
+        // it says who the program runs as and that it isn't setuid, as
+        // Linux always does, and musl's loader needs.
+        Some("auxv") => {
+            const PT_DYNAMIC: u32 = 2;
+            const PT_PHDR: u32 = 6;
+            let vector = auxiliary_vector();
+            let auxv = |kind: usize| vector.iter().find(|(k, _)| *k == kind).map(|(_, v)| *v);
+            let (phdr, phnum) = (auxv(AT_PHDR).unwrap(), auxv(AT_PHNUM).unwrap());
+            // Safety: the program headers the kernel says are there.
+            let headers = unsafe { std::slice::from_raw_parts(phdr as *const [u8; 56], phnum) };
+            let vaddr = |kind: u32| {
+                let header = headers.iter().find(|h| h[..4] == kind.to_le_bytes()).unwrap();
+                usize::from_le_bytes(header[16..24].try_into().unwrap())
+            };
+            // This code's copy, by its own _DYNAMIC, as musl finds itself; the
+            // first copy's by its program headers.
+            let here = &raw const _DYNAMIC as usize - vaddr(PT_DYNAMIC);
+            let first = phdr - vaddr(PT_PHDR);
+            // Safety: the ELF header, at the start of the first segment.
+            let entry = unsafe { ((here + 24) as *const usize).read() };
+            let ids = [AT_UID, AT_EUID, AT_GID, AT_EGID, AT_SECURE].map(auxv);
+            println!(
+                "{} {} {} {}",
+                auxv(AT_BASE) == Some(here),
+                first != here,
+                auxv(AT_ENTRY) == Some(first + entry),
+                ids.iter().all(Option::is_some),
+            );
+        }
         Some("exit") => std::process::exit(arg(2).parse().unwrap_or(0)),
         Some("mkdir") => or_fail(&arg(2), fs::create_dir(arg(2))),
         Some("mkdir-p") => or_fail(&arg(2), fs::create_dir_all(arg(2))),
@@ -625,6 +659,12 @@ fn main() {
             let error =
                 Command::new(arg(2)).args(std::env::args().skip(3)).env("FROM", "exec").exec();
             or_fail::<()>(&arg(2), Err(error));
+        }
+        // exec, from DIR.
+        Some("exec-in") => {
+            or_fail(&arg(2), std::env::set_current_dir(arg(2)));
+            let error = Command::new(arg(3)).args(std::env::args().skip(4)).exec();
+            or_fail::<()>(&arg(3), Err(error));
         }
         // Its arguments and environment.
         Some("env") => {
@@ -1952,6 +1992,42 @@ std::arch::global_asm!(".globl probe_restore_rt", "probe_restore_rt:", "mov eax,
 
 unsafe extern "C" {
     fn probe_restore_rt();
+    /// The program's dynamic section, where the linker put it.
+    static _DYNAMIC: u8;
+    /// The environment, as the kernel put it on the stack: what's changed
+    /// it since, nothing has, as `auxv` reads it first.
+    static environ: *const *const u8;
+}
+
+const AT_PHDR: usize = 3;
+const AT_PHNUM: usize = 5;
+const AT_BASE: usize = 7;
+const AT_ENTRY: usize = 9;
+const AT_UID: usize = 11;
+const AT_EUID: usize = 12;
+const AT_GID: usize = 13;
+const AT_EGID: usize = 14;
+const AT_SECURE: usize = 23;
+
+/// The auxiliary vector, as the kernel put it on the stack, past the
+/// environment's pointers and the null one that ends them: each entry's
+/// kind and value.
+fn auxiliary_vector() -> Vec<(usize, usize)> {
+    let mut entries = Vec::new();
+    // Safety: the stack as the kernel laid it out, which the program
+    // hasn't touched, environ still pointing into it.
+    unsafe {
+        let mut at = environ;
+        while !(*at).is_null() {
+            at = at.add(1);
+        }
+        let mut at = at.add(1).cast::<usize>();
+        while *at != 0 {
+            entries.push((*at, *at.add(1)));
+            at = at.add(2);
+        }
+    }
+    entries
 }
 
 fn bit(signal: usize) -> u64 {
