@@ -1,0 +1,83 @@
+name: Cargo
+description: >-
+  The Rust toolchain rust-toolchain.toml pins, and, given a name, a cache of
+  what that job's cargo builds have in common from one run to the next, which
+  ./save saves at the end of the job.
+
+inputs:
+  cache:
+    description: The cache's name, one for each job; none, for no cache
+    default: ""
+  targets:
+    description: The target directories to cache, one per line
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    # Honours rust-toolchain.toml, its components and targets included.
+    - uses: actions-rust-lang/setup-rust-toolchain@v2
+      with:
+        # Its cache, Swatinem/rust-cache, keeps only crates.io's crates of a
+        # target directory, and of a cross target's (x86_64-unknown-none, the
+        # bootloader's 16- and 32-bit stages) nothing at all: not even the
+        # core and alloc each one builds with -Zbuild-std, on which all the
+        # rest is built. Every job would build everything afresh.
+        cache: false
+        # Not the action's `deny`, for every cargo build there is: the
+        # bootloader's own builds of its stages, uutils' in
+        # scripts/userland.sh. Lint gives clippy -D warnings itself.
+        build-warnings: ""
+
+    # -Zbuild-std's crates are path dependencies, which cargo judges by their
+    # files' dates, and rustup dates them as it unpacks them: newer than any
+    # build of them a cache holds, which would be built again, and all that's
+    # built on them. Their contents are the pinned toolchain's, which is in
+    # the cache's key, so an old date is never wrong.
+    - if: inputs.cache != ''
+      name: Date the standard library's sources
+      shell: bash
+      run: find "$(rustc --print sysroot)/lib/rustlib/src" -exec touch -h -d @946684800 {} +
+
+    - if: inputs.cache != ''
+      id: key
+      name: Name the cargo cache
+      shell: bash
+      env:
+        NAME: ${{ inputs.cache }}
+        TARGETS: ${{ inputs.targets }}
+      run: |
+        key=$(.github/scripts/cargo-cache-key.sh "$NAME")
+        paths=$(printf '%s\n' '~/.cargo/registry/index' '~/.cargo/registry/cache' '~/.cargo/git/db' "$TARGETS")
+        {
+            echo "key=$key"
+            echo "prefix=${key%-*}-"
+            echo "paths<<EOF"
+            echo "$paths"
+            echo "EOF"
+        } >>"$GITHUB_OUTPUT"
+        # For ./save, later in the job.
+        {
+            echo "CARGO_CACHE_KEY=$key"
+            echo "CARGO_CACHE_PATHS<<EOF"
+            echo "$paths"
+            echo "EOF"
+            echo "CARGO_CACHE_TARGETS<<EOF"
+            echo "$TARGETS"
+            echo "EOF"
+        } >>"$GITHUB_ENV"
+
+    # A new key starts from the latest cache of the same toolchain.
+    - if: inputs.cache != ''
+      id: restore
+      uses: actions/cache/restore@v6
+      with:
+        path: ${{ steps.key.outputs.paths }}
+        key: ${{ steps.key.outputs.key }}
+        restore-keys: ${{ steps.key.outputs.prefix }}
+
+    - if: inputs.cache != ''
+      shell: bash
+      env:
+        HIT: ${{ steps.restore.outputs.cache-hit }}
+      run: echo "CARGO_CACHE_HIT=$HIT" >>"$GITHUB_ENV"

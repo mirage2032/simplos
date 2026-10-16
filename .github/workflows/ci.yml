@@ -1,20 +1,48 @@
 name: CI
 
-# Every pull request into develop, and every promotion to master (promote.yml
-# calls this workflow for the commit it is about to release).
+# Every pull request into develop, every push to develop, and every promotion
+# to master (promote.yml calls this workflow for the commit it is about to
+# release).
 #
-# One job, not several: the expensive part by far is the vendored bootloader,
-# which builds four real-mode BIOS stages and a UEFI loader through five nested
-# `cargo install` runs with their own `build-std`. Splitting format, lint, test
-# and build across jobs would pay that cost once per job.
+# Jobs side by side, each with only what it needs:
 #
-# Deliberately without a `paths` filter, even though a README-only change pays
-# for a full build. Once this is a required check on develop, a pull request
-# whose files are all excluded would never run it, and a required check that
-# never runs stays pending forever — the pull request can't merge and there is
-# nothing to re-run. Minutes are cheaper than that.
+#   plan ──┬─ lint                     format, clippy, no SSE, ext4's tests
+#          │
+#   trees ─┼─ test (kernel) ─┐         the kernel's tests, in two halves that
+#          ├─ test (rust) ───┤         take about as long: rustc and cargo
+#          └─ images ────────┴─ check  under emulation alone take as long as
+#                                      all the others
+#
+# trees makes sure the userland, GCC and Rust the disk is made of are cached,
+# and builds what isn't: minutes for the userland, an hour for GCC. The tests
+# and the images restore them from there.
+#
+# plan skips what has passed already: each job's result depends on some of
+# the repository's paths, and when a run has passed a job with all of those
+# as they are now (and on the same runner image), it isn't run again. A pull
+# request that changes only the userland's script doesn't lint again; one
+# that changes only the README runs nothing but plan, trees and check; and
+# develop, after merging a pull request that passed, runs only what the merge
+# changed. See .github/scripts/plan.sh. check is the one check that's all of
+# them, for a branch rule to require.
+#
+# What runs share is in caches and artifacts. A pull request's caches are its
+# own, no one else's to read, but every run can read develop's: so runs on
+# develop save the trees and each job's cargo builds, and pull requests
+# restore them. What a pull request builds that develop hasn't got, a tree
+# whose script it changed, it also uploads as an artifact, which unlike its
+# caches develop can read after the merge.
+#
+# Deliberately without a `paths` filter, even though plan would make a
+# README-only change cheap anyway. Once check is a required check on
+# develop, a pull request whose files are all excluded would never run it,
+# and a required check that never runs stays pending forever: the pull
+# request can't merge and there is nothing to re-run. plan does what such a
+# filter would, job by job, and still reports.
 on:
   pull_request:
+  push:
+    branches: [develop]
   workflow_call:
     inputs:
       ref:
@@ -24,46 +52,64 @@ on:
 
 permissions:
   contents: read
+  # To find other runs' artifacts: what passed, and trees they built.
+  actions: read
 
-# One run per PR: a new push cancels the previous run. When called there is no
-# PR, so the group falls back to the caller's run id.
+# One run per pull request: a new push cancels the previous run. On develop
+# and when called there is no pull request, so the group falls back to the
+# run's id, and a run that may be building GCC for everyone isn't cancelled.
 concurrency:
   group: ci-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
 jobs:
-  check:
+  plan:
     runs-on: ubuntu-latest
+    outputs:
+      keys: ${{ steps.plan.outputs.keys }}
+      run: ${{ steps.plan.outputs.run }}
+      tests: ${{ steps.plan.outputs.tests }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
 
-      # The tests and the smoke test are real boots, so the runner needs an
-      # emulator. It has no /dev/kvm, so everything runs under TCG. qemu-utils
-      # for qemu-img, which makes the images' ext4 disk into qcow2.
-      - name: Install QEMU
-        run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends -y qemu-system-x86 qemu-utils
+      - id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # What every job depends on: the toolchain, and this workflow with
+          # its actions and scripts.
+          COMMON: rust-toolchain.toml .github/workflows/ci.yml .github/actions .github/scripts
+          # A line for each job: its name, the cargo cache it saves (- for
+          # none), and the paths its result depends on besides those.
+          JOBS: |
+            lint        lint   rustfmt.toml kernel fullkernel tools user fs vendor
+            test-kernel test   kernel tools user fs vendor userland scripts/boot-test.sh scripts/userland.sh scripts/toolchain.sh
+            test-rust   -      kernel tools user fs vendor userland scripts/boot-test.sh scripts/userland.sh scripts/toolchain.sh scripts/rust.sh
+            images      images kernel fullkernel user fs vendor userland scripts/build-images.sh scripts/smoke-test.sh scripts/userland.sh scripts/toolchain.sh scripts/rust.sh
+        run: .github/scripts/plan.sh
 
-      # Honours rust-toolchain.toml, including its components and the
-      # x86_64-unknown-none and x86_64-unknown-linux-musl targets. Pull requests
-      # only read the cache; a promotion's run saves it.
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+  lint:
+    name: Lint and host tests
+    needs: plan
+    if: fromJSON(needs.plan.outputs.run).lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
         with:
-          # There is no workspace: five separate crates with five target
-          # directories, plus the vendored bootloader's own, which the nested
-          # `cargo install` runs fill with a rebuilt `core` for two custom
-          # 16-bit and 32-bit targets. Leaving that one out doubles the run.
-          cache-workspaces: |
-            kernel -> target
-            fullkernel -> target
-            tools/boot-test -> target
-            user/probe -> target
-            fs/ext4 -> target
-            vendor/bootloader -> target
-          cache-save-if: ${{ github.event_name != 'pull_request' }}
+          ref: ${{ inputs.ref }}
+
+      - name: Set up Rust
+        uses: ./.github/actions/cargo
+        with:
+          cache: lint
+          targets: |
+            kernel/target
+            fullkernel/target
+            tools/boot-test/target
+            user/probe/target
+            fs/ext4/target
+            vendor/bootloader/target
 
       # vendor/ is upstream code with its own style; only what we write.
       - name: Format
@@ -85,66 +131,6 @@ jobs:
             echo "::endgroup::"
           done
 
-      # busybox, uutils, zsh and vim, for tests/shells.rs, from the sources the script pins,
-      # kept for as long as the script stays the same; and its downloads for
-      # longer. boot-test would build them anyway: here it's a step of its own.
-      - uses: actions/cache@v4
-        with:
-          path: |
-            target/userland/root
-            target/userland/built
-            target/userland/downloads
-          key: userland-${{ hashFiles('scripts/userland.sh') }}
-          restore-keys: userland-
-
-      - name: Build the userland
-        run: scripts/userland.sh
-
-      # GCC, for tests/toolchain.rs and the images' disk, the same way. It
-      # takes an hour here the first time, so it's saved as soon as it's
-      # built rather than at the end, which a failing test would skip.
-      - uses: actions/cache/restore@v4
-        id: toolchain
-        with:
-          path: |
-            target/toolchain/root
-            target/toolchain/built
-            target/toolchain/downloads
-          key: toolchain-${{ hashFiles('scripts/toolchain.sh') }}
-          restore-keys: toolchain-
-
-      - name: Build the toolchain
-        run: scripts/toolchain.sh
-
-      - uses: actions/cache/save@v4
-        if: steps.toolchain.outputs.cache-hit != 'true'
-        with:
-          path: |
-            target/toolchain/root
-            target/toolchain/built
-            target/toolchain/downloads
-          key: ${{ steps.toolchain.outputs.cache-primary-key }}
-
-      # Rust's rustc and cargo, for tests/rust.rs and the images' disk: the
-      # release the script pins, its 300 MB download kept for as long as the
-      # script stays the same, and unpacked each time, which is quick.
-      - uses: actions/cache@v4
-        with:
-          path: target/rust/downloads
-          key: rust-${{ hashFiles('scripts/rust.sh') }}
-          restore-keys: rust-
-
-      - name: Unpack Rust
-        run: scripts/rust.sh
-
-      # Each of these is a kernel: built for x86_64-unknown-none, wrapped in a
-      # bootable image by tools/boot-test and run under QEMU, which reports the
-      # result by the status it exits with. Each run also gets an ext4 disk
-      # from e2fsprogs' mke2fs, and e2fsck checks it afterwards.
-      - name: Test
-        working-directory: kernel
-        run: cargo test
-
       # The kernel saves only the general registers of a thread that's in it,
       # so it mustn't touch SSE ones: Rust code for this target can't, and C
       # (lwext4) is compiled not to. Optimised, as the images are, is when a
@@ -163,8 +149,196 @@ jobs:
         working-directory: fs/ext4
         run: cargo test
 
+      - name: Save the cargo cache
+        uses: ./.github/actions/cargo/save
+
+      - name: Record the pass
+        uses: ./.github/actions/passed
+        with:
+          key: ${{ fromJSON(needs.plan.outputs.keys).lint }}
+
+  # What the disk is made of, each from the sources its script pins, cached
+  # for as long as the script stays the same, and with its downloads, kept
+  # for longer. Each is saved as soon as it's built, rather than at the end,
+  # which a failure after it would skip. See .github/actions/tree.
+  trees:
+    name: Userland, GCC and Rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      - id: userland
+        name: Look for the userland
+        uses: ./.github/actions/tree
+        with:
+          name: userland
+          mode: look
+      - id: toolchain
+        name: Look for GCC
+        uses: ./.github/actions/tree
+        with:
+          name: toolchain
+          mode: look
+      - id: rust
+        name: Look for Rust
+        uses: ./.github/actions/tree
+        with:
+          name: rust
+          mode: look
+
+      # busybox, uutils, zsh and vim, for tests/shells.rs. uutils is Rust.
+      - if: steps.userland.outputs.cache-hit != 'true'
+        name: Set up Rust
+        uses: ./.github/actions/cargo
+      - if: steps.userland.outputs.cache-hit != 'true'
+        name: Build the userland
+        uses: ./.github/actions/tree
+        with:
+          name: userland
+          mode: build
+
+      # GCC, for tests/toolchain.rs.
+      - if: steps.toolchain.outputs.cache-hit != 'true'
+        name: Build GCC
+        uses: ./.github/actions/tree
+        with:
+          name: toolchain
+          mode: build
+
+      # Rust's rustc and cargo, for tests/rust.rs: the release the script
+      # pins, which it checks by building with it, in GCC's loader and with
+      # its linker.
+      - if: steps.rust.outputs.cache-hit != 'true' && steps.toolchain.outputs.cache-hit == 'true'
+        name: Restore GCC
+        uses: ./.github/actions/tree
+        with:
+          name: toolchain
+      - if: steps.rust.outputs.cache-hit != 'true'
+        name: Unpack Rust
+        uses: ./.github/actions/tree
+        with:
+          name: rust
+          mode: build
+
+  test:
+    name: Test
+    needs: [plan, trees]
+    if: needs.plan.outputs.tests != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        half: ${{ fromJSON(needs.plan.outputs.tests) }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      # The tests are real boots, so the runner needs an emulator. It has no
+      # /dev/kvm, so everything runs under TCG.
+      - name: Install QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y qemu-system-x86
+
+      - name: Set up Rust
+        uses: ./.github/actions/cargo
+        with:
+          cache: test
+          targets: |
+            kernel/target
+            tools/boot-test/target
+            vendor/bootloader/target
+
+      - name: Restore the userland
+        uses: ./.github/actions/tree
+        with:
+          name: userland
+      - name: Restore GCC
+        uses: ./.github/actions/tree
+        with:
+          name: toolchain
+      - if: matrix.half == 'rust'
+        name: Restore Rust
+        uses: ./.github/actions/tree
+        with:
+          name: rust
+
+      # Each of these is a kernel: built for x86_64-unknown-none, wrapped in a
+      # bootable image by tools/boot-test and run under QEMU, which reports the
+      # result by the status it exits with. Each run also gets an ext4 disk
+      # from e2fsprogs' mke2fs, and e2fsck checks it afterwards.
+      - name: Test
+        working-directory: kernel
+        env:
+          HALF: ${{ matrix.half }}
+        run: |
+          if [[ $HALF == rust ]]; then
+            cargo test --test rust
+          else
+            # All that `cargo test` runs but tests/rust.rs, the other half.
+            tests=()
+            for test in tests/*.rs; do
+              [[ $test == tests/rust.rs ]] || tests+=(--test "$(basename "$test" .rs)")
+            done
+            cargo test --lib --bins "${tests[@]}"
+            cargo test --doc
+          fi
+
+      # Both halves build the same, but one cache is enough.
+      - if: matrix.half == 'kernel'
+        name: Save the cargo cache
+        uses: ./.github/actions/cargo/save
+
+      - name: Record the pass
+        uses: ./.github/actions/passed
+        with:
+          key: ${{ fromJSON(needs.plan.outputs.keys)[format('test-{0}', matrix.half)] }}
+
+  images:
+    name: Images
+    needs: [plan, trees]
+    if: fromJSON(needs.plan.outputs.run).images
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      # qemu-utils for qemu-img, which makes the images' ext4 disk into qcow2.
+      - name: Install QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y qemu-system-x86 qemu-utils
+
+      - name: Set up Rust
+        uses: ./.github/actions/cargo
+        with:
+          cache: images
+          targets: |
+            fullkernel/target
+            vendor/bootloader/target
+
+      - name: Restore the userland
+        uses: ./.github/actions/tree
+        with:
+          name: userland
+      - name: Restore GCC
+        uses: ./.github/actions/tree
+        with:
+          name: toolchain
+      - name: Restore Rust
+        uses: ./.github/actions/tree
+        with:
+          name: rust
+
       - name: Build the images
         run: scripts/build-images.sh
+
+      - name: Save the cargo cache
+        uses: ./.github/actions/cargo/save
 
       # Boots both images for real and checks the kernel's own boot banner —
       # the firmware it came up under and the framebuffer mode it settled on —
@@ -174,7 +348,7 @@ jobs:
 
       # Handy on a pull request that changes the kernel: download and boot it
       # without building the whole thing locally.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: disk-images
           path: |
@@ -182,3 +356,21 @@ jobs:
             dist/disk.qcow2
           if-no-files-found: error
           retention-days: 7
+
+      - name: Record the pass
+        uses: ./.github/actions/passed
+        with:
+          key: ${{ fromJSON(needs.plan.outputs.keys).images }}
+
+  check:
+    needs: [plan, lint, trees, test, images]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      # Skipped is fine, as plan skips what has passed; failed isn't, and a
+      # job skipped because one it needs failed comes with that failure.
+      - env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "$RESULTS"
+          [[ " $RESULTS " != *" failure "* && " $RESULTS " != *" cancelled "* ]]

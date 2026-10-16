@@ -1,0 +1,126 @@
+name: Tree
+description: >-
+  One of the trees simplos's disk is made of, as scripts/NAME.sh builds it in
+  target/NAME: the userland, GCC or Rust. Cached with its downloads, under the
+  script's hash, which is also how the script itself tells whether what it
+  built is still what it would build.
+
+inputs:
+  name:
+    description: userland, toolchain or rust
+    required: true
+  mode:
+    description: >-
+      need: restore it, and fail if it isn't cached rather than build it
+      again where it's needed, as boot-test and build-images.sh would.
+      look: only see whether it's cached.
+      build: make it, as it isn't cached, and cache it.
+    default: need
+
+outputs:
+  cache-hit:
+    description: Whether it's cached, as its script is now
+    value: ${{ steps.cache.outputs.cache-hit }}
+
+runs:
+  using: composite
+  steps:
+    # The paths and the key as the caches made before this action have them,
+    # so those are still found.
+    - id: key
+      shell: bash
+      env:
+        KEY: ${{ inputs.name }}-${{ hashFiles(format('scripts/{0}.sh', inputs.name)) }}
+      run: |
+        echo "key=$KEY" >>"$GITHUB_OUTPUT"
+        echo "artifact=tree-$KEY.tar.zst" >>"$GITHUB_OUTPUT"
+
+    - if: inputs.mode != 'build'
+      id: cache
+      uses: actions/cache/restore@v6
+      with:
+        path: |
+          target/${{ inputs.name }}/root
+          target/${{ inputs.name }}/built
+          target/${{ inputs.name }}/downloads
+        key: ${{ steps.key.outputs.key }}
+        lookup-only: ${{ inputs.mode == 'look' }}
+        fail-on-cache-miss: ${{ inputs.mode == 'need' }}
+
+    # Another run may have built it: a pull request's caches are its own, but
+    # its artifacts aren't, so develop can take what a pull request built once
+    # it's merged. Only this repository's own runs, as a fork's could upload
+    # anything.
+    - if: inputs.mode == 'build'
+      id: built
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        ARTIFACT: ${{ steps.key.outputs.artifact }}
+      run: |
+        run=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$ARTIFACT" --jq '
+            [.artifacts[] | select(.expired | not)
+                | select(.workflow_run.head_repository_id == .workflow_run.repository_id)]
+            | first | .workflow_run.id // empty') || run=""
+        echo "run=$run" >>"$GITHUB_OUTPUT"
+    - if: inputs.mode == 'build' && steps.built.outputs.run != ''
+      uses: actions/download-artifact@v8
+      with:
+        name: ${{ steps.key.outputs.artifact }}
+        run-id: ${{ steps.built.outputs.run }}
+        github-token: ${{ github.token }}
+        path: ${{ runner.temp }}/tree
+    - if: inputs.mode == 'build' && steps.built.outputs.run != ''
+      shell: bash
+      env:
+        NAME: ${{ inputs.name }}
+        ARTIFACT: ${{ steps.key.outputs.artifact }}
+      run: |
+        mkdir -p target
+        find "$RUNNER_TEMP/tree" -type f -name "$ARTIFACT" -exec tar -C target -I zstd -xf {} \;
+        rm -rf "$RUNNER_TEMP/tree"
+        # What the script would have built, as its stamp says.
+        [[ $(cat "target/$NAME/built") == $(sha256sum "scripts/$NAME.sh" | cut -d' ' -f1) ]]
+
+    # Or build it, with an older build's downloads if there is one.
+    - if: inputs.mode == 'build' && steps.built.outputs.run == ''
+      uses: actions/cache/restore@v6
+      with:
+        path: |
+          target/${{ inputs.name }}/root
+          target/${{ inputs.name }}/built
+          target/${{ inputs.name }}/downloads
+        key: ${{ steps.key.outputs.key }}
+        restore-keys: ${{ inputs.name }}-
+    - if: inputs.mode == 'build' && steps.built.outputs.run == ''
+      shell: bash
+      env:
+        NAME: ${{ inputs.name }}
+      run: scripts/$NAME.sh
+
+    # Tar, not the artifact's zip, which would lose the trees' links and modes.
+    - if: >-
+        inputs.mode == 'build' && steps.built.outputs.run == ''
+        && github.event.pull_request.head.repo.full_name == github.repository
+      shell: bash
+      env:
+        NAME: ${{ inputs.name }}
+        ARTIFACT: ${{ steps.key.outputs.artifact }}
+      run: tar -C target -I 'zstd -T0' -cf "$RUNNER_TEMP/$ARTIFACT" "$NAME/root" "$NAME/built" "$NAME/downloads"
+    - if: >-
+        inputs.mode == 'build' && steps.built.outputs.run == ''
+        && github.event.pull_request.head.repo.full_name == github.repository
+      uses: actions/upload-artifact@v7
+      with:
+        path: ${{ runner.temp }}/${{ steps.key.outputs.artifact }}
+        archive: false
+        retention-days: 30
+
+    - if: inputs.mode == 'build'
+      uses: actions/cache/save@v6
+      with:
+        path: |
+          target/${{ inputs.name }}/root
+          target/${{ inputs.name }}/built
+          target/${{ inputs.name }}/downloads
+        key: ${{ steps.key.outputs.key }}
