@@ -223,7 +223,7 @@ jobs:
           mode: build
 
   test:
-    name: Test (${{ matrix.half }})
+    name: Test
     needs: [plan, trees]
     if: needs.plan.outputs.tests != '[]'
     runs-on: ubuntu-latest
