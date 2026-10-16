@@ -1389,6 +1389,164 @@ fn main() {
             let second = String::from_utf8_lossy(&second[..read.saturating_sub(4)]).into_owned();
             println!("{written} {read} {:?} {second:?} {too_many} {nowhere}", str_of(&first));
         }
+        // preadv and pwritev at an offset, the file's place left where it
+        // was; then pwritev2 at the place, -1, which it moves, and with
+        // RWF_APPEND at the end; and a flag there isn't, EOPNOTSUPP.
+        Some("vectors-at") => {
+            let file = or_fail(
+                &arg(2),
+                OpenOptions::new().read(true).write(true).create(true).truncate(true).open(arg(2)),
+            );
+            or_fail(&arg(2), (&file).write_all(b"abcdefgh"));
+            let fd = file.as_raw_fd() as usize;
+            syscall(8, fd, 0, 0);
+            let iov = |parts: &[&[u8]]| -> Vec<usize> {
+                parts.iter().flat_map(|part| [part.as_ptr() as usize, part.len()]).collect()
+            };
+            let parts = iov(&[b"XY", b"Z"]);
+            let wrote = syscall5(296, [fd, parts.as_ptr() as usize, 2, 2, 0]);
+            let (mut first, mut second) = ([0u8; 3], [0u8; 2]);
+            let into = [first.as_mut_ptr() as usize, 3, second.as_mut_ptr() as usize, 2];
+            let read = syscall5(295, [fd, into.as_ptr() as usize, 2, 1, 0]);
+            let place = syscall(8, fd, 0, 1);
+            let at_place = iov(&[b"12"]);
+            let moved = syscall6(328, [fd, at_place.as_ptr() as usize, 1, -1isize as usize, 0], 0);
+            let appended = iov(&[b"!"]);
+            syscall6(328, [fd, appended.as_ptr() as usize, 1, -1isize as usize, 0], 0x10);
+            let unknown = syscall6(327, [fd, into.as_ptr() as usize, 2, 0, 0], 0x1000);
+            let now = or_fail(&arg(2), fs::read_to_string(arg(2)));
+            println!(
+                "{wrote} {read} {:?} {:?} {place} {moved} {} {now} {unknown}",
+                str_of(&first),
+                str_of(&second),
+                syscall(8, fd, 0, 1)
+            );
+        }
+        // Locks on the file PATH: flock's, an open file's, shared with its
+        // dup and its copy's; one waited for; and fcntl's ranges, each a
+        // process's, as F_GETLK tells, gone as it closes any descriptor of
+        // the file; and F_OFD_SETLK's, an open file's.
+        Some("locks") => {
+            const LOCK_SH: usize = 1;
+            const LOCK_EX: usize = 2;
+            const LOCK_NB: usize = 4;
+            const LOCK_UN: usize = 8;
+            let path = arg(2);
+            let open = || {
+                let mut options = OpenOptions::new();
+                let file = options.read(true).write(true).create(true).truncate(false).open(&path);
+                or_fail(&path, file)
+            };
+            let (first, second) = (open(), open());
+            let (a, b) = (first.as_raw_fd() as usize, second.as_raw_fd() as usize);
+            let flock = |fd: usize, how: usize| syscall(73, fd, how, 0);
+            let mut whole = vec![flock(a, LOCK_EX), flock(b, LOCK_EX | LOCK_NB)];
+            whole.push(flock(b, LOCK_SH | LOCK_NB));
+            let copy = syscall(32, a, 0, 0) as usize;
+            whole.push(flock(copy, LOCK_EX | LOCK_NB));
+            let child = syscall(57, 0, 0, 0);
+            if child == 0 {
+                std::process::exit(if flock(a, LOCK_EX | LOCK_NB) == 0 { 0 } else { 1 });
+            }
+            let in_copy = wait(child).1;
+            whole.push(flock(a, LOCK_UN));
+            whole.push(flock(b, LOCK_SH | LOCK_NB));
+            whole.push(flock(b, LOCK_UN));
+            // Held by a copy, on a file of its own, for 50 ms; waited for.
+            let (mut ready, ready_writer) = or_fail("pipe", io::pipe());
+            let child = syscall(57, 0, 0, 0);
+            if child == 0 {
+                let mine = open();
+                flock(mine.as_raw_fd() as usize, LOCK_EX);
+                or_fail("pipe", (&ready_writer).write_all(b"r"));
+                std::thread::sleep(Duration::from_millis(50));
+                std::process::exit(0);
+            }
+            or_fail("pipe", ready.read_exact(&mut [0]));
+            let started = Instant::now();
+            let waited = (flock(b, LOCK_EX), started.elapsed() >= Duration::from_millis(30));
+            flock(b, LOCK_UN);
+            wait(child);
+            // fcntl: a write lock on bytes 0 to 9, then what a copy is told.
+            let parent = getpid();
+            let range = |kind: i16, start: i64, len: i64| {
+                let mut flock = [0u8; 32];
+                flock[..2].copy_from_slice(&kind.to_le_bytes());
+                flock[8..16].copy_from_slice(&start.to_le_bytes());
+                flock[16..24].copy_from_slice(&len.to_le_bytes());
+                flock
+            };
+            let fcntl = |fd: usize, command: usize, flock: &mut [u8; 32]| {
+                syscall(72, fd, command, flock.as_mut_ptr() as usize)
+            };
+            let ranges = fcntl(a, 6, &mut range(1, 0, 10));
+            let (mut told, told_writer) = or_fail("pipe", io::pipe());
+            let child = syscall(57, 0, 0, 0);
+            if child == 0 {
+                let mut asked = range(1, 5, 1);
+                fcntl(a, 5, &mut asked);
+                let kind = i16::from_le_bytes([asked[0], asked[1]]);
+                let at = i64::from_le_bytes(asked[8..16].try_into().unwrap());
+                let len = i64::from_le_bytes(asked[16..24].try_into().unwrap());
+                let pid = i32::from_le_bytes(asked[24..28].try_into().unwrap());
+                let refused = fcntl(a, 6, &mut range(1, 5, 1));
+                let apart = fcntl(a, 6, &mut range(1, 20, 10));
+                let said =
+                    format!("{kind} {at} {len} {} {refused} {apart}", pid as isize == parent);
+                or_fail("pipe", (&told_writer).write_all(said.as_bytes()));
+                std::process::exit(0);
+            }
+            drop(told_writer);
+            let mut said = String::new();
+            or_fail("pipe", told.read_to_string(&mut said));
+            wait(child);
+            // Closing another descriptor of the file lets go of the range.
+            drop(second);
+            let child = syscall(57, 0, 0, 0);
+            if child == 0 {
+                std::process::exit(fcntl(a, 6, &mut range(1, 5, 1)) as i32 & 0xff);
+            }
+            let after_close = wait(child).1;
+            // An open file's range: in the way of a copy's process range on
+            // the same file, as both are fcntl's.
+            let ofd = fcntl(a, 37, &mut range(1, 0, 0));
+            let child = syscall(57, 0, 0, 0);
+            if child == 0 {
+                let mine = open();
+                let refused = fcntl(mine.as_raw_fd() as usize, 6, &mut range(0, 100, 1));
+                std::process::exit(-refused as i32);
+            }
+            let ofd_in_the_way = wait(child).1;
+            println!(
+                "{whole:?} {in_copy} {waited:?}; {ranges} {said}; {after_close} {ofd} {ofd_in_the_way}"
+            );
+        }
+        // prctl's names: this thread's, which /proc/self/comm tells, cut to
+        // 15 bytes; a new thread's, its maker's until it names itself; and
+        // an option there isn't, EINVAL.
+        Some("names") => {
+            let get = || {
+                let mut name = [0u8; 16];
+                syscall(157, 16, name.as_mut_ptr() as usize, 0);
+                str_of(&name).to_string()
+            };
+            let set = |name: &std::ffi::CStr| syscall(157, 15, name.as_ptr() as usize, 0);
+            let before = get();
+            set(c"renamed");
+            let comm = or_fail("comm", fs::read_to_string("/proc/self/comm"));
+            let thread = std::thread::spawn(move || {
+                let inherited = get();
+                set(c"a name longer than fifteen bytes");
+                (inherited, get())
+            });
+            let (inherited, own) = thread.join().unwrap();
+            let unknown = syscall(157, 0x7fff_ffff, 0, 0);
+            println!("{before} {} {inherited} {own:?} {} {unknown}", comm.trim_end(), get());
+        }
+        // Where this program is, as /proc/self/exe links to it.
+        Some("exe") => {
+            println!("{}", or_fail("exe", fs::read_link("/proc/self/exe")).display());
+        }
         // One readv from standard input into buffers of 5 and 10 bytes.
         Some("readv") => {
             use std::io::IoSliceMut;

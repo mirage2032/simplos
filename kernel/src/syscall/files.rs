@@ -3,6 +3,7 @@
 
 use super::{EBADF, EFAULT, EINVAL, ENOTTY, EPERM};
 use crate::fs::{self, Device, Handle};
+use crate::locks;
 use crate::pipe::{self, PipeEnd, ReadError, WriteError};
 use crate::process;
 use crate::process::{Fd, Process};
@@ -266,6 +267,7 @@ pub fn close(process: &Process, fd: u64) -> i64 {
     let handle = process.files.lock().get_mut(fd as usize).and_then(Option::take);
     match handle {
         Some(handle) => {
+            closed(process, &handle);
             drop(handle);
             0
         }
@@ -277,9 +279,149 @@ pub fn close(process: &Process, fd: u64) -> i64 {
 pub fn close_on_exec(process: &Process) {
     let _tree = fs::lock();
     let mut files = process.files.lock();
-    let closed: Vec<Fd> = files.iter_mut().filter_map(|fd| fd.take_if(|fd| fd.cloexec)).collect();
+    let gone: Vec<Fd> = files.iter_mut().filter_map(|fd| fd.take_if(|fd| fd.cloexec)).collect();
     drop(files);
-    drop(closed);
+    gone.iter().for_each(|fd| closed(process, fd));
+    drop(gone);
+}
+
+/// `process` closed `fd`, one of its descriptors: the `fcntl` locks it held
+/// on its file go, as POSIX says, whatever other descriptors of it it has.
+fn closed(process: &Process, fd: &Fd) {
+    if let Handle::File { file, .. } = &*fd.handle {
+        locks::release_process(process.id, Some(file.identity()));
+    }
+}
+
+/// `flock`: lock the whole file `fd` is open on, shared (LOCK_SH) or
+/// exclusive (LOCK_EX), waiting until no one else's lock is in the way, or
+/// with LOCK_NB failing with EWOULDBLOCK; or let go of it (LOCK_UN). The lock
+/// is the open file's, as `locks.rs` says.
+pub fn flock(process: &Process, fd: u64, operation: u64) -> i64 {
+    const LOCK_SH: u64 = 1;
+    const LOCK_EX: u64 = 2;
+    const LOCK_NB: u64 = 4;
+    const LOCK_UN: u64 = 8;
+    ret((|| {
+        let handle = handle(process, fd)?;
+        let wait = operation & LOCK_NB == 0;
+        let exclusive = match operation & !LOCK_NB {
+            LOCK_SH => false,
+            LOCK_EX => true,
+            LOCK_UN => false,
+            _ => return Err(EINVAL),
+        };
+        let Handle::File { file, .. } = &*handle else { return Ok(0) };
+        let owner = locks::Owner::Whole(Arc::as_ptr(&handle) as usize);
+        let file = file.identity();
+        if operation & !LOCK_NB == LOCK_UN {
+            locks::unlock(owner, file, 0, locks::TO_THE_END);
+            return Ok(0);
+        }
+        let lock = locks::Lock { owner, file, start: 0, end: locks::TO_THE_END, exclusive };
+        locks::lock(lock, wait).map(|()| 0).map_err(refused)
+    })())
+}
+
+/// The errno for a lock that wasn't had: EAGAIN, which is EWOULDBLOCK, for
+/// one in the way; or a signal's.
+fn refused(refused: locks::Refused) -> i64 {
+    match refused {
+        locks::Refused::Held => EAGAIN,
+        locks::Refused::Interrupted => ERESTARTSYS,
+    }
+}
+
+/// `fcntl`'s locks on a range of the bytes of the file `handle` is open on,
+/// as the `struct flock` at `at` says: F_GETLK, which lock would stand in
+/// the way of it, written back there, or that none would; F_SETLK, have it,
+/// or let go of it, with EAGAIN if another's is in the way; F_SETLKW, the
+/// same, waiting until none is. F_SETLK's are `process`'s; the F_OFD_
+/// ones', the open file's.
+fn record_lock(process: &Process, handle: &Arc<Handle>, command: u64, at: u64) -> Result<i64> {
+    const F_GETLK: u64 = 5;
+    const F_SETLKW: u64 = 7;
+    const F_OFD_GETLK: u64 = 36;
+    const F_OFD_SETLK: u64 = 37;
+    const F_OFD_SETLKW: u64 = 38;
+    const F_RDLCK: i16 = 0;
+    const F_WRLCK: i16 = 1;
+    const F_UNLCK: i16 = 2;
+    const SEEK_SET: i16 = 0;
+    const SEEK_CUR: i16 = 1;
+    const SEEK_END: i16 = 2;
+    let Handle::File { file, read, write, offset, .. } = &**handle else { return Err(EINVAL) };
+    // l_type and l_whence, shorts; l_start and l_len, at 8 and 16; l_pid.
+    let mut flock = [0u8; 32];
+    process.memory.lock().space.read(at, &mut flock).ok_or(EFAULT)?;
+    let short = |at: usize| i16::from_le_bytes([flock[at], flock[at + 1]]);
+    let long = |at: usize| i64::from_le_bytes(flock[at..at + 8].try_into().unwrap());
+    let (kind, whence, start, len) = (short(0), short(2), long(8), long(16));
+    let ofd = matches!(command, F_OFD_GETLK | F_OFD_SETLK | F_OFD_SETLKW);
+    if ofd && i32::from_le_bytes(flock[24..28].try_into().unwrap()) != 0 {
+        return Err(EINVAL);
+    }
+    let base = match whence {
+        SEEK_SET => 0,
+        SEEK_CUR => offset.load(Relaxed) as i64,
+        SEEK_END => file.size().map_err(fs::errno)? as i64,
+        _ => return Err(EINVAL),
+    };
+    let start = base.checked_add(start).ok_or(EINVAL)?;
+    // A length of 0 is to wherever the file ends; one below 0, the bytes
+    // before `start`.
+    let (start, end) = match len {
+        0 => (start, locks::TO_THE_END as i64),
+        1.. => (start, start.checked_add(len).ok_or(EINVAL)?),
+        _ => (start.checked_add(len).ok_or(EINVAL)?, start),
+    };
+    if start < 0 {
+        return Err(EINVAL);
+    }
+    let (start, end) = (start as u64, if end < 0 { locks::TO_THE_END } else { end as u64 });
+    let owner = match ofd {
+        true => locks::Owner::Open(Arc::as_ptr(handle) as usize),
+        false => locks::Owner::Process(process.id),
+    };
+    let file = file.identity();
+    let exclusive = match kind {
+        F_RDLCK => false,
+        F_WRLCK => true,
+        F_UNLCK if command != F_GETLK && command != F_OFD_GETLK => {
+            locks::unlock(owner, file, start, end);
+            return Ok(0);
+        }
+        _ => return Err(EINVAL),
+    };
+    let wanted = locks::Lock { owner, file, start, end, exclusive };
+    if command == F_GETLK || command == F_OFD_GETLK {
+        let mut told = flock;
+        match locks::conflict(&wanted) {
+            None => told[..2].copy_from_slice(&F_UNLCK.to_le_bytes()),
+            Some(held) => {
+                let kind = if held.exclusive { F_WRLCK } else { F_RDLCK };
+                let len = if held.end == locks::TO_THE_END { 0 } else { held.end - held.start };
+                let pid = match held.owner {
+                    locks::Owner::Process(pid) => pid as i32,
+                    _ => -1,
+                };
+                told[..2].copy_from_slice(&kind.to_le_bytes());
+                told[2..4].copy_from_slice(&SEEK_SET.to_le_bytes());
+                told[8..16].copy_from_slice(&held.start.to_le_bytes());
+                told[16..24].copy_from_slice(&len.to_le_bytes());
+                told[24..28].copy_from_slice(&pid.to_le_bytes());
+            }
+        }
+        process.memory.lock().space.write(at, &told).ok_or(EFAULT)?;
+        return Ok(0);
+    }
+    // To read-lock is to have it open for reading, and to write-lock, for
+    // writing.
+    if !(if exclusive { *write } else { *read }) {
+        return Err(EBADF);
+    }
+    let wait = command == F_SETLKW || command == F_OFD_SETLKW;
+    locks::lock(wanted, wait).map(|()| 0).map_err(refused)
 }
 
 pub fn read(process: &Process, fd: u64, buf: u64, count: u64) -> i64 {
@@ -290,10 +432,78 @@ pub fn read(process: &Process, fd: u64, buf: u64, count: u64) -> i64 {
 /// name, in turn: one read as long as all of them, as Linux's is, so that a
 /// terminal's line or a pipe's bytes come as they would to `read`.
 pub fn readv(process: &Process, fd: u64, iov: u64, count: u64) -> i64 {
+    ret(read_vectored(process, fd, iov, count, None))
+}
+
+/// `readv` from `offset` on, as `pread` reads: `preadv`, and `preadv2`,
+/// which with an offset of -1 reads from the descriptor's place, as `readv`
+/// does. Its `flags`, as `rw_flags`.
+pub fn preadv(process: &Process, fd: u64, iov: u64, count: u64, offset: u64, flags: u64) -> i64 {
+    ret(rw_flags(flags, false).and_then(|_| {
+        let at = if offset as i64 == -1 { None } else { Some(at(offset)?) };
+        read_vectored(process, fd, iov, count, at)
+    }))
+}
+
+/// `writev` at `offset`, as `pwrite` writes: `pwritev`, and `pwritev2`,
+/// which with an offset of -1 writes at the descriptor's place, as `writev`
+/// does; at the end of the file with RWF_APPEND.
+pub fn pwritev(process: &Process, fd: u64, iov: u64, count: u64, offset: u64, flags: u64) -> i64 {
     ret((|| {
-        let buffers = iovecs(process, iov, count)?;
+        let sync = rw_flags(flags, true)?;
+        let at = match offset as i64 {
+            // At the end, and the descriptor's place moved there and on, as
+            // for a file opened O_APPEND.
+            -1 if flags & RWF_APPEND != 0 => {
+                let handle = handle(process, fd)?;
+                if let Handle::File { file, offset, .. } = &*handle {
+                    offset.store(file.size().map_err(fs::errno)?, Relaxed);
+                }
+                None
+            }
+            -1 => None,
+            _ => Some(at(offset)?),
+        };
+        let written = write_vectored(process, fd, iov, count, at)?;
+        if sync {
+            fs::lock().sync().map_err(fs::errno)?;
+        }
+        Ok(written)
+    })())
+}
+
+const RWF_APPEND: u64 = 0x10;
+
+/// What `preadv2` and `pwritev2` are asked, by `flags`: of Linux's, whether
+/// it's to be on the disk before the call returns (RWF_DSYNC, RWF_SYNC, for
+/// a write); and RWF_HIPRI, RWF_APPEND and RWF_NOAPPEND, the last two only
+/// for a write, which need nothing more done; EOPNOTSUPP for the rest, as
+/// Linux says of flags it doesn't know, and RWF_NOWAIT, as here a read or
+/// write never waits for the disk without waiting.
+fn rw_flags(flags: u64, write: bool) -> Result<bool> {
+    const EOPNOTSUPP: i64 = 95;
+    const RWF_HIPRI: u64 = 0x1;
+    const RWF_DSYNC: u64 = 0x2;
+    const RWF_SYNC: u64 = 0x4;
+    const RWF_NOAPPEND: u64 = 0x20;
+    let known =
+        RWF_HIPRI | if write { RWF_DSYNC | RWF_SYNC | RWF_APPEND | RWF_NOAPPEND } else { 0 };
+    if flags & !known != 0 {
+        return Err(EOPNOTSUPP);
+    }
+    Ok(flags & (RWF_DSYNC | RWF_SYNC) != 0)
+}
+
+/// `readv`, from `at`, or the descriptor's place.
+fn read_vectored(process: &Process, fd: u64, iov: u64, count: u64, at: Option<u64>) -> Result<i64> {
+    let buffers = iovecs(process, iov, count)?;
+    // From a file or the like, into each in turn, as `read_at` reads.
+    if in_pieces(&*handle(process, fd)?) {
+        return vectored(buffers, at, |base, len, at| read_at(process, fd, base, len, at));
+    }
+    {
         let total = buffers.iter().map(|&(_, len)| len).sum::<u64>();
-        let data = read_data(process, fd, total, None)?;
+        let data = read_data(process, fd, total, at)?;
         let mut memory = process.memory.lock();
         let mut rest = &data[..];
         for (base, len) in buffers {
@@ -302,23 +512,60 @@ pub fn readv(process: &Process, fd: u64, iov: u64, count: u64) -> i64 {
             rest = later;
         }
         Ok(data.len() as i64)
-    })())
+    }
 }
 
 /// `write` what the `struct iovec`s at `iov` name, as one write: so a pipe
 /// takes it whole or not at all, as for `write`.
 pub fn writev(process: &Process, fd: u64, iov: u64, count: u64) -> i64 {
-    ret((|| {
-        let most = most_written(process, fd);
-        let mut data = Vec::new();
-        for (base, len) in iovecs(process, iov, count)? {
-            let len = (len as usize).min(most - data.len());
-            let start = data.len();
-            data.resize(start + len, 0);
-            process.memory.lock().space.read(base, &mut data[start..]).ok_or(EFAULT)?;
+    ret(write_vectored(process, fd, iov, count, None))
+}
+
+/// Read or write, with `each`, the buffers `buffers` name in turn, the first
+/// from `at` if it's given and each on from where the last ended: the bytes
+/// moved, until one is short; or the first's errno.
+fn vectored(
+    buffers: Vec<(u64, u64)>,
+    at: Option<u64>,
+    mut each: impl FnMut(u64, u64, Option<u64>) -> Result<i64>,
+) -> Result<i64> {
+    let mut done = 0u64;
+    for (base, len) in buffers {
+        let moved = match each(base, len, at.map(|at| at + done)) {
+            Ok(moved) => moved as u64,
+            Err(errno) if done == 0 => return Err(errno),
+            Err(_) => break,
+        };
+        done += moved;
+        if moved < len || done >= MOST as u64 {
+            break;
         }
-        write_data(process, fd, &data, None)
-    })())
+    }
+    Ok(done as i64)
+}
+
+/// `writev`, at `at`, or the descriptor's place: into a pipe or a socket as
+/// one write; else each buffer in turn, as `write_at` writes.
+fn write_vectored(
+    process: &Process,
+    fd: u64,
+    iov: u64,
+    count: u64,
+    at: Option<u64>,
+) -> Result<i64> {
+    let most = most_written(process, fd);
+    let buffers = iovecs(process, iov, count)?;
+    if most == MOST {
+        return vectored(buffers, at, |base, len, at| write_at(process, fd, base, len, at));
+    }
+    let mut data = Vec::new();
+    for (base, len) in buffers {
+        let len = (len as usize).min(most - data.len());
+        let start = data.len();
+        data.resize(start + len, 0);
+        process.memory.lock().space.read(base, &mut data[start..]).ok_or(EFAULT)?;
+    }
+    write_data(process, fd, &data, at)
 }
 
 /// The `count` buffers, as base and length, the `struct iovec`s at `iov` name.
@@ -368,11 +615,50 @@ fn read_errno(error: ReadError) -> i64 {
     }
 }
 
+/// The most a read or write of a file, or of a device that's never short of
+/// bytes, moves through the kernel at once: what it takes of the kernel's
+/// heap, however much it's asked for. A program's threads can each be in
+/// one at once.
+const PIECE: usize = 64 << 10;
+
+/// Whether a read of `handle` is made a piece at a time: what's always as
+/// long as asked, but at the end of a file, rather than what waits.
+fn in_pieces(handle: &Handle) -> bool {
+    matches!(
+        handle,
+        Handle::File { .. }
+            | Handle::Zero
+            | Handle::Null
+            | Handle::Random { .. }
+            | Handle::Proc { .. }
+    )
+}
+
 /// Read from `at`, or else from the descriptor's place, and move it on.
 fn read_at(process: &Process, fd: u64, buf: u64, count: u64, at: Option<u64>) -> Result<i64> {
-    let data = read_data(process, fd, count, at)?;
-    process.memory.lock().space.write(buf, &data).ok_or(EFAULT)?;
-    Ok(data.len() as i64)
+    if !in_pieces(&*handle(process, fd)?) {
+        let data = read_data(process, fd, count, at)?;
+        process.memory.lock().space.write(buf, &data).ok_or(EFAULT)?;
+        return Ok(data.len() as i64);
+    }
+    let count = (count as usize).min(MOST);
+    let mut done = 0;
+    while done < count {
+        let len = (count - done).min(PIECE);
+        let data = match read_data(process, fd, len as u64, at.map(|at| at + done as u64)) {
+            Ok(data) => data,
+            Err(errno) if done == 0 => return Err(errno),
+            Err(_) => break,
+        };
+        if process.memory.lock().space.write(buf + done as u64, &data).is_none() {
+            return if done == 0 { Err(EFAULT) } else { Ok(done as i64) };
+        }
+        done += data.len();
+        if data.len() < len {
+            break;
+        }
+    }
+    Ok(done as i64)
 }
 
 /// What a read of `count` bytes takes, from `at` or the descriptor's place.
@@ -427,11 +713,35 @@ fn read_data(process: &Process, fd: u64, count: u64, at: Option<u64>) -> Result<
     }
 }
 
-/// Write at `at`, or else at the descriptor's place, and move it on.
+/// Write at `at`, or else at the descriptor's place, and move it on: into a
+/// pipe or a socket as one write, which it takes whole or not at all, and
+/// otherwise a piece at a time.
 fn write_at(process: &Process, fd: u64, buf: u64, count: u64, at: Option<u64>) -> Result<i64> {
-    let mut data = vec![0; (count as usize).min(most_written(process, fd))];
-    process.memory.lock().space.read(buf, &mut data).ok_or(EFAULT)?;
-    write_data(process, fd, &data, at)
+    let most = most_written(process, fd);
+    if most != MOST {
+        let mut data = vec![0; (count as usize).min(most)];
+        process.memory.lock().space.read(buf, &mut data).ok_or(EFAULT)?;
+        return write_data(process, fd, &data, at);
+    }
+    let count = (count as usize).min(MOST);
+    let mut piece = vec![0; count.min(PIECE)];
+    let mut done = 0;
+    while done < count {
+        let piece = &mut piece[..(count - done).min(PIECE)];
+        if process.memory.lock().space.read(buf + done as u64, piece).is_none() {
+            return if done == 0 { Err(EFAULT) } else { Ok(done as i64) };
+        }
+        let written = match write_data(process, fd, piece, at.map(|at| at + done as u64)) {
+            Ok(written) => written as usize,
+            Err(errno) if done == 0 => return Err(errno),
+            Err(_) => break,
+        };
+        done += written;
+        if written < piece.len() {
+            break;
+        }
+    }
+    Ok(done as i64)
 }
 
 /// Write `data` at `at`, or else at the descriptor's place, and move it on.
@@ -774,6 +1084,8 @@ pub fn fcntl(process: &Process, fd: u64, command: u64, arg: u64) -> i64 {
                 set_nonblocking(&handle, arg);
                 Ok(0)
             }
+            // F_GETLK, F_SETLK, F_SETLKW and their F_OFD_ forms.
+            5..=7 | 36..=38 => record_lock(process, &handle, command, arg),
             F_GETFL => Ok(match &*handle {
                 Handle::Tty { nonblocking, .. } => 2 | nonblocking_flag(nonblocking),
                 Handle::Null | Handle::Zero | Handle::Random { .. } => 2,
@@ -1095,6 +1407,9 @@ pub fn dup3(process: &Process, fd: u64, to: u64, flags: u64, dup2: bool) -> i64 
             }
             files[to].replace(Fd { handle, cloexec: flags & O_CLOEXEC != 0 })
         };
+        if let Some(replaced) = &replaced {
+            closed(process, replaced);
+        }
         drop(replaced);
         Ok(to as i64)
     })())

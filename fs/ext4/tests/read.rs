@@ -139,3 +139,42 @@ fn mounts_as_many_as_it_can_and_gets_them_back() {
         drop(held);
     }
 }
+
+#[test]
+fn reads_holes_as_zeros() {
+    // mke2fs -d makes a hole of each block of zeros in what it copies: a
+    // file whose blocks of data are between holes, one block or many, as
+    // in Rust's .rmeta files. Read whole, and from every alignment around
+    // the edges of the holes, in pieces long and short.
+    let _serial = serial();
+    let dir = workspace("holes");
+    let root = dir.join("tree");
+    fs::create_dir_all(&root).unwrap();
+    let block = 4096;
+    let mut sparse = Vec::new();
+    for (index, data) in
+        [true, false, true, true, false, false, false, true, false, true].into_iter().enumerate()
+    {
+        let fill = |byte: usize| if data { (index * 37 + byte % 251) as u8 | 1 } else { 0 };
+        sparse.extend((0..block).map(fill));
+    }
+    // And a part of a block at the end, after a hole.
+    sparse.extend([0; 100]);
+    sparse.extend([7; 100]);
+    fs::write(root.join("sparse.bin"), &sparse).unwrap();
+    let fs = Ext4::mount(Box::new(image(&dir, &root, &["-t", "ext4", "-b", "4096"], "16M")))
+        .expect("mounts");
+    assert!(read_all(&fs, "sparse.bin") == sparse, "sparse.bin reads back different");
+    let file = fs.open("sparse.bin").unwrap();
+    for start in [0, 100, block - 1, block, block + 1, 4 * block - 5, 4 * block + 3, 9 * block] {
+        for len in [1, 200, block, block + 7, 3 * block + 11, sparse.len()] {
+            let len = len.min(sparse.len() - start);
+            let mut read = vec![0xAA; len];
+            let mut done = 0;
+            while done < len {
+                done += file.read_at((start + done) as u64, &mut read[done..]).unwrap();
+            }
+            assert!(read == sparse[start..start + len], "{len} bytes from {start} read different");
+        }
+    }
+}

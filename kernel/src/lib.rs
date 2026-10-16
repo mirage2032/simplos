@@ -13,6 +13,7 @@ pub mod fs;
 pub mod futex;
 pub mod init;
 pub mod io;
+pub mod locks;
 pub mod memory;
 pub mod pipe;
 pub mod proc;

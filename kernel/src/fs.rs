@@ -150,6 +150,16 @@ pub enum Handle {
     },
 }
 
+impl Drop for Handle {
+    /// The last of an open file's descriptors closed: its `flock` and
+    /// F_OFD_SETLK locks go.
+    fn drop(&mut self) {
+        if let Handle::File { .. } = self {
+            crate::locks::release_open(self as *const Handle as usize);
+        }
+    }
+}
+
 impl Handle {
     pub fn tty(tty: Arc<Tty>) -> Handle {
         Handle::Tty { tty, nonblocking: AtomicBool::new(false) }

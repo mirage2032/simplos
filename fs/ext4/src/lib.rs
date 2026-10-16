@@ -940,6 +940,12 @@ impl File {
         self.inode
     }
 
+    /// Which file it is, whichever handle on it this is: its mount's, by
+    /// where that is, and its inode there. For locks on it.
+    pub fn identity(&self) -> (usize, u32) {
+        (Arc::as_ptr(&self.mount) as usize, self.inode)
+    }
+
     pub fn metadata(&self) -> Result<Metadata, Error> {
         let _lwext4 = self.mount.lock();
         self.mount.stat(self.inode)

@@ -125,6 +125,18 @@ jobs:
             target/toolchain/downloads
           key: ${{ steps.toolchain.outputs.cache-primary-key }}
 
+      # Rust's rustc and cargo, for tests/rust.rs and the images' disk: the
+      # release the script pins, its 300 MB download kept for as long as the
+      # script stays the same, and unpacked each time, which is quick.
+      - uses: actions/cache@v4
+        with:
+          path: target/rust/downloads
+          key: rust-${{ hashFiles('scripts/rust.sh') }}
+          restore-keys: rust-
+
+      - name: Unpack Rust
+        run: scripts/rust.sh
+
       # Each of these is a kernel: built for x86_64-unknown-none, wrapped in a
       # bootable image by tools/boot-test and run under QEMU, which reports the
       # result by the status it exits with. Each run also gets an ext4 disk
