@@ -527,22 +527,31 @@ fn main() {
         // Linux always does, and musl's loader needs.
         Some("auxv") => {
             const PT_DYNAMIC: u32 = 2;
+            const PT_LOAD: u32 = 1;
             const PT_PHDR: u32 = 6;
             let vector = auxiliary_vector();
             let auxv = |kind: usize| vector.iter().find(|(k, _)| *k == kind).map(|(_, v)| *v);
             let (phdr, phnum) = (auxv(AT_PHDR).unwrap(), auxv(AT_PHNUM).unwrap());
             // Safety: the program headers the kernel says are there.
             let headers = unsafe { std::slice::from_raw_parts(phdr as *const [u8; 56], phnum) };
-            let vaddr = |kind: u32| {
-                let header = headers.iter().find(|h| h[..4] == kind.to_le_bytes()).unwrap();
-                usize::from_le_bytes(header[16..24].try_into().unwrap())
+            let field = |header: &[u8; 56], at: usize| {
+                usize::from_le_bytes(header[at..at + 8].try_into().unwrap())
             };
-            // This code's copy, by its own _DYNAMIC, as musl finds itself; the
-            // first copy's by its program headers.
-            let here = &raw const _DYNAMIC as usize - vaddr(PT_DYNAMIC);
-            let first = phdr - vaddr(PT_PHDR);
+            let find = |kind: u32| headers.iter().find(|h| h[..4] == kind.to_le_bytes());
+            // This code's copy, by its own _DYNAMIC, as musl finds itself.
+            let here = &raw const _DYNAMIC as usize - field(find(PT_DYNAMIC).unwrap(), 16);
             // Safety: the ELF header, at the start of the first segment.
-            let entry = unsafe { ((here + 24) as *const usize).read() };
+            let elf = |at: usize| unsafe { ((here + at) as *const usize).read() };
+            let (entry, phoff) = (elf(24), elf(32));
+            // The first copy's, by where its program headers are: as PT_PHDR
+            // says; or, as GNU ld leaves that out, e_phoff into the segment
+            // the file starts with, as the kernel and musl find them. The two
+            // copies are the same program, with the same e_phoff.
+            let at_start = || {
+                let load = |h: &&[u8; 56]| h[..4] == PT_LOAD.to_le_bytes() && field(h, 8) == 0;
+                headers.iter().find(load).map(|h| field(h, 16) + phoff)
+            };
+            let first = phdr - find(PT_PHDR).map(|h| field(h, 16)).or_else(at_start).unwrap();
             let ids = [AT_UID, AT_EUID, AT_GID, AT_EGID, AT_SECURE].map(auxv);
             println!(
                 "{} {} {} {}",
