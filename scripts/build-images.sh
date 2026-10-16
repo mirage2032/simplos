@@ -77,17 +77,22 @@ install -m 644 "$uefi" "$root/$out/uefi.img"
 
 # The ext4 disk, made as `cargo run` makes its own (`disk` in
 # fullkernel/src/main.rs; keep the two in step): hello.txt, the user program
-# as /bin/probe, and the userland. Unlike `cargo run`, the userland has to
-# build: a release without busybox and zsh isn't one. 1 GiB to the guest, but
-# compressed qcow2 holds only what mke2fs wrote, so the file is a few
-# megabytes, and QEMU attaches it as it is: -drive format=qcow2,file=disk.qcow2.
+# as /bin/probe, the userland and GCC. Unlike `cargo run`, the userland and
+# the toolchain have to build: a release without busybox, zsh, vim and gcc
+# isn't one. 1 GiB to the guest, but compressed qcow2 holds only what mke2fs
+# wrote, so the file is a fraction of that, and QEMU attaches it as it is:
+# -drive format=qcow2,file=disk.qcow2. The toolchain over the userland
+# replaces what's there rather than writing through it, as binutils replace
+# busybox's links.
 "$root/scripts/userland.sh"
+"$root/scripts/toolchain.sh"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 mkdir -p "$work/tree/bin"
 echo "hello from the ext4 disk" >"$work/tree/hello.txt"
 cp "$probe" "$work/tree/bin/probe"
 cp -a "$root/target/userland/root/." "$work/tree/"
+cp -a --remove-destination "$root/target/toolchain/root/." "$work/tree/"
 PATH=$PATH:/usr/sbin:/sbin mke2fs -q -t ext4 -d "$work/tree" "$work/disk.img" 1G
 qemu-img convert -c -f raw -O qcow2 "$work/disk.img" "$root/$out/disk.qcow2"
 

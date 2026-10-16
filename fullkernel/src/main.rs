@@ -8,8 +8,9 @@
 //!
 //! An ext4 disk goes with it, `disk.img` here, made the first time and kept,
 //! so what's written to it is there next time; delete it to start afresh. It
-//! starts with `hello.txt`, user/probe as `/bin/probe`, and the userland that
-//! `scripts/userland.sh` builds, busybox and zsh, if it can.
+//! starts with `hello.txt`, user/probe as `/bin/probe`, the userland that
+//! `scripts/userland.sh` builds, busybox, zsh and vim, and GCC, which
+//! `scripts/toolchain.sh` builds, if they can be.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -46,8 +47,14 @@ fn main() {
     });
 
     // After any of the caller's, whose ext4 disk the kernel then finds first.
+    // On an AHCI controller of its own, which the kernel reads by DMA: four
+    // times as fast under emulation as an IDE disk's port I/O, which is what
+    // starting gcc's 36 MB cc1 waits on.
     if let Some(disk) = disk() {
-        cmd.arg("-drive").arg(format!("format=raw,file={}", disk.display()));
+        cmd.args(["-device", "ich9-ahci,id=simplos-ahci"]);
+        cmd.arg("-drive")
+            .arg(format!("id=simplos-disk,if=none,format=raw,file={}", disk.display()));
+        cmd.args(["-device", "ide-hd,drive=simplos-disk,bus=simplos-ahci.0"]);
     }
 
     // KVM when the host can give it to us, software emulation when it can't —
@@ -67,6 +74,11 @@ fn main() {
     }
     if !given("-cpu") {
         cmd.arg("-cpu").arg(if kvm { "host" } else { "qemu64" });
+    }
+    // Room to compile more than hello world with gcc and g++, which QEMU's
+    // default 128 MiB is about enough for.
+    if !given("-m") {
+        cmd.arg("-m").arg("1G");
     }
 
     let mut child = cmd.spawn().unwrap();
@@ -92,18 +104,22 @@ fn disk() -> Option<PathBuf> {
     std::fs::write(tree.join("hello.txt"), "hello from the ext4 disk\n").ok()?;
     std::fs::create_dir_all(tree.join("bin")).ok()?;
     std::fs::copy(env!("PROBE_PATH"), tree.join("bin/probe")).ok()?;
-    // Built the first time, which takes a few minutes; links and modes kept.
+    // Built the first time: the userland in a few minutes, GCC in a quarter
+    // of an hour on a fast machine. Links and modes kept, and what's there replaced rather
+    // than written through, as GCC's binutils replace busybox's links.
     let repository = here.join("..");
-    let userland = Command::new(repository.join("scripts/userland.sh")).status();
-    let copied = userland.is_ok_and(|status| status.success())
-        && Command::new("cp")
-            .arg("-a")
-            .arg(repository.join("target/userland/root/."))
-            .arg(&tree)
-            .status()
-            .is_ok_and(|status| status.success());
-    if !copied {
-        eprintln!("note: the disk has no busybox or zsh; delete {} to try again", image.display());
+    for (what, has) in [("userland", "busybox, zsh or vim"), ("toolchain", "gcc")] {
+        let built = Command::new(repository.join(format!("scripts/{what}.sh"))).status();
+        let copied = built.is_ok_and(|status| status.success())
+            && Command::new("cp")
+                .args(["-a", "--remove-destination"])
+                .arg(repository.join(format!("target/{what}/root/.")))
+                .arg(&tree)
+                .status()
+                .is_ok_and(|status| status.success());
+        if !copied {
+            eprintln!("note: the disk has no {has}; delete {} to try again", image.display());
+        }
     }
     // Where Linux and Homebrew put it: often not on PATH.
     let mke2fs = [
@@ -118,7 +134,7 @@ fn disk() -> Option<PathBuf> {
         .args(["-q", "-t", "ext4", "-d"])
         .arg(&tree)
         .arg(&image)
-        .arg("256M")
+        .arg("1G")
         .stdout(Stdio::null())
         .status();
     if made.is_ok_and(|status| status.success()) {

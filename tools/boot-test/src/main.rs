@@ -15,7 +15,9 @@
 //!
 //! A kernel whose file name starts with `shells` (`tests/shells.rs`) gets the
 //! userland on its ext4 disk too, busybox and zsh, which `scripts/userland.sh`
-//! builds the first time; the others' tests list that disk and expect only
+//! builds the first time; one whose name starts with `toolchain`
+//! (`tests/toolchain.rs`), GCC as well, from `scripts/toolchain.sh`, and the
+//! time compiling takes. The others' tests list that disk and expect only
 //! what's theirs.
 
 use std::error::Error;
@@ -28,6 +30,9 @@ use std::time::{Duration, Instant};
 /// Long enough for a slow interpreted boot on a loaded CI runner, short enough
 /// that a hung test fails the job rather than sitting until the job's own limit.
 const TIMEOUT: Duration = Duration::from_secs(180);
+/// The same, for a kernel whose tests compile with GCC under emulation, each
+/// given 300 s.
+const TOOLCHAIN_TIMEOUT: Duration = Duration::from_secs(900);
 
 /// QEMU reports a debug-exit of `value` as `(value << 1) | 1`, so the kernel's
 /// `QemuExitCode::Success` (0x10) and `Failed` (0x11) arrive as these.
@@ -75,24 +80,32 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let userland =
-        kernel.file_name().is_some_and(|name| name.to_string_lossy().starts_with("shells"));
-    let userland = match userland.then(build_userland).transpose() {
-        Ok(userland) => userland,
+    let named = |prefix: &str| {
+        kernel.file_name().is_some_and(|name| name.to_string_lossy().starts_with(prefix))
+    };
+    let toolchain = named("toolchain");
+    let built = |wanted: bool, what: &str| match wanted.then(|| build(what)).transpose() {
+        Ok(tree) => Ok(tree),
         Err(why) => {
-            eprintln!("boot-test: {}: the userland: {why}", kernel.display());
-            return ExitCode::FAILURE;
+            eprintln!("boot-test: {}: the {what}: {why}", kernel.display());
+            Err(ExitCode::FAILURE)
         }
     };
+    let (userland, toolchain) =
+        match (built(named("shells") || toolchain, "userland"), built(toolchain, "toolchain")) {
+            (Ok(userland), Ok(toolchain)) => (userland, toolchain),
+            (Err(failed), _) | (_, Err(failed)) => return failed,
+        };
     // At once, as each is a QEMU of its own; what each says is shown in turn,
     // the first's as it comes and the next's once the first is done.
-    let (kernel, userland) = (&kernel, userland.as_deref());
+    let (kernel, userland, toolchain) = (&kernel, userland.as_deref(), toolchain.as_deref());
     let passed = std::thread::scope(|scope| {
         let runs: Vec<_> = firmwares
             .into_iter()
             .map(|firmware| {
                 let (output, said) = mpsc::channel();
-                (firmware, said, scope.spawn(move || run(kernel, userland, firmware, output)))
+                let run = move || run(kernel, userland, toolchain, firmware, output);
+                (firmware, said, scope.spawn(run))
             })
             .collect();
         let mut passed = true;
@@ -112,24 +125,26 @@ fn main() -> ExitCode {
     if passed { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }
 
-/// The tree `scripts/userland.sh` builds, built if it isn't yet.
-fn build_userland() -> Result<PathBuf, String> {
+/// The tree `scripts/WHAT.sh` builds, the userland's or the toolchain's,
+/// built if it isn't yet.
+fn build(what: &str) -> Result<PathBuf, String> {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let status = Command::new(repository.join("scripts/userland.sh"))
+    let status = Command::new(repository.join(format!("scripts/{what}.sh")))
         .status()
-        .map_err(|error| format!("couldn't run scripts/userland.sh: {error}"))?;
+        .map_err(|error| format!("couldn't run scripts/{what}.sh: {error}"))?;
     match status.success() {
-        true => Ok(repository.join("target/userland/root")),
-        false => Err(format!("scripts/userland.sh failed ({status})")),
+        true => Ok(repository.join(format!("target/{what}/root"))),
+        false => Err(format!("scripts/{what}.sh failed ({status})")),
     }
 }
 
-/// One boot of `kernel` under `firmware`, with `userland` on its ext4 disk
-/// if given, what it writes to its serial port sent to `output` as it comes:
-/// whether the guest reported a pass, and if not, why.
+/// One boot of `kernel` under `firmware`, with `userland` and `toolchain` on
+/// its ext4 disk if given, what it writes to its serial port sent to
+/// `output` as it comes: whether the guest reported a pass, and if not, why.
 fn run(
     kernel: &Path,
     userland: Option<&Path>,
+    toolchain: Option<&Path>,
     firmware: Firmware,
     output: Sender<Vec<u8>>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -163,7 +178,7 @@ fn run(
     // A program bigger than the kernel's heap, for tests/processes.rs.
     let big =
         kernel.file_name().is_some_and(|name| name.to_string_lossy().starts_with("processes"));
-    make_ext4(&ext4_scratch, userland, big)?;
+    make_ext4(&ext4_scratch, userland, toolchain, big)?;
 
     let mut qemu = Command::new("qemu-system-x86_64");
     if let Firmware::Uefi = firmware {
@@ -219,14 +234,15 @@ fn run(
     });
 
     let started = Instant::now();
+    let timeout = if toolchain.is_some() { TOOLCHAIN_TIMEOUT } else { TIMEOUT };
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
         }
-        if started.elapsed() > TIMEOUT {
+        if started.elapsed() > timeout {
             child.kill()?;
             child.wait()?;
-            return Err(format!("did not finish within {}s", TIMEOUT.as_secs()).into());
+            return Err(format!("did not finish within {}s", timeout.as_secs()).into());
         }
         std::thread::sleep(Duration::from_millis(50));
     };
@@ -254,11 +270,13 @@ const EXT4_TREE: &[(&str, &str)] =
 
 /// A 16 MiB ext4 file system holding `EXT4_TREE`, as Linux makes them, and in
 /// /bin, user/probe for programs to run, and a script whose interpreter isn't
-/// there. With `userland`'s tree too, 128 MiB, and /bin/sh is; with `big`,
-/// 64 MiB, and /bin/big, from `big_program`.
+/// there. With `userland`'s tree too, 128 MiB, and /bin/sh is; with
+/// `toolchain`'s as well, 1 GiB, and GCC; with `big`, 64 MiB, and /bin/big,
+/// from `big_program`.
 fn make_ext4(
     image: &Path,
     userland: Option<&Path>,
+    toolchain: Option<&Path>,
     big: bool,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     use std::os::unix::fs::PermissionsExt;
@@ -279,11 +297,16 @@ fn make_ext4(
         std::fs::write(tree.join("bin/big"), big_program(&probe))?;
         std::fs::set_permissions(tree.join("bin/big"), std::fs::Permissions::from_mode(0o755))?;
     }
-    if let Some(userland) = userland {
-        // Links and modes as they are.
-        let copied = Command::new("cp").arg("-a").arg(userland.join(".")).arg(&tree).status()?;
+    // Links and modes as they are; and what's there replaced, not written
+    // through, as the toolchain's binutils replace busybox's links.
+    for from in [userland, toolchain].into_iter().flatten() {
+        let copied = Command::new("cp")
+            .args(["-a", "--remove-destination"])
+            .arg(from.join("."))
+            .arg(&tree)
+            .status()?;
         if !copied.success() {
-            return Err(format!("couldn't copy {} ({copied})", userland.display()).into());
+            return Err(format!("couldn't copy {} ({copied})", from.display()).into());
         }
     }
     // 4 KiB blocks, which the tests count in: for a disk this small, some
@@ -292,10 +315,11 @@ fn make_ext4(
         .args(["-q", "-F", "-t", "ext4", "-b", "4096", "-d"])
         .arg(&tree)
         .arg(image)
-        .arg(match (userland.is_some(), big) {
-            (true, _) => "128M",
-            (false, true) => "64M",
-            (false, false) => "16M",
+        .arg(match (toolchain.is_some(), userland.is_some(), big) {
+            (true, _, _) => "1G",
+            (false, true, _) => "128M",
+            (false, false, true) => "64M",
+            (false, false, false) => "16M",
         })
         .output()
         .map_err(|error| format!("couldn't run mke2fs ({error}); is e2fsprogs installed?"))?;
