@@ -132,8 +132,8 @@ jobs:
             echo "::error::The bump changed more than the versions:"; git diff --stat; exit 1
           fi
 
-      # The userland goes on the ext4 disk; the check above has just built it
-      # under this same key, so this is normally a restore.
+      # The userland and GCC go on the ext4 disk; the check above has just
+      # built them under these same keys, so these are normally restores.
       - uses: actions/cache@v4
         with:
           path: |
@@ -142,6 +142,15 @@ jobs:
             target/userland/downloads
           key: userland-${{ hashFiles('scripts/userland.sh') }}
           restore-keys: userland-
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            target/toolchain/root
+            target/toolchain/built
+            target/toolchain/downloads
+          key: toolchain-${{ hashFiles('scripts/toolchain.sh') }}
+          restore-keys: toolchain-
 
       # Built from the release commit, so the images attached below are exactly
       # what this tag describes. The smoke test runs once more here because

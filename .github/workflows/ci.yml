@@ -85,7 +85,7 @@ jobs:
             echo "::endgroup::"
           done
 
-      # busybox and zsh, for tests/shells.rs, from the sources the script pins,
+      # busybox, zsh and vim, for tests/shells.rs, from the sources the script pins,
       # kept for as long as the script stays the same; and its downloads for
       # longer. boot-test would build them anyway: here it's a step of its own.
       - uses: actions/cache@v4
@@ -99,6 +99,31 @@ jobs:
 
       - name: Build the userland
         run: scripts/userland.sh
+
+      # GCC, for tests/toolchain.rs and the images' disk, the same way. It
+      # takes an hour here the first time, so it's saved as soon as it's
+      # built rather than at the end, which a failing test would skip.
+      - uses: actions/cache/restore@v4
+        id: toolchain
+        with:
+          path: |
+            target/toolchain/root
+            target/toolchain/built
+            target/toolchain/downloads
+          key: toolchain-${{ hashFiles('scripts/toolchain.sh') }}
+          restore-keys: toolchain-
+
+      - name: Build the toolchain
+        run: scripts/toolchain.sh
+
+      - uses: actions/cache/save@v4
+        if: steps.toolchain.outputs.cache-hit != 'true'
+        with:
+          path: |
+            target/toolchain/root
+            target/toolchain/built
+            target/toolchain/downloads
+          key: ${{ steps.toolchain.outputs.cache-primary-key }}
 
       # Each of these is a kernel: built for x86_64-unknown-none, wrapped in a
       # bootable image by tools/boot-test and run under QEMU, which reports the

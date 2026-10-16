@@ -31,9 +31,12 @@ Any other argument is passed straight through to QEMU.
 
 A release's images need none of this — download `bios.img` or `uefi.img` from
 [the latest release](../../releases/latest) and boot it. Its `disk.qcow2` is
-the ext4 disk `cargo run` would make, userland and all, 1 GiB to the guest in a
-file of a few megabytes; attach it after the image with
-`-drive format=qcow2,file=disk.qcow2`.
+the ext4 disk `cargo run` would make, userland, GCC and all, 1 GiB to the
+guest in a file of 79 MB; attach it after the image with
+`-drive format=qcow2,file=disk.qcow2`. To compile on it, attach it to AHCI
+instead, as `cargo run` does, which reads four times as fast, and for more
+than hello world, give it more memory than QEMU's 128 MiB with `-m 1G`:
+`-device ich9-ahci,id=ahci -drive id=d,if=none,format=qcow2,file=disk.qcow2 -device ide-hd,drive=d,bus=ahci.0`.
 
 ## Resolution
 
@@ -380,6 +383,44 @@ under the Vim license, which is GPL-compatible. A disk made with them holds
 their programs, built from the upstream releases the script names (vim's,
 from its tag), unchanged, configured as it says.
 
+## GCC
+
+`scripts/toolchain.sh` builds a compiler for the disk, so programs can be
+compiled on simplos and run there: gcc and g++ 14.3.0, binutils 2.44, and
+musl 1.2.6's headers and `libc.a`, with `cc` for gcc, all under `/usr`.
+
+```sh
+gcc -O2 -o hello hello.c && ./hello
+g++ -O2 -o hello hello.cc && ./hello
+```
+
+They're static programs for x86-64 Linux with musl, as the userland's are,
+made by musl-cross-make from the sources the script pins and checks by their
+SHA-256: first a cross compiler, with the host's gcc, then with that one the
+compiler itself. What they compile is static too, as simplos runs nothing
+else, unless it's asked for otherwise. Before it's done, the script compiles
+C and C++ with it on the host, which can run what it makes. The first build
+takes 13 minutes on 32 cores, needs the network and a few GB of room while
+it runs, and leaves 155 MB in `target/toolchain/root`; after that it's done,
+until the script changes. It builds on x86-64 Linux only.
+
+`cargo run`'s disk gets it over the userland, which makes it 1 GiB, on an
+AHCI controller, and `cargo run` gives the guest 1 GiB of memory unless `-m`
+is given; a hello world, even in C++ with `<iostream>`, compiles in QEMU's
+default 128 MiB. Under emulation, `gcc -O2` compiles a C hello world there
+in 5 s and `g++ -O2` an `<iostream>` one in 35 s. For now:
+
+- a program is read whole as it starts, and that's most of the time it
+  takes: `cc1`, 36 MB, takes 6 s to start from an AHCI disk, read by DMA,
+  and 25 s from an IDE one, read a word at a time by port I/O;
+- there's no LTO, no sanitizers, and no shared libraries, as simplos can't
+  load them.
+
+gcc and binutils are GPL-3.0, with GCC's runtime library exception for what's
+linked into programs; musl is MIT; gmp, mpfr and mpc, which gcc is linked
+with, LGPL-3.0. Like the userland, they're built from the upstream releases,
+unchanged, configured as the script says.
+
 ## Tests
 
 ```sh
@@ -402,7 +443,10 @@ copies of and run again; `tests/tty.rs` types into a terminal for it to read;
 `tests/time.rs` has it read the clocks, count CPU time and set alarms.
 `tests/shells.rs` runs busybox's sh and zsh, as commands and typed at on a
 terminal: its disk is 128 MiB and holds the userland too, which the runner
-builds with `scripts/userland.sh` the first time. After a run that passes, e2fsck must find nothing wrong with it, and it must have been
+builds with `scripts/userland.sh` the first time. `tests/toolchain.rs`
+compiles C and C++ with gcc and g++ and runs what they made: its disk is
+1 GiB, with GCC from `scripts/toolchain.sh` as well, and it gets as long as
+compiling takes. After a run that passes, e2fsck must find nothing wrong with it, and it must have been
 unmounted, so the tests need e2fsprogs installed.
 
 Each test boots twice, under BIOS and UEFI at once, and passes only if it
@@ -412,7 +456,9 @@ kernel saw the same one. `SIMPLOS_FIRMWARE=bios cargo test` (or `uefi`) boots
 just the one.
 
 A test still running after 30 s is taken to hang: it fails there and then,
-named, rather than leaving its kernel to the runner's limit of 180 s. Test
+named, rather than leaving its kernel to the runner's limit of 180 s. A test
+that knows it takes longer, as compiling does, says so with
+`simplos::take_longer`, and the toolchain kernel's limit is 900 s. Test
 kernels are built a little optimised and without debug information
 (`[profile.test]` in `kernel/Cargo.toml`): with it each was 15 MB, which the
 BIOS bootloader takes 18 s to read through emulated disk I/O, and unoptimised
@@ -449,7 +495,7 @@ the right firmware and the right framebuffer mode.
 | `vendor/ps2/` | the `ps2` crate, with its `x86_64` dependency bumped. |
 | `fs/ext4/` | ext4 (and ext3 and ext2) file systems, read and written with a journal: a Rust interface over the vendored lwext4, tested on the host against e2fsprogs. |
 | `vendor/lwext4/` | [lwext4](https://github.com/gkostka/lwext4), the C library `fs/ext4` uses for now. |
-| `scripts/` | `build-images.sh`, `smoke-test.sh`, `boot-test.sh`, `mutants.sh`, and `userland.sh`, which builds busybox and zsh for the disk. |
+| `scripts/` | `build-images.sh`, `smoke-test.sh`, `boot-test.sh`, `mutants.sh`, `userland.sh`, which builds busybox, zsh and vim for the disk, and `toolchain.sh`, which builds GCC for it. |
 
 There is no cargo workspace: `kernel` builds for `x86_64-unknown-none` with
 `build-std`, the host tools and `fs/ext4`'s tests build for the host, `user/probe` builds for
