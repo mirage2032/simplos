@@ -150,6 +150,14 @@ fn execve_refuses_what_isnt_a_program() {
 }
 
 #[test_case]
+fn a_program_runs_another_by_fork_and_exec() {
+    // What Linux says, from the same program: Rust's Command when
+    // posix_spawn won't do, as with a pre_exec closure, forks and then
+    // execs, and hears whether the exec failed through a socket pair.
+    assert_eq!(run(&["pre-exec", "/bin/probe"]), ok("hello from user space\nErr(Some(2))\n"));
+}
+
+#[test_case]
 fn a_program_runs_another_and_waits_for_it() {
     // Rust's Command, through musl's posix_spawn: clone, then execve.
     assert_eq!(

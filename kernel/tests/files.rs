@@ -499,6 +499,61 @@ fn a_program_reads_of_itself_in_proc() {
 }
 
 #[test_case]
+fn mounts_are_in_proc_as_each_process_sees_them() {
+    // /proc/self/mounts, as /proc/mounts; and mountinfo, where uutils' df
+    // finds them.
+    assert_eq!(run(&["cat", "/proc/self/mounts"]), run(&["cat", "/proc/mounts"]));
+    assert_eq!(
+        run(&["cat", "/proc/self/mountinfo"]),
+        ok("1 1 8:0 / / rw,relatime - ext4 /dev/root rw\n\
+            2 1 0:5 / /dev rw - devtmpfs devtmpfs rw\n3 1 0:4 / /proc rw - proc proc rw\n")
+    );
+}
+
+#[test_case]
+fn calls_take_at_fdcwd_as_an_int() {
+    // What Linux says, from the same program: openat, symlinkat,
+    // readlinkat and unlinkat given AT_FDCWD in its low 32 bits only, as
+    // rustix, and so uutils, passes it: by a relative path, which an
+    // absolute one would ignore.
+    assert_eq!(
+        run(&["at-fdcwd", "at.txt"]),
+        ok("true \"through the working directory\" 0 true [0, 0]\n")
+    );
+}
+
+#[test_case]
+fn files_have_no_extended_attributes() {
+    // As on a file system without them on Linux: getting one is EOPNOTSUPP
+    // and listing them lists none, by path, by path to a link and by
+    // descriptor; setting or removing one is EOPNOTSUPP too, as Linux says
+    // to root, though to anyone else EACCES can come first; and ENOENT and
+    // EBADF for what isn't there.
+    assert_eq!(run(&["xattrs", "/hello.txt"]), ok("[-95, -95, -95, 0, 0, 0, -95, -95, -2, -9]\n"));
+}
+
+#[test_case]
+fn fadvise_takes_advice() {
+    // What Linux says, from the same program: advice taken; EINVAL for
+    // advice there isn't, ESPIPE for a pipe and EBADF for a descriptor not
+    // open.
+    assert_eq!(run(&["fadvise", "/hello.txt"]), ok("[0, -22, -29, -9]\n"));
+}
+
+#[test_case]
+fn socket_pairs_connect_their_two_ends() {
+    // What Linux says, from the same program: written one way and sent the
+    // other, close-on-exec, a socket to fstat, ready to be written; once the
+    // other end closes, readable, writable and hung up to poll, nothing to
+    // read and EPIPE to send; and EAFNOSUPPORT, EPROTONOSUPPORT,
+    // ESOCKTNOSUPPORT, EINVAL and ENOTSOCK twice for what it refuses.
+    assert_eq!(
+        run(&["socketpair"]),
+        ok("0 4 4 4 4 \"pingpong\" 1 true 4 21 0 -32 [-97, -93, -94, -22, -88, -88]\n")
+    );
+}
+
+#[test_case]
 fn fsync_writes_what_waits_in_memory() {
     // A small write waits to be made with what follows it; fsync makes it,
     // and sync, as /proc/diskstats shows.

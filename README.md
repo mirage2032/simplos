@@ -126,7 +126,11 @@ and `umask`; and for what isn't a file, `pipe`, `pipe2`, `dup`, `dup2` and `dup3
 for any process's, is descriptor N, which opening it duplicates, as FreeBSD's
 `/dev/fd` does it, and `/dev/stdin` and the others link to `fd/0` and the
 rest. `statfs` and `fstatfs` say how big a file system is and how much of it
-is free. In the shell, `run cat /hello.txt` has the user program read it, and
+is free. `socketpair` makes two connected Unix-domain sockets, each reading
+what the other writes, with `read` and `write` or `send` and `recv`, as
+Rust's `Command` makes to hear whether a program it forked failed to
+`exec`. `fadvise64` takes advice. The `*at` calls read `AT_FDCWD` as the
+`int` it is, as rustix passes it zero-extended. In the shell, `run cat /hello.txt` has the user program read it, and
 `run` lists its other modes.
 
 `/proc` is made as it's read (`proc.rs`), with the files Linux has there
@@ -134,7 +138,8 @@ that busybox's `free`, `ps`, `top`, `df` and `mount` read: `meminfo`,
 `uptime`, `loadavg`, `stat`, `mounts` and `version`; `diskstats`, each
 disk's reads and writes since boot; `self`, a link to the
 reader's own directory; and in each process's, its `stat`, `status`,
-`cmdline` and `comm`, and `fd`.
+`cmdline` and `comm`, `fd`, and `mounts` and `mountinfo`, which uutils' `df`
+reads.
 
 Symbolic links (`symlink`, `symlinkat`, `readlink`, `readlinkat`) are
 followed wherever a path goes through one, as Linux follows them
@@ -157,6 +162,10 @@ what anyone may. `sendfile` copies from one descriptor to another. For now:
   keeps it on ext4's orphan list, which lwext4 doesn't know; the disk's next
   mount takes out any the power went before closing. And a directory that's
   open can't be removed (`EBUSY`);
+- there are no extended attributes, as on a file system without them on
+  Linux: `listxattr` lists none and the rest are `EOPNOTSUPP`;
+- the only sockets are the pairs `socketpair` makes, datagram and
+  sequenced-packet ones as streams, the messages in them not kept apart;
 - `/dev` holds just those devices, and can't be written; and opening
   `/dev/fd/N` shares N's place in the file, where Linux opens the file anew;
 - `/proc` has none of `maps`, `environ` and the rest, nor load averages, and
