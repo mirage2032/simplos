@@ -119,7 +119,7 @@ stdio) works as it does on Linux: `open`, `openat`, `close`, `read`, `write`,
 `getdents64`, `fcntl`, `fsync`, `mkdir`, `mkdirat`, `rmdir`, `unlink`,
 `unlinkat`, `rename`, `renameat`, `renameat2`, `chdir`, `fchdir`, `getcwd`
 and `umask`; and for what isn't a file, `pipe`, `pipe2`, `dup`, `dup2` and `dup3`, and
-`/dev/null`, `/dev/zero` and `/dev/tty`. `/dev/fd/N`, and `/proc/PID/fd/N`
+`/dev/null`, `/dev/zero`, `/dev/tty`, `/dev/random` and `/dev/urandom`. `/dev/fd/N`, and `/proc/PID/fd/N`
 for any process's, is descriptor N, which opening it duplicates, as FreeBSD's
 `/dev/fd` does it, and `/dev/stdin` and the others link to `fd/0` and the
 rest. `statfs` and `fstatfs` say how big a file system is and how much of it
@@ -187,7 +187,12 @@ like say 0), in no other groups (`getgroups`); `getpriority` and
 `writev` move several buffers in one call, as musl's `printf` and the like
 do. `mremap` makes what `mmap` mapped longer or shorter, or moves it,
 taking its pages along rather than copying them, as musl's `realloc` asks
-of big blocks. For now:
+of big blocks. `mprotect` with `PROT_NONE` puts memory out of the program's
+reach and keeps what's in it for when it's given back, and gives the
+program memory `mmap` reserved with `PROT_NONE`, as musl lays out a
+thread's stack below its guard page. `getrandom`, as Rust's `std` asks for
+its hash maps' keys, and `/dev/random` and `/dev/urandom` give random bytes
+(`random.rs`). For now:
 
 - every id is 0, and can't be set to another, as there are no other users;
   what `setgroups` sets is forgotten;
@@ -205,6 +210,11 @@ of big blocks. For now:
   never waited for go with their parent rather than to an init;
 - `execve` reads all of a program's segments into memory as it starts it,
   rather than as they're used;
+- random bytes come from RDRAND when the CPU has it, which QEMU's default
+  CPU hasn't, and otherwise from the timestamp counter, stirred, which is
+  guessable;
+- `mprotect` gives the program memory nothing reserved too, where Linux
+  says `ENOMEM`;
 - `mremap` grows a mapping where it is only if it's the last `mmap`
   handed out, where Linux grows into any room after it, and moves it
   otherwise; it takes no part that's `PROT_NONE`, and has no

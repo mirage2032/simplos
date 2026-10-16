@@ -269,7 +269,10 @@ fn ls_and_cat_show_the_ext4_disk() {
     // The disk tools/boot-test attaches: hello.txt and dir/nested/deep.txt.
     let mut shell = shell().0;
     assert_eq!(shell.execute("ls"), "bin/\ndev/\ndir/\nhello.txt\nlost+found/\nproc/");
-    assert_eq!(shell.execute("ls /dev"), "fd/\nnull\nstderr\nstdin\nstdout\ntty\nzero");
+    assert_eq!(
+        shell.execute("ls /dev"),
+        "fd/\nnull\nrandom\nstderr\nstdin\nstdout\ntty\nurandom\nzero"
+    );
     assert_eq!(shell.execute("cat /dev/null"), "cat: /dev/null: Unsupported");
     assert_eq!(shell.execute("ls dir/nested"), "deep.txt");
     assert_eq!(shell.execute("cat hello.txt"), "hello from ext4\n");

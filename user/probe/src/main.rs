@@ -259,6 +259,71 @@ fn main() {
             ];
             println!("{mapped} {shared} {private} {refused:?}");
         }
+        // mprotect: PROT_NONE, which keeps what's in the pages, out of reach,
+        // which write(2) from them says, until they're given back; memory
+        // mmap reserved with PROT_NONE given to the program, zeroed, but for
+        // the guard page below it, as musl does with a thread's stack; and a
+        // page made read-only, which read(2) can't fill but write(2) can
+        // still copy from.
+        Some("mprotect") => {
+            const PAGE: usize = 4096;
+            let mmap = |len: usize, prot: usize| syscall5(9, [0, len, prot, 0x22, 0]) as usize;
+            let mprotect = |at: usize, len: usize, prot: usize| syscall(10, at, len, prot);
+            let (reader, writer) = or_fail("pipe", io::pipe());
+            let readable = |at: usize| syscall(1, writer.as_raw_fd() as usize, at, 1) == 1;
+            // Safety: only ever of pages mapped for the program.
+            let holds = |at: usize, len: usize, byte: u8| {
+                let bytes = unsafe { std::slice::from_raw_parts(at as *const u8, len) };
+                bytes.iter().all(|&b| b == byte)
+            };
+            let at = mmap(2 * PAGE, 3);
+            // Safety: the two pages just mapped.
+            unsafe { std::ptr::write_bytes(at as *mut u8, 7, 2 * PAGE) };
+            let hidden = [mprotect(at, 2 * PAGE, 0), readable(at) as isize];
+            let back = mprotect(at, 2 * PAGE, 3) == 0 && holds(at, 2 * PAGE, 7);
+            let stack = mmap(4 * PAGE, 0);
+            let given =
+                mprotect(stack + PAGE, 3 * PAGE, 3) == 0 && holds(stack + PAGE, 3 * PAGE, 0);
+            // Safety: the three pages just given.
+            unsafe { std::ptr::write_bytes((stack + PAGE) as *mut u8, 9, 3 * PAGE) };
+            let used = holds(stack + PAGE, 3 * PAGE, 9) && !readable(stack);
+            let read_only = mprotect(at, PAGE, 1);
+            // A byte to read, so the read doesn't wait.
+            syscall(1, writer.as_raw_fd() as usize, b"x".as_ptr() as usize, 1);
+            let into = syscall(0, reader.as_raw_fd() as usize, at, 1);
+            println!("{hidden:?} {back} {given} {used} {read_only} {into} {}", readable(at));
+        }
+        // getrandom, as Rust's std asks it for its hash maps' keys: as many
+        // bytes as are asked for, whatever the flags but those there aren't,
+        // and GRND_RANDOM with GRND_INSECURE; EFAULT into the kernel's half.
+        // Then /dev/urandom and /dev/random: read, written to, and what they
+        // are.
+        Some("random") => {
+            use std::os::unix::fs::FileTypeExt;
+            let mut bytes = [[0u8; 32]; 2];
+            let got = [0, 1, 2, 4, 5]
+                .map(|flags| syscall(318, bytes[0].as_mut_ptr() as usize, 32, flags));
+            syscall(318, bytes[1].as_mut_ptr() as usize, 32, 0);
+            let differ = bytes[0] != bytes[1];
+            let refused = [
+                syscall(318, bytes[0].as_mut_ptr() as usize, 32, 8),
+                syscall(318, bytes[0].as_mut_ptr() as usize, 32, 6),
+                syscall(318, 0xFFFF_8000_0000_0000, 8, 0),
+            ];
+            let devices = ["/dev/urandom", "/dev/random"].map(|path| {
+                let mut file = or_fail(path, OpenOptions::new().read(true).write(true).open(path));
+                let mut read = [0u8; 64];
+                or_fail(path, file.read_exact(&mut read));
+                let written = or_fail(path, file.write(b"abc"));
+                let metadata = or_fail(path, fs::metadata(path));
+                let mode = metadata.permissions().mode() & 0o777;
+                let device = metadata.file_type().is_char_device();
+                format!("{} {written} {device} {mode:o}", read.iter().any(|&b| b != 0))
+            });
+            let mut map = std::collections::HashMap::new();
+            map.insert("key", 42);
+            println!("{got:?} {differ} {refused:?} {devices:?} {}", map["key"]);
+        }
         // That the LEN bytes at ADDR are i % 251 for each i: what tools/boot-test
         // puts in /bin/big, a segment bigger than the kernel's heap.
         Some("peek") => {
