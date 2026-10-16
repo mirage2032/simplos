@@ -287,3 +287,13 @@ fn a_thread_that_execs_takes_its_program_over() {
 fn a_thread_that_forks_makes_a_copy_with_one_thread() {
     assert_eq!(run(&["thread-fork"]), ok("child: true Threads:\t1\nparent: exit status: 4\n"));
 }
+
+#[test_case]
+fn threads_are_named_and_a_program_knows_where_it_is() {
+    // What Linux says, from the same program: its name, then the one it
+    // gave itself, which /proc/self/comm tells; a new thread's, its
+    // maker's, then its own, cut to 15 bytes; and an option there isn't.
+    assert_eq!(run(&["names"]), ok("probe renamed renamed \"a name longer t\" renamed -22\n"));
+    // /proc/self/exe, as rustc finds its libraries by it.
+    assert_eq!(run(&["exec", "/bin/probe", "exe"]), ok("/bin/probe\n"));
+}

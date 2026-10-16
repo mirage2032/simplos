@@ -220,6 +220,12 @@ fn call(frame: &Frame) -> i64 {
         1 => files::write(&process, a0, a1, a2),
         19 => files::readv(&process, a0, a1, a2),
         20 => files::writev(&process, a0, a1, a2),
+        // preadv and pwritev: the offset's high half, a4, is nothing on
+        // x86-64. Then preadv2 and pwritev2, with flags.
+        295 => files::preadv(&process, a0, a1, a2, a3, 0),
+        296 => files::pwritev(&process, a0, a1, a2, a3, 0),
+        327 => files::preadv(&process, a0, a1, a2, a3, a5),
+        328 => files::pwritev(&process, a0, a1, a2, a3, a5),
         2 => files::open(&process, files::AT_FDCWD, a0, a1, a2),
         3 => files::close(&process, a0),
         // stat, and lstat, which doesn't follow a link at the end.
@@ -302,6 +308,7 @@ fn call(frame: &Frame) -> i64 {
         62 => signals::kill(&process, a0, a1),
         63 => system::uname(&process, a0),
         72 => files::fcntl(&process, a0, a1, a2),
+        73 => files::flock(&process, a0, a1),
         79 => files::getcwd(&process, a0, a1),
         80 => files::chdir(&process, a0),
         81 => files::fchdir(&process, a0),
@@ -346,6 +353,7 @@ fn call(frame: &Frame) -> i64 {
         138 => files::fstatfs(&process, a0, a1),
         140 => system::getpriority(&process, a0, a1),
         141 => system::setpriority(&process, a0, a1, a2),
+        157 => system::prctl(&process, &task, a0, a1),
         158 => arch_prctl(&process, a0, a1),
         160 => system::prlimit(&process, 0, a0, a1, 0),
         162 => files::sync(),
@@ -394,7 +402,13 @@ fn call(frame: &Frame) -> i64 {
         324 => processes::membarrier(a0, a1),
         439 => files::faccessat(&process, a0, a1, a2, a3),
         _ => {
-            serial_println!("simplos: process {}: no system call {}", process.id, frame.nr);
+            let name = process.command.lock().name.clone();
+            serial_println!(
+                "simplos: process {} ({}): no system call {}",
+                process.id,
+                name,
+                frame.nr
+            );
             -ENOSYS
         }
     }

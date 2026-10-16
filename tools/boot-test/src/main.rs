@@ -17,7 +17,9 @@
 //! userland on its ext4 disk too, busybox, uutils and zsh, which `scripts/userland.sh`
 //! builds the first time; one whose name starts with `toolchain`
 //! (`tests/toolchain.rs`), GCC as well, from `scripts/toolchain.sh`, and the
-//! time compiling takes. The others' tests list that disk and expect only
+//! time compiling takes; one whose name starts with `rust` (`tests/rust.rs`),
+//! Rust's rustc and cargo too, from `scripts/rust.sh`, and the memory and
+//! the disk they take. The others' tests list that disk and expect only
 //! what's theirs.
 
 use std::error::Error;
@@ -33,6 +35,21 @@ const TIMEOUT: Duration = Duration::from_secs(180);
 /// The same, for a kernel whose tests compile with GCC under emulation, each
 /// given 300 s.
 const TOOLCHAIN_TIMEOUT: Duration = Duration::from_secs(900);
+/// And with rustc and cargo, each of which reads its 230 MB library as it
+/// starts.
+const RUST_TIMEOUT: Duration = Duration::from_secs(1800);
+
+/// What a kernel boots with, by its name: the trees its ext4 disk gets
+/// besides its own, as `scripts/WHAT.sh` build them; how big that disk is;
+/// whether it gets the programs `crafted` makes; its memory; and how long it
+/// may take.
+struct Setup {
+    trees: Vec<PathBuf>,
+    disk: &'static str,
+    crafted: bool,
+    memory: &'static str,
+    timeout: Duration,
+}
 
 /// QEMU reports a debug-exit of `value` as `(value << 1) | 1`, so the kernel's
 /// `QemuExitCode::Success` (0x10) and `Failed` (0x11) arrive as these.
@@ -83,28 +100,48 @@ fn main() -> ExitCode {
     let named = |prefix: &str| {
         kernel.file_name().is_some_and(|name| name.to_string_lossy().starts_with(prefix))
     };
-    let toolchain = named("toolchain");
-    let built = |wanted: bool, what: &str| match wanted.then(|| build(what)).transpose() {
-        Ok(tree) => Ok(tree),
-        Err(why) => {
-            eprintln!("boot-test: {}: the {what}: {why}", kernel.display());
-            Err(ExitCode::FAILURE)
+    let rust = named("rust");
+    let toolchain = named("toolchain") || rust;
+    let userland = named("shells") || toolchain;
+    let mut trees = Vec::new();
+    for (what, wanted) in [("userland", userland), ("toolchain", toolchain), ("rust", rust)] {
+        match wanted.then(|| build(what)).transpose() {
+            Ok(tree) => trees.extend(tree),
+            Err(why) => {
+                eprintln!("boot-test: {}: the {what}: {why}", kernel.display());
+                return ExitCode::FAILURE;
+            }
         }
+    }
+    // Programs made from user/probe, for tests/processes.rs.
+    let crafted = named("processes");
+    let setup = Setup {
+        trees,
+        disk: match () {
+            _ if rust => "2G",
+            _ if toolchain => "1G",
+            _ if userland => "128M",
+            _ if crafted => "64M",
+            _ => "16M",
+        },
+        crafted,
+        // rustc maps its library whole, in memory, as it starts.
+        memory: if rust { "1G" } else { "128M" },
+        timeout: match () {
+            _ if rust => RUST_TIMEOUT,
+            _ if toolchain => TOOLCHAIN_TIMEOUT,
+            _ => TIMEOUT,
+        },
     };
-    let (userland, toolchain) =
-        match (built(named("shells") || toolchain, "userland"), built(toolchain, "toolchain")) {
-            (Ok(userland), Ok(toolchain)) => (userland, toolchain),
-            (Err(failed), _) | (_, Err(failed)) => return failed,
-        };
     // At once, as each is a QEMU of its own; what each says is shown in turn,
     // the first's as it comes and the next's once the first is done.
-    let (kernel, userland, toolchain) = (&kernel, userland.as_deref(), toolchain.as_deref());
+    let (kernel, setup) = (&kernel, &setup);
     let passed = std::thread::scope(|scope| {
         let runs: Vec<_> = firmwares
             .into_iter()
             .map(|firmware| {
                 let (output, said) = mpsc::channel();
-                let run = move || run(kernel, userland, toolchain, firmware, output);
+                let run = move || run(kernel, setup, firmware, output);
                 (firmware, said, scope.spawn(run))
             })
             .collect();
@@ -125,8 +162,8 @@ fn main() -> ExitCode {
     if passed { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }
 
-/// The tree `scripts/WHAT.sh` builds, the userland's or the toolchain's,
-/// built if it isn't yet.
+/// The tree `scripts/WHAT.sh` builds, the userland's, the toolchain's or
+/// Rust's, built if it isn't yet.
 fn build(what: &str) -> Result<PathBuf, String> {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let status = Command::new(repository.join(format!("scripts/{what}.sh")))
@@ -138,13 +175,12 @@ fn build(what: &str) -> Result<PathBuf, String> {
     }
 }
 
-/// One boot of `kernel` under `firmware`, with `userland` and `toolchain` on
-/// its ext4 disk if given, what it writes to its serial port sent to
-/// `output` as it comes: whether the guest reported a pass, and if not, why.
+/// One boot of `kernel` under `firmware`, as `setup` says, what it writes to
+/// its serial port sent to `output` as it comes: whether the guest reported
+/// a pass, and if not, why.
 fn run(
     kernel: &Path,
-    userland: Option<&Path>,
-    toolchain: Option<&Path>,
+    setup: &Setup,
     firmware: Firmware,
     output: Sender<Vec<u8>>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -175,10 +211,7 @@ fn run(
     // And an ext4 one, made by Linux's own mke2fs and checked afterwards by
     // its e2fsck, for what the kernel's file system code does to it.
     let ext4_scratch = file("ext4.img");
-    // Programs made from user/probe, for tests/processes.rs.
-    let crafted =
-        kernel.file_name().is_some_and(|name| name.to_string_lossy().starts_with("processes"));
-    make_ext4(&ext4_scratch, userland, toolchain, crafted)?;
+    make_ext4(&ext4_scratch, setup)?;
 
     let mut qemu = Command::new("qemu-system-x86_64");
     if let Firmware::Uefi = firmware {
@@ -211,7 +244,7 @@ fn run(
         .args(["-display", "none"])
         // Never KVM: these run on CI, and a test that only passes with hardware
         // virtualisation is worse than no test.
-        .args(["-accel", "tcg", "-cpu", "qemu64", "-m", "128M"])
+        .args(["-accel", "tcg", "-cpu", "qemu64", "-m", setup.memory])
         // A triple fault should end the run, not restart it into a loop.
         .arg("-no-reboot")
         // No network card: the kernel has no driver for one, and both
@@ -234,7 +267,7 @@ fn run(
     });
 
     let started = Instant::now();
-    let timeout = if toolchain.is_some() { TOOLCHAIN_TIMEOUT } else { TIMEOUT };
+    let timeout = setup.timeout;
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
@@ -268,17 +301,12 @@ fn e2fsprogs(tool: &str) -> Command {
 const EXT4_TREE: &[(&str, &str)] =
     &[("hello.txt", "hello from ext4\n"), ("dir/nested/deep.txt", "deep\n")];
 
-/// A 16 MiB ext4 file system holding `EXT4_TREE`, as Linux makes them, and in
-/// /bin, user/probe for programs to run, and a script whose interpreter isn't
-/// there. With `userland`'s tree too, 128 MiB, and /bin/sh is; with
-/// `toolchain`'s as well, 1 GiB, and GCC; with `crafted`, 64 MiB, and in
-/// /bin what `crafted` makes.
-fn make_ext4(
-    image: &Path,
-    userland: Option<&Path>,
-    toolchain: Option<&Path>,
-    crafted: bool,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
+/// An ext4 file system, as Linux makes them, as big as `setup` says, holding
+/// `EXT4_TREE`; in /bin, user/probe for programs to run, and a script whose
+/// interpreter isn't there; and `setup`'s trees: the userland's, with
+/// /bin/sh, GCC's, Rust's. With `setup.crafted`, in /bin what `crafted` makes
+/// too.
+fn make_ext4(image: &Path, setup: &Setup) -> Result<(), Box<dyn Error + Send + Sync>> {
     use std::os::unix::fs::PermissionsExt;
     let tree = image.with_extension("tree");
     let _ = std::fs::remove_dir_all(&tree);
@@ -292,7 +320,7 @@ fn make_ext4(
     let script = tree.join("bin/script");
     std::fs::write(&script, "#!/bin/sh\necho a script\n")?;
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
-    if crafted {
+    if setup.crafted {
         let probe = std::fs::read(env!("CARGO_BIN_FILE_PROBE_probe"))?;
         for (name, program) in self::crafted(&probe) {
             let path = tree.join("bin").join(name);
@@ -302,7 +330,7 @@ fn make_ext4(
     }
     // Links and modes as they are; and what's there replaced, not written
     // through, as the toolchain's binutils replace busybox's links.
-    for from in [userland, toolchain].into_iter().flatten() {
+    for from in &setup.trees {
         let copied = Command::new("cp")
             .args(["-a", "--remove-destination"])
             .arg(from.join("."))
@@ -318,12 +346,7 @@ fn make_ext4(
         .args(["-q", "-F", "-t", "ext4", "-b", "4096", "-d"])
         .arg(&tree)
         .arg(image)
-        .arg(match (toolchain.is_some(), userland.is_some(), crafted) {
-            (true, _, _) => "1G",
-            (false, true, _) => "128M",
-            (false, false, true) => "64M",
-            (false, false, false) => "16M",
-        })
+        .arg(setup.disk)
         .output()
         .map_err(|error| format!("couldn't run mke2fs ({error}); is e2fsprogs installed?"))?;
     if !output.status.success() {

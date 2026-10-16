@@ -132,8 +132,9 @@ jobs:
             echo "::error::The bump changed more than the versions:"; git diff --stat; exit 1
           fi
 
-      # The userland and GCC go on the ext4 disk; the check above has just
-      # built them under these same keys, so these are normally restores.
+      # The userland, GCC and Rust go on the ext4 disk; the check above has
+      # just built them under these same keys, so these are normally
+      # restores.
       - uses: actions/cache@v4
         with:
           path: |
@@ -151,6 +152,12 @@ jobs:
             target/toolchain/downloads
           key: toolchain-${{ hashFiles('scripts/toolchain.sh') }}
           restore-keys: toolchain-
+
+      - uses: actions/cache@v4
+        with:
+          path: target/rust/downloads
+          key: rust-${{ hashFiles('scripts/rust.sh') }}
+          restore-keys: rust-
 
       # Built from the release commit, so the images attached below are exactly
       # what this tag describes. The smoke test runs once more here because
@@ -194,7 +201,7 @@ jobs:
             ${PREVIOUS:+--notes-start-tag "$PREVIOUS"} \
             "dist/bios.img#Bootable BIOS disk image" \
             "dist/uefi.img#Bootable UEFI disk image" \
-            "dist/disk.qcow2#ext4 disk with the userland (-drive format=qcow2,file=disk.qcow2)"
+            "dist/disk.qcow2#ext4 disk with the userland, GCC and Rust (-drive format=qcow2,file=disk.qcow2)"
           {
             echo "### Released v$NEXT"
             echo "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/v$NEXT"

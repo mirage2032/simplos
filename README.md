@@ -31,8 +31,8 @@ Any other argument is passed straight through to QEMU.
 
 A release's images need none of this — download `bios.img` or `uefi.img` from
 [the latest release](../../releases/latest) and boot it. Its `disk.qcow2` is
-the ext4 disk `cargo run` would make, userland, GCC and all, 1 GiB to the
-guest in a file of 89 MB; attach it after the image with
+the ext4 disk `cargo run` would make, userland, GCC, Rust and all, 2 GiB to
+the guest in a compressed file a fraction of that; attach it after the image with
 `-drive format=qcow2,file=disk.qcow2`. To compile on it, attach it to AHCI
 instead, as `cargo run` does, which reads four times as fast, and for more
 than hello world, give it more memory than QEMU's 128 MiB with `-m 1G`:
@@ -150,7 +150,13 @@ is free. `socketpair` makes two connected Unix-domain sockets, each reading
 what the other writes, with `read` and `write` or `send` and `recv`, as
 Rust's `Command` makes to hear whether a program it forked failed to
 `exec`. `fadvise64` takes advice. The `*at` calls read `AT_FDCWD` as the
-`int` it is, as rustix passes it zero-extended. In the shell, `run cat /hello.txt` has the user program read it, and
+`int` it is, as rustix passes it zero-extended. `preadv` and `pwritev`, and
+`preadv2` and `pwritev2` with their flags, read and write several buffers
+at an offset. Files lock as Linux's do (`locks.rs`): whole, with `flock`,
+each lock its open file's, as cargo locks its build; and in ranges of
+bytes, with `fcntl`'s `F_SETLK`, `F_SETLKW` and `F_GETLK`, each its
+process's and gone as it closes any descriptor of the file, as SQLite
+locks, or with the `F_OFD_` ones, its open file's. In the shell, `run cat /hello.txt` has the user program read it, and
 `run` lists its other modes.
 
 `/proc` is made as it's read (`proc.rs`), with the files Linux has there
@@ -158,8 +164,10 @@ that busybox's `free`, `ps`, `top`, `df` and `mount` read: `meminfo`,
 `uptime`, `loadavg`, `stat`, `mounts` and `version`; `diskstats`, each
 disk's reads and writes since boot; `self`, a link to the
 reader's own directory; and in each process's, its `stat`, `status`,
-`cmdline` and `comm`, `fd`, and `mounts` and `mountinfo`, which uutils' `df`
-reads.
+`cmdline` and `comm`, `fd`, `mounts` and `mountinfo`, which uutils' `df`
+reads, and `exe`, a link to its program, by which rustc finds its own
+libraries. `prctl` names threads (`PR_SET_NAME`, `PR_GET_NAME`), the first
+one's name being its program's, as `comm` tells.
 
 Symbolic links (`symlink`, `symlinkat`, `readlink`, `readlinkat`) are
 followed wherever a path goes through one, as Linux follows them
@@ -185,6 +193,10 @@ what anyone may. `sendfile` copies from one descriptor to another, and
   open can't be removed (`EBUSY`);
 - there are no extended attributes, as on a file system without them on
   Linux: `listxattr` lists none and the rest are `EOPNOTSUPP`;
+- locks aren't checked for deadlocks: two processes each waiting for a
+  range the other holds wait until a signal, where Linux tells one
+  `EDEADLK`; and only files on the disk are locked, `flock` of anything
+  else succeeding;
 - the only sockets are the pairs `socketpair` makes, datagram and
   sequenced-packet ones as streams, the messages in them not kept apart;
 - `/dev` holds just those devices, and can't be written; and opening
@@ -531,6 +543,46 @@ linked into programs; musl is MIT; gmp, mpfr and mpc, which gcc is linked
 with, LGPL-3.0. Like the userland, they're built from the upstream releases,
 unchanged, configured as the script says.
 
+## Rust
+
+`scripts/rust.sh` puts Rust on the disk too, so Rust programs can be built
+on simplos and run there: rustc, rustdoc and cargo 1.99.1, with the standard
+library for `x86_64-unknown-linux-musl`, all under `/usr`.
+
+```sh
+rustc -O hello.rs && ./hello
+cargo new hello && cd hello && cargo run
+```
+
+They're the Rust project's own release for x86-64 Linux with musl, which
+the script downloads, checks by its SHA-256 and unpacks, keeping rustc,
+cargo and the standard library, stripped, and leaving out what simplos has
+no use for: debuggers' scripts, rust-analyzer's server, rust-lld, the
+sanitizers' runtimes and the documentation. rustc and cargo are
+dynamically linked, so they run in musl's loader from GCC's tree, with its
+`libgcc_s.so.1`, and rustc runs most of itself from its 230 MB
+`librustc_driver`. What rustc makes it links with `cc`, GCC's, statically,
+as Rust's musl target does. Before it's done, the script builds a program
+with rustc and a package with cargo on the host, in that loader, and runs
+them. It takes 20 s and leaves 420 MB in `target/rust/root`, the download,
+300 MB, kept in `target/rust/downloads`; it unpacks on x86-64 Linux only,
+after `scripts/toolchain.sh` has built GCC.
+
+`cargo run`'s disk gets it over the userland and GCC, which makes it 2
+GiB, and rustc needs `cargo run`'s 1 GiB of memory. cargo locks what it
+builds with `flock`, and keeps its records in SQLite, which locks ranges
+of its files with `fcntl`, both of which simplos has as Linux does. Under
+emulation, `rustc` compiles a hello world in 47 s and `cargo run` builds
+and runs a new package in 66 s. For now:
+
+- each start of rustc reads all of its library into memory, simplos
+  having no way to read a file only as it's used: 18 s each time, and
+  cargo starts rustc three times for a build;
+- there are no proc-macro crates, nor anything downloaded: simplos has no
+  network.
+
+Rust is MIT or Apache-2.0, at the user's choice.
+
 ## Tests
 
 ```sh
@@ -558,7 +610,9 @@ compiles C and C++ with gcc and g++, linked dynamically and statically, a
 shared library and a program that loads one with `dlopen`, and runs what
 they made: its disk is
 1 GiB, with GCC from `scripts/toolchain.sh` as well, and it gets as long as
-compiling takes. After a run that passes, e2fsck must find nothing wrong with it, and it must have been
+compiling takes. `tests/rust.rs` builds a program with rustc and a package
+with cargo, and runs them: its disk is 2 GiB, with Rust from
+`scripts/rust.sh` too, and it gets 1 GiB of memory, and half an hour. After a run that passes, e2fsck must find nothing wrong with it, and it must have been
 unmounted, so the tests need e2fsprogs installed.
 
 Each test boots twice, under BIOS and UEFI at once, and passes only if it
@@ -607,7 +661,7 @@ the right firmware and the right framebuffer mode.
 | `vendor/ps2/` | the `ps2` crate, with its `x86_64` dependency bumped. |
 | `fs/ext4/` | ext4 (and ext3 and ext2) file systems, read and written with a journal: a Rust interface over the vendored lwext4, tested on the host against e2fsprogs. |
 | `vendor/lwext4/` | [lwext4](https://github.com/gkostka/lwext4), the C library `fs/ext4` uses for now. |
-| `scripts/` | `build-images.sh`, `smoke-test.sh`, `boot-test.sh`, `mutants.sh`, `userland.sh`, which builds busybox, uutils, zsh and vim for the disk, and `toolchain.sh`, which builds GCC for it. |
+| `scripts/` | `build-images.sh`, `smoke-test.sh`, `boot-test.sh`, `mutants.sh`, `userland.sh`, which builds busybox, uutils, zsh and vim for the disk, `toolchain.sh`, which builds GCC for it, and `rust.sh`, which unpacks Rust for it. |
 
 There is no cargo workspace: `kernel` builds for `x86_64-unknown-none` with
 `build-std`, the host tools and `fs/ext4`'s tests build for the host, `user/probe` builds for

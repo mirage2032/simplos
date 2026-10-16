@@ -81,6 +81,9 @@ pub fn node(path: &str, disk: Option<&Ext4>) -> Option<Node> {
                         .map(|name| entry(name, Kind::File, &format!("{id}/{name}")))
                         .into();
                     entries.push(entry("fd", Kind::Directory, &format!("{id}/fd")));
+                    if !process.command.lock().exe.is_empty() {
+                        entries.push(entry("exe", Kind::Symlink, &format!("{id}/exe")));
+                    }
                     Some(Node::Dir(entries))
                 }
                 "fd" => Some(Node::Dir(descriptors(&process, &format!("proc/{id}/fd")))),
@@ -88,6 +91,11 @@ pub fn node(path: &str, disk: Option<&Ext4>) -> Option<Node> {
                 "status" => file(status(&process)),
                 "cmdline" => Some(Node::File(process.command.lock().args.clone())),
                 "comm" => file(format!("{}\n", process.command.lock().name)),
+                // The program's file, which rustc finds its libraries from.
+                "exe" => {
+                    let exe = process.command.lock().exe.clone();
+                    (!exe.is_empty()).then(|| Node::Link(format!("/{exe}").into_bytes()))
+                }
                 // What's mounted where it sees: as everyone does.
                 "mounts" => file(mounts(disk)),
                 "mountinfo" => file(mountinfo(disk)),

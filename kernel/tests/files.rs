@@ -647,3 +647,28 @@ fn fsync_writes_what_waits_in_memory() {
     }
     ROOT.lock().as_ref().unwrap().remove_file("synced.txt").unwrap();
 }
+
+#[test_case]
+fn files_are_locked_whole_and_in_ranges() {
+    // What Linux says, from the same program: flock's lock is its open
+    // file's, so another open file of the same file is refused, shared or
+    // not, and its dup and its copy aren't; let go of, another has it; a
+    // copy's, waited for. fcntl's write lock on bytes 0 to 9, which a copy
+    // is told of, F_GETLK, and refused, F_SETLK, but not bytes past it;
+    // gone as the process closes another descriptor of the file; and an
+    // open file's, F_OFD_SETLK, in a copy's process lock's way.
+    let expected = "[0, -11, -11, 0, 0, 0, 0] exit status: 0 (0, true); 0 1 0 10 true -11 0; \
+                    exit status: 0 0 exit status: 11\n";
+    assert_eq!(run(&["locks", "/locked"]), ok(expected));
+    ROOT.lock().as_ref().unwrap().remove_file("locked").unwrap();
+}
+
+#[test_case]
+fn preadv_and_pwritev_read_and_write_where_asked() {
+    // What Linux says, from the same program: three bytes written at 2 and
+    // five read from 1, the file's place left at 0; two written there by
+    // pwritev2, and one with RWF_APPEND at the end, the place moved to 9;
+    // and a flag there isn't, EOPNOTSUPP.
+    assert_eq!(run(&["vectors-at", "/at.txt"]), ok("3 5 \"bXY\" \"Zf\" 0 2 9 12XYZfgh! -95\n"));
+    ROOT.lock().as_ref().unwrap().remove_file("at.txt").unwrap();
+}

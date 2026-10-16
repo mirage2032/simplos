@@ -2,11 +2,11 @@
 //! is called, how long it's been up and how much memory it has, which user
 //! and groups, which CPUs, how nice, and its resource limits.
 
-use super::files::{Result, ret};
+use super::files::{Result, ret, string_at};
 use super::signals::other;
 use super::{EFAULT, EINVAL, EPERM};
-use crate::process::{self, Process};
-use crate::{memory, time};
+use crate::process::{self, Process, Task};
+use crate::{memory, serial_println, time};
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -200,5 +200,44 @@ pub fn prlimit(process: &Process, pid: u64, resource: u64, new: u64, old: u64) -
             limits[resource] = limit;
         }
         Ok(0)
+    })())
+}
+
+/// `prctl`: of all it does, a thread's name, `task`'s, the current one's, as
+/// PR_SET_NAME sets it, its first 15 bytes, and PR_GET_NAME tells it, with
+/// its NUL: what /proc/PID/comm says of its program's first thread. The rest
+/// is EINVAL, as Linux says of an option it doesn't know.
+pub fn prctl(process: &Process, task: &Task, option: u64, arg: u64) -> i64 {
+    const PR_SET_NAME: u64 = 15;
+    const PR_GET_NAME: u64 = 16;
+    ret((|| match option {
+        PR_SET_NAME => {
+            let given = string_at(process, arg, 4096, EINVAL)?;
+            let mut name = [0u8; 16];
+            let len = given.len().min(15);
+            name[..len].copy_from_slice(&given[..len]);
+            *task.name.lock() = Some(name);
+            if task.id() == process.id {
+                process.command.lock().name =
+                    alloc::string::String::from_utf8_lossy(&name[..len]).into();
+            }
+            Ok(0)
+        }
+        PR_GET_NAME => {
+            let own = *task.name.lock();
+            let name = own.unwrap_or_else(|| {
+                let mut name = [0u8; 16];
+                let program = process.command.lock().name.clone();
+                let len = program.len().min(15);
+                name[..len].copy_from_slice(&program.as_bytes()[..len]);
+                name
+            });
+            process.memory.lock().space.write(arg, &name).ok_or(EFAULT)?;
+            Ok(0)
+        }
+        _ => {
+            serial_println!("simplos: process {}: no prctl option {}", process.id, option);
+            Err(EINVAL)
+        }
     })())
 }

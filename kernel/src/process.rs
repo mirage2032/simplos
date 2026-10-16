@@ -151,11 +151,16 @@ pub struct Task {
     /// CLONE_CHILD_CLEARTID and `set_tid_address` ask: how `pthread_join`
     /// hears of it. 0 for nowhere.
     pub clear_tid: AtomicU64,
+    /// Its name, as `prctl`'s PR_SET_NAME sets it, NUL-padded; `None` for
+    /// its program's, as a new program's thread has. Taken with interrupts
+    /// on.
+    pub name: Mutex<Option<[u8; 16]>>,
 }
 
 impl Task {
     fn new(id: u64, signals: ThreadSignals) -> Arc<Task> {
-        Arc::new(Task { id: AtomicU64::new(id), signals, clear_tid: AtomicU64::new(0) })
+        let (clear_tid, name) = (AtomicU64::new(0), Mutex::new(None));
+        Arc::new(Task { id: AtomicU64::new(id), signals, clear_tid, name })
     }
 
     pub fn id(&self) -> u64 {
@@ -164,12 +169,15 @@ impl Task {
 }
 
 /// What a process runs: its program's name, as Linux's `comm` is, the last
-/// part of the path it was run by, at most 15 bytes; and its arguments,
-/// each ending in a NUL, as /proc/PID/cmdline has them.
+/// part of the path it was run by, at most 15 bytes; its arguments, each
+/// ending in a NUL, as /proc/PID/cmdline has them; and its file, a path from
+/// the root, as /proc/PID/exe links to it: the interpreter's, for a script,
+/// and none for one the kernel had in memory.
 #[derive(Clone, Default)]
 pub struct Command {
     pub name: String,
     pub args: Vec<u8>,
+    pub exe: String,
 }
 
 impl Command {
@@ -179,6 +187,7 @@ impl Command {
         Command {
             name,
             args: args.iter().flat_map(|arg| arg.iter().chain(&[0])).copied().collect(),
+            exe: String::new(),
         }
     }
 }
@@ -501,9 +510,11 @@ pub fn spawn_program(
     files: Vec<Option<Arc<fs::Handle>>>,
 ) -> Result<Arc<Process>, i64> {
     let mut args: Vec<Vec<u8>> = args.iter().map(|arg| arg.as_bytes().to_vec()).collect();
-    let elf = program_for("", path, &mut args)?;
-    let command =
-        Command::new(path.as_bytes(), &args.iter().map(Vec::as_slice).collect::<Vec<_>>());
+    let (elf, exe) = program_for("", path, &mut args)?;
+    let command = Command {
+        exe,
+        ..Command::new(path.as_bytes(), &args.iter().map(Vec::as_slice).collect::<Vec<_>>())
+    };
     let args: Vec<String> = args.iter().map(|arg| String::from_utf8_lossy(arg).into()).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let process = spawn_with(&elf, &args, env, files)?;
@@ -516,8 +527,12 @@ pub fn spawn_program(
 /// own; or for a script, what its first line names, given the line's
 /// argument if it has one and the script's path, in place of the first of
 /// `args`, as Linux runs them. That can be a script too, up to where Linux
-/// gives up (ELOOP).
-pub fn program_for(cwd: &str, path: &str, args: &mut Vec<Vec<u8>>) -> Result<fs::Program, i64> {
+/// gives up (ELOOP). With where the program is, a path from the root.
+pub fn program_for(
+    cwd: &str,
+    path: &str,
+    args: &mut Vec<Vec<u8>>,
+) -> Result<(fs::Program, String), i64> {
     const ENOENT: i64 = 2;
     const EIO: i64 = 5;
     const ELOOP: i64 = 40;
@@ -525,7 +540,8 @@ pub fn program_for(cwd: &str, path: &str, args: &mut Vec<Vec<u8>>) -> Result<fs:
         return Err(ENOENT);
     }
     let mut path = String::from(path);
-    let mut elf = fs::open_program(&fs::lookup(cwd, &path, true)?)?;
+    let mut found = fs::lookup(cwd, &path, true)?;
+    let mut elf = fs::open_program(&found)?;
     for depth in 0.. {
         // As much of its first line as `interpreter` looks at.
         let mut head = vec![0; elf.size().min(LONGEST_LINE as u64) as usize];
@@ -539,10 +555,11 @@ pub fn program_for(cwd: &str, path: &str, args: &mut Vec<Vec<u8>>) -> Result<fs:
         first.extend(argument.map(<[u8]>::to_vec));
         first.push(path.into_bytes());
         args.splice(..args.len().min(1), first);
-        elf = fs::open_program(&fs::lookup(cwd, &interpreter, true)?)?;
+        found = fs::lookup(cwd, &interpreter, true)?;
+        elf = fs::open_program(&found)?;
         path = interpreter;
     }
-    Ok(elf)
+    Ok((elf, found))
 }
 
 /// How much of a script's first line Linux reads.
@@ -739,9 +756,13 @@ pub fn spawn_thread(
     const EAGAIN: i64 = 11;
     const ENOMEM: i64 = 12;
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    // Named as the thread that made it is.
+    let name = thread::current_task().and_then(|task| *task.name.lock());
     let user = thread::with_current_user(|user| {
         let task = Task::new(id, user.task.signals.sibling());
         task.clear_tid.store(ids.clear, Ordering::Relaxed);
+        // Its own, which no one else has yet: free, though interrupts are off.
+        *task.name.lock() = name;
         let mut new = user.fork(process.clone(), task, user.pml4, registers);
         new.fs_base = tls.unwrap_or(new.fs_base);
         new
@@ -803,6 +824,7 @@ pub fn exec(
     task.signals.exec();
     // Its timers go, as POSIX says; its alarm stays.
     process.timers.lock().clear();
+    *task.name.lock() = None;
     Ok(start)
 }
 
@@ -885,6 +907,7 @@ fn leave(status: i32) -> ! {
     let files = core::mem::take(&mut *process.files.lock());
     drop(files);
     drop(tree);
+    crate::locks::release_process(process.id, None);
     process.status.store(status, Ordering::Release);
     process.exited.wake_all();
     let (code, how) = match status & 0x7f {
