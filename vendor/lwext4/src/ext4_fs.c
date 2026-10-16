@@ -562,6 +562,10 @@ static bool ext4_fs_verify_bg_csum(struct ext4_sblock *sb,
 				   uint32_t bgid,
 				   struct ext4_bgroup *bg)
 {
+	/* LOCAL PATCH: a mismatch is only ever logged, by ext4_dbg: not
+	 * worked out when that logs nothing, as it's most of a lookup's time. */
+	if (!CONFIG_DEBUG_PRINTF)
+		return true;
 	if (!ext4_sb_feature_ro_com(sb, EXT4_FRO_COM_METADATA_CSUM))
 		return true;
 
@@ -708,6 +712,10 @@ static void ext4_fs_set_inode_checksum(struct ext4_inode_ref *inode_ref)
 #if CONFIG_META_CSUM_ENABLE
 static bool ext4_fs_verify_inode_csum(struct ext4_inode_ref *inode_ref)
 {
+	/* LOCAL PATCH: a mismatch is only ever logged, by ext4_dbg: not
+	 * worked out when that logs nothing, as it's most of a lookup's time. */
+	if (!CONFIG_DEBUG_PRINTF)
+		return true;
 	struct ext4_sblock *sb = &inode_ref->fs->sb;
 	if (!ext4_sb_feature_ro_com(sb, EXT4_FRO_COM_METADATA_CSUM))
 		return true;

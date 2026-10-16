@@ -753,7 +753,9 @@ static int ext4_ext_check(struct ext4_inode_ref *inode_ref,
 	}
 
 	tail = find_ext4_extent_tail(eh);
-	if (ext4_sb_feature_ro_com(sb, EXT4_FRO_COM_METADATA_CSUM)) {
+	/* LOCAL PATCH: a mismatch is only ever logged: as in ext4_dir.c. */
+	if (CONFIG_DEBUG_PRINTF &&
+	    ext4_sb_feature_ro_com(sb, EXT4_FRO_COM_METADATA_CSUM)) {
 		if (tail->et_checksum !=
 		    to_le32(ext4_ext_block_csum(inode_ref, eh))) {
 			ext4_dbg(DEBUG_EXTENT,

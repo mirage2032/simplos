@@ -11,7 +11,8 @@
 //! starts with `hello.txt`, user/probe as `/bin/probe`, the userland that
 //! `scripts/userland.sh` builds, busybox, uutils, zsh and vim, GCC, which
 //! `scripts/toolchain.sh` builds, and Rust's rustc and cargo, which
-//! `scripts/rust.sh` unpacks, if they can be.
+//! `scripts/rust.sh` unpacks, if they can be, and compinit's record of their
+//! completions, which `scripts/completions.sh` makes.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -124,6 +125,11 @@ fn disk() -> Option<PathBuf> {
             eprintln!("note: the disk has no {has}; delete {} to try again", image.display());
         }
     }
+    // Once they're all in, as each may bring completions of its own.
+    let recorded = Command::new(repository.join("scripts/completions.sh")).arg(&tree).status();
+    if !recorded.is_ok_and(|status| status.success()) {
+        eprintln!("note: zsh will make its completions' record as it starts, slowly");
+    }
     // Where Linux and Homebrew put it: often not on PATH.
     let mke2fs = [
         "/usr/sbin/mke2fs",
@@ -133,8 +139,9 @@ fn disk() -> Option<PathBuf> {
     .into_iter()
     .find(|path| Path::new(path).exists())
     .unwrap_or("mke2fs");
+    // Inode tables zeroed now (see scripts/build-images.sh).
     let made = Command::new(mke2fs)
-        .args(["-q", "-t", "ext4", "-d"])
+        .args(["-q", "-t", "ext4", "-E", "lazy_itable_init=0", "-d"])
         .arg(&tree)
         .arg(&image)
         .arg("2G")

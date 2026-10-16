@@ -102,6 +102,10 @@ static uint32_t ext4_dir_csum(struct ext4_inode_ref *inode_ref,
 bool ext4_dir_csum_verify(struct ext4_inode_ref *inode_ref,
 			      struct ext4_dir_en *dirent)
 {
+	/* LOCAL PATCH: a mismatch is only ever logged, by ext4_dbg: not
+	 * worked out when that logs nothing, as it's most of a lookup's time. */
+	if (!CONFIG_DEBUG_PRINTF)
+		return true;
 #ifdef CONFIG_META_CSUM_ENABLE
 	struct ext4_dir_entry_tail *t;
 	struct ext4_sblock *sb = &inode_ref->fs->sb;

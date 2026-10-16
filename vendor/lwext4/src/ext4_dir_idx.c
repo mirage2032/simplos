@@ -281,6 +281,10 @@ ext4_dir_dx_get_climit(struct ext4_inode_ref *inode_ref,
 static bool ext4_dir_dx_csum_verify(struct ext4_inode_ref *inode_ref,
 				    struct ext4_dir_en *de)
 {
+	/* LOCAL PATCH: a mismatch is only ever logged, by ext4_dbg: not
+	 * worked out when that logs nothing, as it's most of a lookup's time. */
+	if (!CONFIG_DEBUG_PRINTF)
+		return true;
 	struct ext4_sblock *sb = &inode_ref->fs->sb;
 	uint32_t block_size = ext4_sb_get_block_size(sb);
 	int coff, limit, cnt;

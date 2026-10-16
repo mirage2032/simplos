@@ -161,14 +161,8 @@ step ./configure --prefix=/usr --bindir=/bin CC="$cc" \
 step make -j"$jobs"
 install -m 755 Src/zsh "$out/bin/zsh"
 step make DESTDIR="$out" install.fns
-# compinit's record of what the completion functions complete, which it
-# checks against the functions there are and uses if it's right: made here
-# by the same zsh, as simplos writes it a line at a time, for most of a
-# minute, the first time root's zsh starts.
-mkdir -p "$out/root"
-step "$out/bin/zsh" -f -c "fpath=($out/usr/share/zsh/site-functions \
-    $out/usr/share/zsh/$zsh_version/functions)
-    autoload -Uz compinit && compinit -u -d $out/root/.zcompdump"
+# compinit's record of them isn't made here but once the disk's trees are
+# all in, by scripts/completions.sh: the others bring functions too.
 
 echo "userland: vim" >&2
 cd "$build/vim-$vim_version"

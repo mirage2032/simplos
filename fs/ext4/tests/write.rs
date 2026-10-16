@@ -805,3 +805,85 @@ fn tells_whoever_watches_what_changes() {
         ]
     );
 }
+
+/// Where paths lead, kept as they're looked up, and what leads nowhere: as
+/// names are made, moved and removed, they lead where they now do.
+#[test]
+fn looks_up_names_as_they_are_now() {
+    let _serial = serial();
+    let dir = workspace("names");
+    let root = dir.join("tree");
+    make_tree(&root);
+    let image = image(&dir, &root, &["-t", "ext4"], "64M");
+    let fs = Ext4::mount_writable(Box::new(image)).unwrap();
+    let inode = |path| fs.metadata(path).map(|metadata| metadata.inode);
+    let hello = inode("hello.txt").unwrap();
+    // Each looked up first, as missing or as it was.
+    for path in ["new", "new/file", "moved", "moved/file", "linked", "short", "dir/nested"] {
+        let _ = inode(path);
+    }
+    fs.create_dir("new").unwrap();
+    let file = inode("new").map(|_| fs.create("new/file").unwrap()).unwrap();
+    let made = file.inode();
+    drop(file);
+    assert_eq!(inode("new/file"), Ok(made));
+    // A directory moved: what's in it with it.
+    fs.rename("new", "moved").unwrap();
+    assert_eq!(inode("new/file"), Err(Error::NotFound));
+    assert_eq!(inode("moved/file"), Ok(made));
+    fs.link("hello.txt", "linked").unwrap();
+    assert_eq!(inode("linked"), Ok(hello));
+    fs.symlink(b"hello.txt", "short").unwrap();
+    assert_eq!(fs.metadata("short").unwrap().kind, Kind::Symlink);
+    // A file renamed over another: the name leads to it.
+    fs.rename("moved/file", "linked").unwrap();
+    assert_eq!(inode("linked"), Ok(made));
+    assert_eq!(inode("moved/file"), Err(Error::NotFound));
+    fs.remove_file("linked").unwrap();
+    assert_eq!(inode("linked"), Err(Error::NotFound));
+    fs.remove_file("dir/nested/deep.txt").unwrap();
+    fs.remove_dir("dir/nested").unwrap();
+    assert_eq!(inode("dir/nested"), Err(Error::NotFound));
+    // Open as its last name goes, then closed: the name kept for it goes too.
+    let open = fs.open("hello.txt").unwrap();
+    fs.remove_file("hello.txt").unwrap();
+    let kept = format!("lost+found/.open-{hello}");
+    assert_eq!(inode(&kept), Ok(hello));
+    drop(open);
+    assert_eq!(inode(&kept), Err(Error::NotFound));
+}
+
+/// Once nothing else has been done on it between two flushes, as simplos's
+/// writer makes one every second, the journal's changes are where they go:
+/// the power going then leaves nothing to replay. Until then, they wait.
+#[test]
+fn empties_its_journal_when_idle() {
+    let _serial = serial();
+    let dir = workspace("idle");
+    let root = dir.join("tree");
+    make_tree(&root);
+    let image = image(&dir, &root, &["-t", "ext4"], "64M");
+    let fs = Ext4::mount_writable(Box::new(image.clone())).unwrap();
+    for i in 0..100 {
+        fs.create(&format!("f{i}")).unwrap();
+    }
+    // The power going now: the transactions its journal holds to replay,
+    // as e2fsprogs reads it.
+    let saved = dir.join("idle.img");
+    let replays = || {
+        image.save(&saved);
+        String::from_utf8(debugfs(&saved, "logdump")).unwrap().matches("commit block").count()
+    };
+    let busy = replays();
+    assert!(busy >= 100, "{busy} transactions for 100 files made");
+    // Something was done since the last one.
+    fs.flush();
+    assert_eq!(replays(), busy, "written as it was used");
+    fs.flush();
+    assert_eq!(replays(), 0, "left to replay once idle");
+    // There as it is, without its journal.
+    assert_eq!(debugfs_ls(&saved, "/").len(), 106);
+    replay(&saved).unwrap();
+    fsck(&saved).unwrap();
+    drop(fs);
+}

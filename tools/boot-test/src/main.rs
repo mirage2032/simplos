@@ -340,10 +340,16 @@ fn make_ext4(image: &Path, setup: &Setup) -> Result<(), Box<dyn Error + Send + S
             return Err(format!("couldn't copy {} ({copied})", from.display()).into());
         }
     }
+    // compinit's record of their completions, once they're all in.
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let recorded = Command::new(repository.join("scripts/completions.sh")).arg(&tree).status()?;
+    if !recorded.success() {
+        return Err(format!("scripts/completions.sh failed ({recorded})").into());
+    }
     // 4 KiB blocks, which the tests count in: for a disk this small, some
-    // mke2fs.conf say 1 KiB.
+    // mke2fs.conf say 1 KiB. Inode tables zeroed now, as the images' are.
     let output = e2fsprogs("mke2fs")
-        .args(["-q", "-F", "-t", "ext4", "-b", "4096", "-d"])
+        .args(["-q", "-F", "-t", "ext4", "-b", "4096", "-E", "lazy_itable_init=0", "-d"])
         .arg(&tree)
         .arg(image)
         .arg(setup.disk)

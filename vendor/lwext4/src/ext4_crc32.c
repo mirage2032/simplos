@@ -177,9 +177,45 @@ uint32_t ext4_crc32(uint32_t crc, const void *buf, uint32_t size)
 	return crc32(crc, buf, size, crc32_tab);
 }
 
+/* LOCAL PATCH: crc32c eight bytes at a time ("slicing by 8"), a few times
+ * as fast as a byte at a time, which was most of what writing metadata and
+ * replaying the journal took. Not by the crc32 instruction: QEMU's qemu64
+ * hasn't SSE4.2. The other seven tables are made from crc32c_tab the first
+ * time; every call into lwext4 holds one lock. */
+static uint32_t crc32c_tabs[8][256];
+static bool crc32c_tabs_made;
+
+static void crc32c_make_tabs(void)
+{
+	for (int n = 0; n < 256; n++) {
+		uint32_t crc = crc32c_tab[n];
+		crc32c_tabs[0][n] = crc;
+		for (int k = 1; k < 8; k++) {
+			crc = crc32c_tab[crc & 0xFF] ^ (crc >> 8);
+			crc32c_tabs[k][n] = crc;
+		}
+	}
+	crc32c_tabs_made = true;
+}
+
 uint32_t ext4_crc32c(uint32_t crc, const void *buf, uint32_t size)
 {
-	return crc32(crc, buf, size, crc32c_tab);
+	const uint8_t *p = (const uint8_t *)buf;
+	const uint32_t (*t)[256] = crc32c_tabs;
+
+	if (!crc32c_tabs_made)
+		crc32c_make_tabs();
+	for (; size >= 8; p += 8, size -= 8) {
+		uint32_t lo = crc ^ (p[0] | p[1] << 8 | p[2] << 16 |
+				     (uint32_t)p[3] << 24);
+		uint32_t hi = p[4] | p[5] << 8 | p[6] << 16 |
+			      (uint32_t)p[7] << 24;
+		crc = t[7][lo & 0xFF] ^ t[6][(lo >> 8) & 0xFF] ^
+		      t[5][(lo >> 16) & 0xFF] ^ t[4][lo >> 24] ^
+		      t[3][hi & 0xFF] ^ t[2][(hi >> 8) & 0xFF] ^
+		      t[1][(hi >> 16) & 0xFF] ^ t[0][hi >> 24];
+	}
+	return crc32(crc, p, size, crc32c_tab);
 }
 
 /**
