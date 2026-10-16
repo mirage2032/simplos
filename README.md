@@ -782,7 +782,8 @@ easy to misread.
 
 `develop` is the default branch and where work lands, through pull requests that
 CI checks. `master` is only ever moved by the **Promote to master** workflow,
-which re-runs the checks at the commit it is about to release, bumps the version,
+which checks the commit it is about to release (running again only what no run
+has passed with the same sources, usually nothing), bumps the version,
 fast-forwards both branches to it, tags it `vX.Y.Z` and publishes a GitHub
 Release with both disk images and the ext4 disk (`disk.qcow2`, made by
 `scripts/build-images.sh`) attached.

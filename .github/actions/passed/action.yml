@@ -1,0 +1,27 @@
+name: Passed
+description: >-
+  Records that the job has passed with what it depends on as it is now, for
+  ci.yml's plan job to find: an artifact named for the job's key, which holds
+  the run's address.
+
+inputs:
+  key:
+    description: The job's key, as plan worked it out
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        KEY: ${{ inputs.key }}
+      run: echo "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" >"$RUNNER_TEMP/passed-$KEY"
+
+    # The key names the runner's image too, which changes every week or so,
+    # after which what passed before runs again anyway.
+    - uses: actions/upload-artifact@v7
+      with:
+        path: ${{ runner.temp }}/passed-${{ inputs.key }}
+        archive: false
+        retention-days: 30
+        overwrite: true

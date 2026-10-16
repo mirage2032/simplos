@@ -1,0 +1,19 @@
+name: Save the cargo cache
+description: >-
+  Saves the cache ../ restored, less this repository's own crates, unless it
+  was there as it is, or the run is a pull request's: pull requests only read
+  the caches develop's runs save.
+
+runs:
+  using: composite
+  steps:
+    - if: github.event_name != 'pull_request' && env.CARGO_CACHE_KEY != '' && env.CARGO_CACHE_HIT != 'true'
+      name: Take this repository's crates out of the cargo cache
+      shell: bash
+      run: .github/scripts/prune-cargo-cache.sh $CARGO_CACHE_TARGETS
+
+    - if: github.event_name != 'pull_request' && env.CARGO_CACHE_KEY != '' && env.CARGO_CACHE_HIT != 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: ${{ env.CARGO_CACHE_PATHS }}
+        key: ${{ env.CARGO_CACHE_KEY }}

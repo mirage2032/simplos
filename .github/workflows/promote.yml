@@ -46,11 +46,16 @@ jobs:
           echo "Releasing develop at $sha" >> "$GITHUB_STEP_SUMMARY"
 
   # The pull request checks passed for each change on its own; this checks them
-  # together, at the exact commit being released.
+  # together, at the exact commit being released. Its plan skips what a run
+  # has passed already with the same, as develop's after the last merge will
+  # mostly have; and its trees job makes sure develop's cache has the trees
+  # the release job restores.
   check:
     needs: target
     permissions:
       contents: read
+      # To find other runs' artifacts: what passed, and trees they built.
+      actions: read
     uses: ./.github/workflows/ci.yml
     with:
       ref: ${{ needs.target.outputs.sha }}
@@ -66,7 +71,7 @@ jobs:
       # GitHub App is needed.
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.target.outputs.sha }}
           fetch-depth: 0 # every branch and tag: to compare with master and past releases
@@ -76,13 +81,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y qemu-system-x86 qemu-utils
 
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      # As ci.yml's images job builds, and from its cargo cache, which it only
+      # reads.
+      - uses: ./.github/actions/cargo
         with:
-          cache-workspaces: |
-            kernel -> target
-            fullkernel -> target
-            tools/boot-test -> target
-            vendor/bootloader -> target
+          cache: images
+          targets: |
+            fullkernel/target
+            vendor/bootloader/target
 
       - name: Check there's something to promote
         env:
@@ -132,32 +138,17 @@ jobs:
             echo "::error::The bump changed more than the versions:"; git diff --stat; exit 1
           fi
 
-      # The userland, GCC and Rust go on the ext4 disk; the check above has
-      # just built them under these same keys, so these are normally
-      # restores.
-      - uses: actions/cache@v4
+      # The userland, GCC and Rust go on the ext4 disk; the check's trees job
+      # has just made sure they're cached.
+      - uses: ./.github/actions/tree
         with:
-          path: |
-            target/userland/root
-            target/userland/built
-            target/userland/downloads
-          key: userland-${{ hashFiles('scripts/userland.sh') }}
-          restore-keys: userland-
-
-      - uses: actions/cache@v4
+          name: userland
+      - uses: ./.github/actions/tree
         with:
-          path: |
-            target/toolchain/root
-            target/toolchain/built
-            target/toolchain/downloads
-          key: toolchain-${{ hashFiles('scripts/toolchain.sh') }}
-          restore-keys: toolchain-
-
-      - uses: actions/cache@v4
+          name: toolchain
+      - uses: ./.github/actions/tree
         with:
-          path: target/rust/downloads
-          key: rust-${{ hashFiles('scripts/rust.sh') }}
-          restore-keys: rust-
+          name: rust
 
       # Built from the release commit, so the images attached below are exactly
       # what this tag describes. The smoke test runs once more here because
