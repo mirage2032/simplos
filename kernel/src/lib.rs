@@ -147,6 +147,7 @@ pub fn pre_init(boot_info: &'static mut BootInfo) {
             unsafe { BootInfoFrameAllocator::init(&boot_info.memory_regions) };
         allocator::init_heap(&mut mapper, &mut frame_allocator)
             .expect("heap initialization failed");
+        frame_allocator.count_holders();
         *memory::FRAMES.lock() = Some(frame_allocator);
         *memory::PAGE_TABLE.lock() = Some(mapper);
         // Needs the page table for the idle thread's stack, and must be done

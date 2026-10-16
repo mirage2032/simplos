@@ -1,4 +1,5 @@
-use alloc::collections::BTreeMap;
+use alloc::vec;
+use alloc::vec::Vec;
 use bootloader_api::info::{MemoryRegionKind, MemoryRegions};
 use core::ops::Range;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -723,10 +724,16 @@ pub struct BootInfoFrameAllocator {
     freed: Option<PhysFrame>,
     /// How many frames are handed out now.
     used: u64,
-    /// The frames handed out to be held by more than one holder (`SHARED`
-    /// pages): how many hold each, by its address. The last to let go of
-    /// one frees it.
-    shared: BTreeMap<u64, u32>,
+    /// How many hold each frame handed out to be held by more than one
+    /// holder (`SHARED` pages), by the frame's number; 0 for the rest. The
+    /// last to let go of one frees it. Made by `count_holders` as big as the
+    /// highest usable frame needs, once and in one piece, so that counting
+    /// takes no more of the heap as more is shared: 512 KiB for 1 GiB.
+    ///
+    /// shortcut: a machine with more than about 16 GiB has more frames than
+    /// the kernel's 20 MiB heap could count this way; count only those
+    /// shared, by number, if one turns up.
+    shared: Vec<u16>,
 }
 
 /// Ends the `freed` stack. Not 0, because frame 0 can be usable memory.
@@ -753,8 +760,23 @@ impl BootInfoFrameAllocator {
             next: 0,
             freed: None,
             used: 0,
-            shared: BTreeMap::new(),
+            shared: Vec::new(),
         }
+    }
+
+    /// Make room to count the holders of every frame there is, now that
+    /// the kernel's heap is there to keep the counts in: before the first
+    /// `allocate_shared`.
+    pub fn count_holders(&mut self) {
+        let usable =
+            self.memory_map.iter().filter(|region| region.kind == MemoryRegionKind::Usable);
+        let end = usable.map(|region| region.end).max().unwrap_or(0);
+        self.shared = vec![0; (end / 4096) as usize];
+    }
+
+    /// The count of `frame`'s holders.
+    fn holders_of(&mut self, frame: PhysFrame) -> &mut u16 {
+        &mut self.shared[(frame.start_address().as_u64() / 4096) as usize]
     }
 
     /// The bytes of memory there are to hand out, and of those the bytes
@@ -772,23 +794,23 @@ impl BootInfoFrameAllocator {
     /// asked: zero it before anyone else reads it.
     pub fn allocate_shared(&mut self) -> Option<PhysFrame> {
         let frame = self.allocate_frame()?;
-        self.shared.insert(frame.start_address().as_u64(), 1);
+        *self.holders_of(frame) = 1;
         Some(frame)
     }
 
     /// Hold `frame`, a shared one, once more.
     pub fn hold(&mut self, frame: PhysFrame) {
-        let holders = self.shared.get_mut(&frame.start_address().as_u64());
-        *holders.expect("a shared frame") += 1;
+        let holders = self.holders_of(frame);
+        assert!(*holders > 0, "a shared frame");
+        *holders = holders.checked_add(1).expect("fewer than 65536 holders");
     }
 
     /// Let go of `frame`, a shared one: the last holder to frees it.
     pub fn release(&mut self, frame: PhysFrame) {
-        let at = frame.start_address().as_u64();
-        let holders = self.shared.get_mut(&at).expect("a shared frame");
+        let holders = self.holders_of(frame);
+        assert!(*holders > 0, "a shared frame");
         *holders -= 1;
         if *holders == 0 {
-            self.shared.remove(&at);
             // Safety: no one holds it any more.
             unsafe { self.deallocate_frame(frame) };
         }
@@ -796,7 +818,8 @@ impl BootInfoFrameAllocator {
 
     /// How many hold `frame`, a shared one: 0 for one that isn't.
     pub fn holders(&self, frame: PhysFrame) -> u32 {
-        self.shared.get(&frame.start_address().as_u64()).copied().unwrap_or(0)
+        let index = (frame.start_address().as_u64() / 4096) as usize;
+        self.shared.get(index).copied().map_or(0, u32::from)
     }
 
     /// The most recently freed frame, or else the next never handed out.
