@@ -4,6 +4,7 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
+use x86_64::structures::paging::PhysFrame;
 
 pub const PT_LOAD: u32 = 1;
 pub const PT_INTERP: u32 = 3;
@@ -32,6 +33,14 @@ pub trait Source {
     /// Fill `buf` from `offset` on: `None` if that's past the end, or it
     /// can't be read.
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Option<()>;
+
+    /// Page `index` of it, from `index * 4096` on, in a frame to map as it
+    /// is (`AddressSpace::map_shared`), held for the caller: the page
+    /// cache's, for a file on the disk. `None` for what isn't in it, or
+    /// past the end.
+    fn page(&self, _index: u64) -> Option<PhysFrame> {
+        None
+    }
 }
 
 impl Source for [u8] {

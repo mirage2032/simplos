@@ -259,6 +259,63 @@ fn main() {
             ];
             println!("{mapped} {shared} {private} {refused:?}");
         }
+        // A file's pages mapped read-only, privately and shared: whether what's
+        // written to the file then shows in each, as Linux has it, and still
+        // after MADV_DONTNEED; whether one mapped writable and written stays
+        // the program's own; and whether the private one, made writable with
+        // mprotect and written, does too, leaving the file and the shared
+        // one as they were.
+        Some("mapped-writes") => {
+            let (prot_read, prot_write, map_shared, map_private) = (1, 2, 1, 2);
+            let path = arg(2);
+            or_fail(&path, fs::write(&path, [b'a'; 2 * 4096]));
+            let file = or_fail(&path, OpenOptions::new().read(true).write(true).open(&path));
+            let fd = file.as_raw_fd() as usize;
+            let map = |prot, flags| syscall6(9, [0, 2 * 4096, prot, flags, fd], 0) as usize;
+            let private = map(prot_read, map_private);
+            let shared = map(prot_read, map_shared);
+            let own = map(prot_read | prot_write, map_private);
+            // Safety: the second of the two pages just mapped, to be written.
+            unsafe { ((own + 4101) as *mut u8).write_volatile(b'o') };
+            or_fail(&path, file.write_at(b"b", 4101));
+            // Safety: in the second of the two pages each maps.
+            let at = |mapped: usize| unsafe { ((mapped + 4101) as *const u8).read_volatile() };
+            let seen = (at(private) == b'b', at(shared) == b'b');
+            // MADV_DONTNEED.
+            syscall(28, private, 2 * 4096, 4);
+            let (after, kept) = (at(private) == b'b', at(own) == b'o');
+            syscall(10, private, 2 * 4096, prot_read | prot_write);
+            // Safety: the page just made writable.
+            unsafe { ((private + 4101) as *mut u8).write_volatile(b'p') };
+            let mut byte = [0];
+            or_fail(&path, file.read_at(&mut byte, 4101));
+            let apart = at(private) == b'p' && at(shared) == b'b' && byte == *b"b";
+            println!("{} {} {after} {kept} {apart}", seen.0, seen.1);
+        }
+        // How much memory a copy made with fork takes, by sysinfo, while it's
+        // there: under 4 MiB, as it is when the program's code is shared
+        // rather than copied, however big that is?
+        Some("fork-taken") => {
+            let free = || {
+                let mut info = [0u64; 14];
+                syscall(99, info.as_mut_ptr() as usize, 0, 0);
+                info[5] * (info[13] & 0xFFFF_FFFF)
+            };
+            let (ready, mut told) = or_fail("pipe", io::pipe());
+            let before = free();
+            let child = syscall(57, 0, 0, 0);
+            if child == 0 {
+                drop(ready);
+                or_fail("pipe", told.write_all(b"x"));
+                std::thread::sleep(Duration::from_millis(200));
+                std::process::exit(0);
+            }
+            drop(told);
+            or_fail("pipe", (&ready).read_exact(&mut [0]));
+            let taken = before.saturating_sub(free());
+            wait(child);
+            println!("{}", taken < 4 << 20);
+        }
         // mprotect: PROT_NONE, which keeps what's in the pages, out of reach,
         // which write(2) from them says, until they're given back; memory
         // mmap reserved with PROT_NONE given to the program, zeroed, but for
@@ -1663,6 +1720,42 @@ fn main() {
                 "{made} {got} {late} {sent:?} {repeated:?} {off} {at_once} {counting} {alarmed} \
                  {made_mine} {to_me} {deleted:?} {refused:?}"
             );
+        }
+        // splice, as uutils' cat moves what it copies: from PATH, from the
+        // place given, into a pipe, that place moved on and the file's own
+        // left as it was; out of the pipe into another file; from the file's
+        // own place; 0 at its end. Then what it refuses: neither end a pipe,
+        // a place for a pipe, flags there aren't, a descriptor not open.
+        Some("splice") => {
+            let path = arg(2);
+            let copy_path = format!("{path}.copy");
+            or_fail(&path, fs::write(&path, "0123456789"));
+            let file = or_fail(&path, fs::File::open(&path));
+            let copy = or_fail(&copy_path, fs::File::create(&copy_path));
+            let (reader, writer) = or_fail("pipe", io::pipe());
+            let [f, c, r, w] =
+                [file.as_raw_fd(), copy.as_raw_fd(), reader.as_raw_fd(), writer.as_raw_fd()]
+                    .map(|fd| fd as usize);
+            let splice = |input: usize, at: usize, output: usize, len: usize, flags: usize| {
+                syscall6(275, [input, at, output, 0, len], flags)
+            };
+            let mut place = 2i64;
+            let into = splice(f, &raw mut place as usize, w, 4, 0);
+            let own = syscall(8, f, 0, 1);
+            let out = splice(r, 0, c, 16, 0);
+            let rest = splice(f, 0, w, 64, 0);
+            let drained = splice(r, 0, c, 64, 0);
+            let end = splice(f, 0, w, 64, 0);
+            let copied = or_fail(&copy_path, fs::read_to_string(&copy_path));
+            let refused = [
+                splice(f, 0, c, 4, 0),
+                splice(r, &raw mut place as usize, c, 4, 0),
+                splice(f, 0, w, 4, 0x100),
+                splice(1000, 0, w, 4, 0),
+            ];
+            or_fail(&path, fs::remove_file(&path));
+            or_fail(&copy_path, fs::remove_file(&copy_path));
+            println!("{into} {place} {own} {out} {rest} {drained} {end} {copied:?} {refused:?}");
         }
         // Symbolic links: made and read back, followed, and lstat'd as
         // themselves; through a directory, after which `..` is the

@@ -130,16 +130,20 @@ fn root() -> Vec<DirEntry> {
     entries
 }
 
-/// Memory, in kB: there's no swap, and nothing is kept to give back, so all
-/// that's free is available.
+/// Memory, in kB: there's no swap, and what's available is what's free and
+/// what the page cache keeps, which it gives back as it's needed, but for
+/// what programs map.
 fn meminfo() -> String {
     let (total, free) = memory::FRAMES.lock().as_ref().map_or((0, 0), |frames| frames.memory());
+    // Files' pages, kept: given back as memory's needed, as far as programs
+    // don't map them.
+    let cached = crate::cache::pages() as u64 * 4096;
     let lines = [
         ("MemTotal", total),
         ("MemFree", free),
-        ("MemAvailable", free),
+        ("MemAvailable", free + cached),
         ("Buffers", 0),
-        ("Cached", 0),
+        ("Cached", cached),
         ("SwapCached", 0),
         ("Shmem", 0),
         ("SReclaimable", 0),

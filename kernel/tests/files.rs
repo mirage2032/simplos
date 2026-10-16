@@ -110,6 +110,17 @@ fn ok(text: &str) -> (i32, String) {
     (0, String::from(text))
 }
 
+/// Put `contents` in the file at `path`, from the root, made or emptied
+/// first.
+fn write(path: &str, contents: &[u8]) {
+    let root = ROOT.lock();
+    let file = root.as_ref().unwrap().create(path).unwrap();
+    let mut done = 0;
+    while done < contents.len() {
+        done += file.write_at(done as u64, &contents[done..]).unwrap();
+    }
+}
+
 /// How probe says what went wrong with `path`.
 fn failed(path: &str, error: &str) -> (i32, String) {
     (1, alloc::format!("probe: {path}: {error}\n"))
@@ -305,6 +316,67 @@ fn mmap_maps_files() {
     // EACCES.
     assert_eq!(run(&["file-mmap", "/mapped.bin"]), ok("true true true [-22, -9, -19, -13, -13]\n"));
     ROOT.lock().as_ref().unwrap().remove_file("mapped.bin").unwrap();
+}
+
+#[test_case]
+fn a_file_s_pages_mapped_are_the_file_s() {
+    // What Linux says, from the same program: mapped read-only, privately or
+    // shared, they're the page cache's, so what's written to the file then
+    // shows in both, and still does after MADV_DONTNEED; but a page mapped
+    // writable and written is the program's own, as is the private one made
+    // writable with mprotect.
+    assert_eq!(run(&["mapped-writes", "/mapped.bin"]), ok("true true true true true\n"));
+    ROOT.lock().as_ref().unwrap().remove_file("mapped.bin").unwrap();
+}
+
+#[test_case]
+fn a_file_read_again_is_read_from_memory() {
+    // The page cache keeps what's read of a file: read again, none of it
+    // comes from the disk; removed, it's not kept.
+    let contents: String = (0..64 << 10).map(|i| char::from(b'a' + (i % 26) as u8)).collect();
+    write("cached.txt", contents.as_bytes());
+    let sectors = || simplos::io::disk::list().iter().map(|disk| disk.sectors_read).sum::<u64>();
+    let kept = simplos::cache::pages();
+    assert_eq!(run(&["cat", "/cached.txt"]), ok(&contents));
+    assert!(
+        simplos::cache::pages() >= kept + 16,
+        "{} pages kept, from {kept}",
+        simplos::cache::pages()
+    );
+    let read = sectors();
+    assert_eq!(run(&["cat", "/cached.txt"]), ok(&contents));
+    assert_eq!(sectors() - read, 0, "sectors read from the disk the second time");
+    // Gone, it takes them with it.
+    ROOT.lock().as_ref().unwrap().remove_file("cached.txt").unwrap();
+    assert!(simplos::cache::pages() <= kept, "{} pages kept, from {kept}", simplos::cache::pages());
+}
+
+#[test_case]
+fn what_s_read_again_is_what_was_written_since() {
+    // Each read first, so the page cache keeps it: then rewritten shorter,
+    // emptied as it's opened; cut short and made longer, with zeros, by the
+    // kernel itself; renamed over by another file; and gone, its inode's
+    // number free for the next file made, which is made longer with zeros.
+    let cat = |path| run(&["cat", path]);
+    let resize = |path, size| {
+        let root = ROOT.lock();
+        root.as_ref().unwrap().open_writable(path).unwrap().set_len(size).unwrap();
+    };
+    assert_eq!(run(&["write", "/again.txt", "a longer first text"]), ok(""));
+    assert_eq!(cat("/again.txt"), ok("a longer first text"));
+    assert_eq!(run(&["write", "/again.txt", "short"]), ok(""));
+    assert_eq!(cat("/again.txt"), ok("short"));
+    resize("again.txt", 2);
+    resize("again.txt", 4);
+    assert_eq!(cat("/again.txt"), ok("sh\0\0"));
+    assert_eq!(run(&["write", "/other.txt", "the other"]), ok(""));
+    assert_eq!(run(&["mv", "/other.txt", "/again.txt"]), ok(""));
+    assert_eq!(cat("/again.txt"), ok("the other"));
+    assert_eq!(run(&["rm", "/again.txt"]), ok(""));
+    assert_eq!(run(&["write", "/new.txt", "new"]), ok(""));
+    resize("new.txt", 9);
+    assert_eq!(cat("/new.txt"), ok("new\0\0\0\0\0\0"));
+    ROOT.lock().as_ref().unwrap().remove_file("new.txt").unwrap();
 }
 
 #[test_case]
@@ -550,6 +622,19 @@ fn socket_pairs_connect_their_two_ends() {
     assert_eq!(
         run(&["socketpair"]),
         ok("0 4 4 4 4 \"pingpong\" 1 true 4 21 0 -32 [-97, -93, -94, -22, -88, -88]\n")
+    );
+}
+
+#[test_case]
+fn splice_moves_what_s_read_into_or_out_of_a_pipe() {
+    // What Linux says, from the same program: 4 bytes from the place given,
+    // moved on, into a pipe, the file's own place left; out of the pipe
+    // into another file; the rest from the file's own place; 0 at its end;
+    // and EINVAL for neither end a pipe, ESPIPE for a place for a pipe,
+    // EINVAL for flags there aren't and EBADF for a descriptor not open.
+    assert_eq!(
+        run(&["splice", "/spliced.txt"]),
+        ok("4 6 0 4 10 10 0 \"23450123456789\" [-22, -29, -22, -9]\n")
     );
 }
 

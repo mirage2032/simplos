@@ -7,6 +7,7 @@
 extern crate alloc;
 
 pub mod allocator;
+pub mod cache;
 pub mod elf;
 pub mod fs;
 pub mod futex;

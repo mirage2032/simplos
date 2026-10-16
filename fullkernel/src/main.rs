@@ -9,7 +9,7 @@
 //! An ext4 disk goes with it, `disk.img` here, made the first time and kept,
 //! so what's written to it is there next time; delete it to start afresh. It
 //! starts with `hello.txt`, user/probe as `/bin/probe`, the userland that
-//! `scripts/userland.sh` builds, busybox, zsh and vim, and GCC, which
+//! `scripts/userland.sh` builds, busybox, uutils, zsh and vim, and GCC, which
 //! `scripts/toolchain.sh` builds, if they can be.
 
 use std::path::{Path, PathBuf};
@@ -108,7 +108,7 @@ fn disk() -> Option<PathBuf> {
     // of an hour on a fast machine. Links and modes kept, and what's there replaced rather
     // than written through, as GCC's binutils replace busybox's links.
     let repository = here.join("..");
-    for (what, has) in [("userland", "busybox, zsh or vim"), ("toolchain", "gcc")] {
+    for (what, has) in [("userland", "busybox, uutils, zsh or vim"), ("toolchain", "gcc")] {
         let built = Command::new(repository.join(format!("scripts/{what}.sh"))).status();
         let copied = built.is_ok_and(|status| status.success())
             && Command::new("cp")

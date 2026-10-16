@@ -85,7 +85,7 @@ jobs:
             echo "::endgroup::"
           done
 
-      # busybox, zsh and vim, for tests/shells.rs, from the sources the script pins,
+      # busybox, uutils, zsh and vim, for tests/shells.rs, from the sources the script pins,
       # kept for as long as the script stays the same; and its downloads for
       # longer. boot-test would build them anyway: here it's a step of its own.
       - uses: actions/cache@v4

@@ -14,7 +14,7 @@
 //! it at the end of a passing run.
 //!
 //! A kernel whose file name starts with `shells` (`tests/shells.rs`) gets the
-//! userland on its ext4 disk too, busybox and zsh, which `scripts/userland.sh`
+//! userland on its ext4 disk too, busybox, uutils and zsh, which `scripts/userland.sh`
 //! builds the first time; one whose name starts with `toolchain`
 //! (`tests/toolchain.rs`), GCC as well, from `scripts/toolchain.sh`, and the
 //! time compiling takes. The others' tests list that disk and expect only

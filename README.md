@@ -32,7 +32,7 @@ Any other argument is passed straight through to QEMU.
 A release's images need none of this — download `bios.img` or `uefi.img` from
 [the latest release](../../releases/latest) and boot it. Its `disk.qcow2` is
 the ext4 disk `cargo run` would make, userland, GCC and all, 1 GiB to the
-guest in a file of 79 MB; attach it after the image with
+guest in a file of 89 MB; attach it after the image with
 `-drive format=qcow2,file=disk.qcow2`. To compile on it, attach it to AHCI
 instead, as `cargo run` does, which reads four times as fast, and for more
 than hello world, give it more memory than QEMU's 128 MiB with `-m 1G`:
@@ -116,6 +116,25 @@ done by `fs/ext4` (see below), behind a lock that sleeps whoever waits for
 it (`thread::SleepLock`), since a call can wait on the disk for a long time.
 The disk is trusted: lwext4 is C, parsing it in ring 0, and isn't fuzzed yet.
 
+What's read of a file is kept in memory, a page at a time, in the page cache
+(`cache.rs`): read again, it comes from there rather than the disk. Programs
+map its pages of their code, and of files they map read-only, all of them
+the same frames, so every program running uutils' coreutils, or linked to
+`libc.so`, has one copy of it between them. What's written goes to the file
+as it's written, and into whatever of it is kept: ext4 tells the cache of
+every change to a file, whoever makes it (`Ext4::watch`). It keeps up to
+128 MiB, gives back the pages no program maps, those used longest ago
+first, as free memory runs low, and all of them when it runs out; and
+`/proc/meminfo` counts them as `Cached`. Under emulation, ten runs of
+uutils' 14 MB `coreutils true` took 10 s before it and take 1 s; a second
+`gcc -O2` of a hello world, 10 s before and 0.7 s now. For now:
+
+- a page a program can write, of its data or of a file it maps writable,
+  is a copy, made as it starts or maps it rather than as it's first
+  written;
+- what's cut off the end of a file stays in the pages programs map of it,
+  where Linux sends SIGBUS for a page past the end.
+
 Programs use it through Linux's system calls, so Rust's `std::fs` (or C's
 stdio) works as it does on Linux: `open`, `openat`, `close`, `read`, `write`,
 `pread64`, `pwrite64`, `lseek`, `stat`, `lstat`, `fstat`, `newfstatat`,
@@ -155,7 +174,8 @@ length with `truncate` and `ftruncate`; making a file sets all three of its
 times, writing to it when it was modified, and any change when it was
 changed. `access`, `faccessat` and `faccessat2` answer as for root, who may
 read and write anything but where nothing can be written (`EROFS`), and run
-what anyone may. `sendfile` copies from one descriptor to another. For now:
+what anyone may. `sendfile` copies from one descriptor to another, and
+`splice` into a pipe or out of one, as uutils' `cat` copies. For now:
 
 - a file removed or renamed over while it's open stays until it's closed, as
   on Linux, but in `/lost+found`, as `.open-` and its inode, where Linux
@@ -235,8 +255,9 @@ its hash maps' keys, and `/dev/random` and `/dev/urandom` give random bytes
   stack mapped a page at a time as it's used, and the same turns at the CPU
   as any other;
 
-- `fork` copies all of a program's memory at once, rather than sharing it
-  until either side writes to it;
+- `fork` copies a program's memory at once, but for the page cache's pages
+  it maps, its code's among them, which it shares; rather than sharing all
+  of it until either side writes to it;
 - `clone` without `CLONE_THREAD` copies the program even when asked to share
   its memory (`CLONE_VM`), which is all `posix_spawn` needs, and
   `CLONE_VFORK` doesn't hold the parent back; a thread shares its
@@ -249,10 +270,10 @@ its hash maps' keys, and `/dev/random` and `/dev/urandom` give random bytes
 - there's no `/proc/PID/task`, and a thread's CPU time is its program's;
 - a program that ended keeps its memory until it's waited for, and those
   never waited for go with their parent rather than to an init;
-- `execve` reads all of a program's segments into memory as it starts it,
-  rather than as they're used; and `mmap` all it maps of a file, so a
-  shared library is read from the disk into each program that loads it,
-  rather than shared between them;
+- `execve` maps all of a program's segments as it starts it, rather than
+  as they're used: those it can't write, the page cache's pages, read in if
+  they aren't there, and the rest copied; and `mmap` all it maps of a
+  file;
 - an interpreter must be position-independent, as loaders are, rather than
   at addresses of its own;
 - random bytes come from RDRAND when the CPU has it, which QEMU's default
@@ -399,16 +420,28 @@ its `/sbin/init`, a script that logs root in to zsh.
 ## Userland
 
 `scripts/userland.sh` builds the programs that make a disk a system to use:
-busybox 1.38.0, with a link for each of its applets where Linux keeps them
-(`/bin/sh`, `/bin/ls`, `/usr/bin/awk` and the rest), zsh 5.9.2 with its
-shell functions, and vim 9.2.1202 with its runtime files, its help and
-syntax highlighting among them, on ncurses 6.6 with the terminals it knows
-built in.
-They're static programs for x86-64 Linux, linked with musl by zig cc 0.17.0,
-from the sources the script pins and checks by their SHA-256, into
-`target/userland/root`. The first build takes a few minutes and needs the
-network; after that it's done, until the script changes. It builds on x86-64
-Linux only.
+uutils' coreutils 0.12.0, GNU's commands rewritten in Rust, one program,
+`/usr/bin/coreutils`, for its 104 (`ls`, `cp`, `sort`, `du`, `dd`, `timeout`
+and the rest); busybox 1.38.0 for what they aren't, with a link for each of
+its applets where Linux keeps them (`/bin/sh`, `/bin/grep`, `/usr/bin/awk`,
+`/bin/vi`, `/bin/ps` and so on), but those uutils has, whose links are
+uutils'; zsh 5.9.2 with its shell functions; and vim 9.2.1202 with its
+runtime files, its help and syntax highlighting among them, on ncurses 6.6
+with the terminals it knows built in.
+They're static programs for x86-64 Linux, linked with musl: the C by zig cc
+0.17.0, uutils by the Rust toolchain `rust-toolchain.toml` pins, for
+`x86_64-unknown-linux-musl`, as `user/probe` is; from the sources the script
+pins and checks by their SHA-256, and for uutils the crates its `Cargo.lock`
+pins, into `target/userland/root`. The first build takes a few minutes and
+needs the network, crates.io's included; after that it's done, until the
+script changes. It builds on x86-64 Linux only.
+
+uutils' commands, being Rust's, ask more of the kernel than busybox's: hash
+maps keyed by `getrandom`; threads, which `sort`, `du` and `dd` always start;
+POSIX timers and `sigwait`, which `timeout` waits by; `splice`, which `cat`
+copies with; a socket pair, which Rust's `Command` hears of a failed `exec`
+by; and `AT_FDCWD` as rustix passes it. Its 13 MB are read from the disk
+once, and each program running it after shares them, in the page cache.
 
 Over them go the files in `userland/`, copied every time, so changing them
 needs no new build:
@@ -423,8 +456,8 @@ needs no new build:
 
 What the completion system knows of its 998 functions it keeps in
 `~/.zcompdump`, which the build makes for root, by running the same zsh:
-made on simplos, it takes half a minute, most of it reading the functions
-a byte at a time, each byte from the disk.
+made on simplos, it takes ten seconds under emulation, most of it reading
+the functions a byte at a time, a system call for each.
 
 `cargo run`'s disk gets all of it as it's made: delete `fullkernel/disk.img`
 for one that has it. Then zsh is what you type at, and once it ends, the
@@ -432,21 +465,20 @@ kernel's own shell. For now:
 
 - busybox is built without `init`, which the kernel would run first, and
   which wants a console and an `inittab` there aren't; and without `tc`;
+- uutils is built without `stdbuf`, which its musl build leaves out; and its
+  `chroot`, `mknod` and `mkfifo` fail, as busybox's did, as there are no
+  `chroot` and no FIFOs here;
 - the disk's files belong to whoever made it, as `mke2fs -d` copies owners,
   which is why `/etc/zshrc` has `compinit -u`;
-- what's read a little at a time is read from the disk each time, as
-  lwext4 keeps no file's data in memory, so zsh's `read`, which reads a
-  byte at a time, is slow, and vim takes a few seconds to start under
-  emulation, reading its scripts;
 - vim is built without `timer_create`, whose `SIGEV_THREAD` takes a thread,
   so it times what it times out (a regexp, `'redrawtime'`) with `setitimer`;
   and the `flock` it puts on its temporary directory, against cleaners
   that there aren't, isn't there.
 
-busybox is GPL-2.0, as simplos is; zsh and ncurses are MIT-style; vim is
-under the Vim license, which is GPL-compatible. A disk made with them holds
-their programs, built from the upstream releases the script names (vim's,
-from its tag), unchanged, configured as it says.
+busybox is GPL-2.0, as simplos is; uutils is MIT; zsh and ncurses are
+MIT-style; vim is under the Vim license, which is GPL-compatible. A disk made
+with them holds their programs, built from the upstream releases the script
+names (vim's and uutils', from their tags), unchanged, configured as it says.
 
 ## GCC
 
@@ -480,16 +512,17 @@ the script changes. It builds on x86-64 Linux only.
 AHCI controller, and `cargo run` gives the guest 1 GiB of memory unless `-m`
 is given; a hello world, even in C++ with `<iostream>`, compiles in QEMU's
 default 128 MiB. Under emulation, `gcc -O2` compiles a C hello world there
-in 4 s, and `g++ -O2` an `<iostream>` one in 9 s, or in 28 s with
-`-static`, which reads what it needs of `libstdc++.a` into it. For now:
+in 5 s the first time, and in under 1 s after that, the compiler being in
+the page cache by then; `g++ -O2` an `<iostream>` one in 9 s, then 4 s, or
+14 s with `-static`, which copies what it needs of `libstdc++.a` into it.
+For now:
 
-- a program is read whole as it starts, and that's most of the time it
-  takes: `cc1`, 36 MB, takes 6 s to start from an AHCI disk, read by DMA,
-  and 25 s from an IDE one, read a word at a time by port I/O;
-- a program linked dynamically reads its shared libraries from the disk
-  each time it starts, simplos having nowhere to keep them, so one linked
-  statically starts sooner: that C++ hello world in 0.09 s rather than
-  0.23 s;
+- a program is read whole the first time it starts, and that's most of
+  that time: `cc1`, 36 MB, takes 6 s to read from an AHCI disk, by DMA,
+  and 25 s from an IDE one, a word at a time by port I/O;
+- a program linked dynamically starts a little later than one linked
+  statically, as the loader finds and maps its libraries, which are in the
+  page cache by then: that C++ hello world in 0.03 s rather than 0.01 s;
 - there's no LTO and no sanitizers.
 
 gcc and binutils are GPL-3.0, with GCC's runtime library exception for what's
@@ -573,7 +606,7 @@ the right firmware and the right framebuffer mode.
 | `vendor/ps2/` | the `ps2` crate, with its `x86_64` dependency bumped. |
 | `fs/ext4/` | ext4 (and ext3 and ext2) file systems, read and written with a journal: a Rust interface over the vendored lwext4, tested on the host against e2fsprogs. |
 | `vendor/lwext4/` | [lwext4](https://github.com/gkostka/lwext4), the C library `fs/ext4` uses for now. |
-| `scripts/` | `build-images.sh`, `smoke-test.sh`, `boot-test.sh`, `mutants.sh`, `userland.sh`, which builds busybox, zsh and vim for the disk, and `toolchain.sh`, which builds GCC for it. |
+| `scripts/` | `build-images.sh`, `smoke-test.sh`, `boot-test.sh`, `mutants.sh`, `userland.sh`, which builds busybox, uutils, zsh and vim for the disk, and `toolchain.sh`, which builds GCC for it. |
 
 There is no cargo workspace: `kernel` builds for `x86_64-unknown-none` with
 `build-std`, the host tools and `fs/ext4`'s tests build for the host, `user/probe` builds for

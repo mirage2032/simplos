@@ -1,4 +1,5 @@
-//! Shells: busybox's and zsh, as `scripts/userland.sh` builds them and
+//! Shells: busybox's and zsh, and the commands they run, uutils' coreutils
+//! and busybox's others, as `scripts/userland.sh` builds them and
 //! `tools/boot-test` puts them on this kernel's disk, as it does for a
 //! kernel whose name starts with `shells`. Each runs on a terminal of its
 //! own: as a command, its output kept; or as people use them, typed at.
@@ -131,8 +132,10 @@ fn ok(text: &str) -> (i32, String) {
 }
 
 #[test_case]
-fn busybox_runs_its_applets_through_their_links() {
-    // ls through a pipe, where it lists one to a line, without colours.
+fn commands_run_through_their_links() {
+    // uutils' (ls, cat, wc, sort...) and busybox's (sed, awk, xargs...), as
+    // their links name them. ls through a pipe, where it lists one to a
+    // line, without colours.
     let script = "echo $((6 * 7)); ls /bin/ls /hello.txt | cat; cat /hello.txt | wc -c; \
                   uname -s; printf '%s\\n' c b a | sort | tr a-z A-Z | head -2; \
                   seq 3 | xargs echo; expr 6 \\* 7; basename /a/b.txt .txt; \
@@ -146,7 +149,7 @@ fn busybox_runs_its_applets_through_their_links() {
 }
 
 #[test_case]
-fn busybox_works_with_files() {
+fn commands_work_with_files() {
     // Made, linked, found, copied, moved, changed, edited in place and
     // appended to; then all of it removed.
     let script = "cd /tmp && mkdir -p a/b && echo x > a/b/f && ln -s f a/b/l && readlink a/b/l; \
@@ -158,6 +161,27 @@ fn busybox_works_with_files() {
         run(&["/bin/sh", "-c", script]),
         ok("f\nx\na\na/b\na/b/f\na/b/l\nhello from ext4\n750\n1000000000\nHELLO from ext4\n\
             more\n2\n0\n")
+    );
+}
+
+#[test_case]
+fn uutils_commands_use_threads_timers_and_pipes() {
+    // What the kernel gives uutils that busybox never asked for: sort,
+    // with a thread of its own, of numbers out of order; du, whose sizes a
+    // thread prints; dd, whose progress a thread counts; timeout, waiting by
+    // a timer for a command that ends in time and one that doesn't; cat,
+    // through splice; cp -a, which finds no extended attributes to copy; ln
+    // -s by a relative path, which rustix passes AT_FDCWD for; df, from
+    // /proc/self/mountinfo; and which they are.
+    let script = "seq 1000 | shuf | sort -n | tail -n 1; du -s /etc | cut -f 2; \
+                  dd if=/hello.txt of=/tmp/dd bs=4 status=none && cat /tmp/dd; \
+                  timeout 5 true; echo $?; timeout 1 sleep 5; echo $?; \
+                  cd /tmp && cp -a /etc e && ln -s e/passwd p && cat p | wc -l; \
+                  rm -r e p dd; df / | tail -n 1 | cut -c 1-9; \
+                  ls --version | head -n 1 | cut -d ' ' -f 1-3";
+    assert_eq!(
+        run(&["/bin/sh", "-c", script]),
+        ok("1000\n/etc\nhello from ext4\n0\n124\n1\n/dev/root\nls (uutils coreutils)\n")
     );
 }
 

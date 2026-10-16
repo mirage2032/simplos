@@ -10,6 +10,7 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -17,6 +18,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use bootloader_api::{BootInfo, entry_point};
 use core::panic::PanicInfo;
+use simplos::tty::Tty;
 use simplos::{fs, process};
 use spin::Mutex;
 
@@ -100,6 +102,27 @@ fn execve_replaces_the_program() {
         run(&["exec", "/bin/probe", "env", "a b", "c"]),
         ok("[\"env\", \"a b\", \"c\"]\nFROM=exec\n")
     );
+}
+
+#[test_case]
+fn copies_of_a_program_share_its_code() {
+    // /bin/big's 24 MiB segment is read-only, so each copy that runs maps
+    // the page cache's pages of it, rather than copies of its own: a second
+    // takes under 4 MiB. So does a copy made with fork.
+    let free = || simplos::memory::FRAMES.lock().as_ref().unwrap().memory().1;
+    let start = || {
+        let tty = Tty::capture(Box::new(|_: &[u8]| {}));
+        let files = vec![Some(Arc::new(fs::Handle::tty(Arc::new(tty)))); 3];
+        let argv = ["/bin/big", "sleep", "500"];
+        process::spawn_program(argv[0], &argv, &[], files).expect("big runs")
+    };
+    let first = start();
+    let before = free();
+    let second = start();
+    let taken = before.saturating_sub(free());
+    assert!(taken < 4 << 20, "a second copy took {} KiB", taken >> 10);
+    assert_eq!((first.wait(), second.wait()), (0, 0));
+    assert_eq!(run(&["exec", "/bin/big", "fork-taken"]), ok("true\n"));
 }
 
 #[test_case]

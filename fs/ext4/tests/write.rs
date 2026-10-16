@@ -4,7 +4,7 @@
 mod common;
 
 use common::*;
-use ext4::{BlockDevice, Changes, Error, Ext4, Kind, Usage};
+use ext4::{BlockDevice, Change, Changes, Error, Ext4, Kind, Usage};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::sync::Arc;
@@ -756,4 +756,52 @@ fn tells_how_much_is_used() {
     let after = fs.usage().unwrap();
     assert!(before.free_blocks - after.free_blocks >= 256, "{before:?} {after:?}");
     assert_eq!(after.free_inodes, before.free_inodes - 1);
+}
+
+/// What `heard` has been told: for `tells_whoever_watches_what_changes`,
+/// the only test that watches.
+static HEARD: std::sync::Mutex<Vec<(u32, String)>> = std::sync::Mutex::new(Vec::new());
+
+fn heard(inode: u32, change: Change<'_>) {
+    HEARD.lock().unwrap().push((inode, format!("{change:?}")));
+}
+
+#[test]
+fn tells_whoever_watches_what_changes() {
+    let _serial = serial();
+    let dir = workspace("watch");
+    let root = dir.join("tree");
+    make_tree(&root);
+    let image = image_after(&dir, &root, &[], "64M", |_| {});
+    let fs = Ext4::mount_writable(Box::new(image)).expect("mounts");
+    fs.watch(heard);
+    let inode = |path| fs.metadata(path).unwrap().inode;
+    let (hello, big) = (inode("hello.txt"), inode("big.bin"));
+    // Written to, cut short, and emptied as it's opened.
+    let file = fs.open_writable("hello.txt").unwrap();
+    file.write_at(1, b"i").unwrap();
+    file.set_len(3).unwrap();
+    drop(file);
+    drop(fs.create("hello.txt").unwrap());
+    // Made, under a number that may have been another's; replacing another
+    // file, which goes; then gone itself.
+    drop(fs.create("made.txt").unwrap());
+    let made = inode("made.txt");
+    fs.rename("made.txt", "big.bin").unwrap();
+    fs.remove_file("big.bin").unwrap();
+    // Nothing for what changes no file's contents.
+    fs.create_dir("new").unwrap();
+    fs.link("hello.txt", "new/hello.txt").unwrap();
+    let heard = |inode, change: &str| (inode, String::from(change));
+    assert_eq!(
+        *HEARD.lock().unwrap(),
+        [
+            heard(hello, "Written { offset: 1, bytes: [105] }"),
+            heard(hello, "Resized { size: 3 }"),
+            heard(hello, "Resized { size: 0 }"),
+            heard(made, "Gone"),
+            heard(big, "Gone"),
+            heard(made, "Gone"),
+        ]
+    );
 }
