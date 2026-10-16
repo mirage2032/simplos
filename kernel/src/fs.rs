@@ -103,6 +103,10 @@ pub enum Handle {
     Null,
     /// /dev/zero: as many zeros as are read, and what's written goes nowhere.
     Zero,
+    /// /dev/random and /dev/urandom, which have been the same since Linux
+    /// 5.6: as many random bytes as are read (`random::fill`), and what's
+    /// written goes nowhere.
+    Random { urandom: bool },
     Pipe {
         end: crate::pipe::PipeEnd,
         /// O_NONBLOCK: a read or write that would wait fails instead.
@@ -157,8 +161,9 @@ impl Handle {
 /// ones ext4 keeps for itself and never shows (its bad-blocks list, quotas
 /// and boot loader), so no file on the disk has them.
 ///
-/// shortcut: just these three; device nodes on the disk aren't looked at.
-const DEVICES: [(&str, u32); 3] = [("null", 3), ("tty", 4), ("zero", 5)];
+/// shortcut: just these; device nodes on the disk aren't looked at.
+const DEVICES: [(&str, u32); 5] =
+    [("null", 3), ("random", 6), ("tty", 4), ("urandom", 7), ("zero", 5)];
 /// /dev's own.
 const DEV_INODE: u32 = 1;
 
@@ -168,6 +173,8 @@ pub enum Device {
     Zero,
     /// The terminal of whoever opens it.
     Tty,
+    Random,
+    Urandom,
 }
 
 /// /dev's links to /dev/fd's, as Linux has them to /proc/self/fd's.
@@ -204,6 +211,8 @@ pub fn device(path: &str) -> Option<Device> {
         On::Devices("null") => Some(Device::Null),
         On::Devices("zero") => Some(Device::Zero),
         On::Devices("tty") => Some(Device::Tty),
+        On::Devices("random") => Some(Device::Random),
+        On::Devices("urandom") => Some(Device::Urandom),
         _ => None,
     }
 }
@@ -214,6 +223,8 @@ fn device_metadata(device: Device) -> Metadata {
         Device::Null => (3, 0o020666),
         Device::Zero => (5, 0o020666),
         Device::Tty => (4, 0o020620),
+        Device::Random => (6, 0o020666),
+        Device::Urandom => (7, 0o020666),
     };
     special_metadata(inode, mode)
 }
@@ -224,6 +235,8 @@ pub fn special(handle: &Handle) -> Option<Metadata> {
         Handle::Tty { .. } => Some(device_metadata(Device::Tty)),
         Handle::Null => Some(device_metadata(Device::Null)),
         Handle::Zero => Some(device_metadata(Device::Zero)),
+        Handle::Random { urandom: false } => Some(device_metadata(Device::Random)),
+        Handle::Random { urandom: true } => Some(device_metadata(Device::Urandom)),
         // A FIFO.
         Handle::Pipe { .. } => Some(special_metadata(0, 0o010600)),
         Handle::File { .. } | Handle::Dir { .. } | Handle::Proc { .. } => None,
