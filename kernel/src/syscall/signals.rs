@@ -121,6 +121,69 @@ pub fn rt_sigsuspend(process: &Process, task: &Task, mask: u64, size: u64) -> i6
     pause(task)
 }
 
+/// `rt_sigtimedwait`, which `sigwait` and `sigwaitinfo` come to: wait for one
+/// of the signals in the set at `set`, which the caller blocks, and take it
+/// rather than have its handler run: its number, with its `siginfo_t` at
+/// `info` if that isn't 0. For as long as the `struct timespec` at `timeout`
+/// says, if it isn't 0, and then EAGAIN; EINTR if another signal comes and
+/// its handler runs. Meanwhile the set is unblocked, so that a signal in it
+/// wakes the wait, as on Linux; SIGKILL and SIGSTOP can't be waited for.
+pub fn rt_sigtimedwait(
+    process: &Process,
+    task: &Task,
+    set: u64,
+    info: u64,
+    timeout: u64,
+    size: u64,
+) -> i64 {
+    const EAGAIN: i64 = 11;
+    const EINTR: i64 = 4;
+    if size != SET_SIZE {
+        return -EINVAL;
+    }
+    let set = match read_set(process, set) {
+        Ok(set) => set & !(signal::bit(signal::SIGKILL) | signal::bit(signal::SIGSTOP)),
+        Err(errno) => return -errno,
+    };
+    // Whether to wait at all, which a timeout of 0 doesn't, and until when.
+    let (wait, deadline) = match timeout {
+        0 => (true, None),
+        timeout => match super::timespec_ms(process, timeout) {
+            Ok(ms) => (ms > 0, Some(crate::thread::ticks_after(ms))),
+            Err(errno) => return -errno,
+        },
+    };
+    let own = &task.signals;
+    let mut taken = signal::take_waited(process, task, set);
+    if taken.is_none() && wait {
+        own.wait_for(set);
+        while taken.is_none() {
+            let waited = match deadline {
+                Some(deadline) => crate::thread::poll_until(Some(deadline), || false),
+                None => own.arrived.wait_until_interruptible(|| false),
+            };
+            taken = signal::take_waited(process, task, set);
+            // Out of time; or another signal, as one of the set another
+            // thread took first is waited past.
+            if waited.is_ok() || signal::has_signal(process, task) {
+                break;
+            }
+        }
+        own.wait_for(0);
+        if taken.is_none() && signal::has_signal(process, task) {
+            return -EINTR;
+        }
+    }
+    let Some((signal, sent)) = taken else { return -EAGAIN };
+    if info != 0 {
+        let siginfo = signal::siginfo(signal, sent);
+        if process.memory.lock().space.write(info, &siginfo).is_none() {
+            return -EFAULT;
+        }
+    }
+    signal as i64
+}
+
 /// Wait for a signal for `task`, the current thread: one whose handler runs
 /// ends it, with EINTR.
 pub fn pause(task: &Task) -> i64 {

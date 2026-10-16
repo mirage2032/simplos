@@ -149,3 +149,17 @@ fn a_program_stops_all_its_threads() {
     // spins too, as its CPU time standing still says; continued; killed.
     assert_eq!(run(&["thread-stops"]), ok("0x137f true 0xffff signal: 9\n"));
 }
+
+#[test_case]
+fn a_program_waits_for_signals_it_blocks() {
+    // What Linux says, from the same program: rt_sigtimedwait takes a
+    // signal of the set, with who sent it, rather than run its handler;
+    // EAGAIN after 50 ms with none, and at once for a time of 0; EINTR for
+    // one not in the set, whose handler runs; a child's SIGCHLD, with how it
+    // ended; the set still blocked after; and EINVAL for a set's size that
+    // isn't 8 and a time that isn't one.
+    assert_eq!(
+        run(&["sigtimedwait"]),
+        ok("10 (0, true) -11 true -11 true -4 true 17 (1, true, 3) true 1 [-22, -22]\n")
+    );
+}

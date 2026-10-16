@@ -334,6 +334,7 @@ fn call(frame: &Frame) -> i64 {
         121 => signals::getpgid(&process, a0),
         124 => signals::getsid(&process, a0),
         127 => signals::rt_sigpending(&process, &task, a0, a1),
+        128 => signals::rt_sigtimedwait(&process, &task, a0, a1, a2, a3),
         130 => signals::rt_sigsuspend(&process, &task, a0, a1),
         // fsync, fdatasync.
         74 | 75 => files::fsync(&process, a0),
@@ -355,6 +356,11 @@ fn call(frame: &Frame) -> i64 {
         217 => files::getdents64(&process, a0, a1, a2),
         // set_tid_address: where to write 0 and wake a futex as the thread
         // ends; its id.
+        222 => clocks::timer_create(&process, a0, a1, a2),
+        223 => clocks::timer_settime(&process, a0, a1, a2, a3),
+        224 => clocks::timer_gettime(&process, a0, a1),
+        225 => clocks::timer_getoverrun(&process, a0),
+        226 => clocks::timer_delete(&process, a0),
         218 => {
             task.clear_tid.store(a0, Ordering::Relaxed);
             task.id() as i64

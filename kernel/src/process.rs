@@ -107,8 +107,11 @@ pub struct Process {
     /// The CPU time it has had, and its children it waited for have.
     pub times: Times,
     /// Its alarm, which the alarm thread sends it when due. Taken with
-    /// interrupts on.
+    /// interrupts on, as are its timers.
     pub alarm: Mutex<time::Alarm>,
+    /// Its timers, by id, as `timer_create` makes them; `None` for one
+    /// deleted, whose id is free again.
+    pub timers: Mutex<Vec<Option<time::Timer>>>,
     /// The program it's a copy of; none for one the kernel started.
     parent: Weak<Process>,
     /// What it runs, as /proc tells it. Taken with interrupts on.
@@ -464,6 +467,7 @@ pub fn spawn_with(
         limits: Mutex::new(syscall::DEFAULT_LIMITS),
         times: Times::default(),
         alarm: Mutex::new(time::Alarm::default()),
+        timers: Mutex::new(Vec::new()),
         parent: Weak::new(),
         children: Mutex::new(Vec::new()),
         child_exited: WaitQueue::new(),
@@ -698,6 +702,7 @@ pub fn fork(
         limits: Mutex::new(*parent.limits.lock()),
         times: Times::default(),
         alarm: Mutex::new(time::Alarm::default()),
+        timers: Mutex::new(Vec::new()),
         parent: Arc::downgrade(parent),
         children: Mutex::new(Vec::new()),
         child_exited: WaitQueue::new(),
@@ -796,6 +801,8 @@ pub fn exec(
     drop(old);
     process.signals.exec();
     task.signals.exec();
+    // Its timers go, as POSIX says; its alarm stays.
+    process.timers.lock().clear();
     Ok(start)
 }
 
