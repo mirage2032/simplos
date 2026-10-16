@@ -7,12 +7,12 @@ description: >-
 runs:
   using: composite
   steps:
-    - if: github.event_name != 'pull_request' && env.CARGO_CACHE_KEY != '' && env.CARGO_CACHE_HIT != 'true'
+    - if: (github.event_name != 'pull_request' || github.head_ref == 'ci/parallel') && env.CARGO_CACHE_KEY != '' && env.CARGO_CACHE_HIT != 'true'
       name: Take this repository's crates out of the cargo cache
       shell: bash
       run: .github/scripts/prune-cargo-cache.sh $CARGO_CACHE_TARGETS
 
-    - if: github.event_name != 'pull_request' && env.CARGO_CACHE_KEY != '' && env.CARGO_CACHE_HIT != 'true'
+    - if: (github.event_name != 'pull_request' || github.head_ref == 'ci/parallel') && env.CARGO_CACHE_KEY != '' && env.CARGO_CACHE_HIT != 'true'
       uses: actions/cache/save@v6
       with:
         path: ${{ env.CARGO_CACHE_PATHS }}
