@@ -133,3 +133,19 @@ fn a_signal_whose_stack_is_past_the_end_of_memory_ends_the_program() {
     // on adding its size up.
     assert_eq!(run(&["far-altstack"]), ok("signal: 11\n"));
 }
+
+#[test_case]
+fn a_thread_takes_the_signals_it_doesn_t_block_and_those_sent_it() {
+    // What Linux says, from the same program: one sent to the program goes
+    // to the thread that doesn't block it; tgkill to the thread named; a
+    // group that isn't its own, and a thread there isn't, ESRCH; and the alternate
+    // stack the first thread set is still its own, the others' theirs.
+    assert_eq!(run(&["thread-signals"]), ok("true 0 true -3 -3 true\n"));
+}
+
+#[test_case]
+fn a_program_stops_all_its_threads() {
+    // What Linux says, from the same program: stopped, its thread that
+    // spins too, as its CPU time standing still says; continued; killed.
+    assert_eq!(run(&["thread-stops"]), ok("0x137f true 0xffff signal: 9\n"));
+}

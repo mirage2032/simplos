@@ -433,9 +433,13 @@ fn write_data(process: &Process, fd: u64, data: &[u8], at: Option<u64>) -> Resul
         Handle::Pipe { end, .. } if !end.write => Err(EBADF),
         Handle::Pipe { end, nonblocking } => match end.write(data, !nonblocking.load(Relaxed)) {
             Ok(written) => Ok(written as i64),
-            // And SIGPIPE, which ends a program that doesn't ignore it.
+            // And SIGPIPE, to the thread that wrote, as Linux sends it,
+            // which ends a program that doesn't ignore it.
             Err(WriteError::Broken) => {
-                signal::send(process, signal::SIGPIPE, Info::user(process.id));
+                let info = Info::user(process.id);
+                if let Some(task) = crate::thread::current_task() {
+                    signal::send_thread(process, &task, signal::SIGPIPE, info);
+                }
                 Err(EPIPE)
             }
             Err(WriteError::Full) => Err(EAGAIN),

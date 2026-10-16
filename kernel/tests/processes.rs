@@ -89,8 +89,8 @@ fn wait4_waits_for_children_and_not_for_none() {
 
 #[test_case]
 fn bad_calls_are_refused_and_the_program_goes_on() {
-    // A thread, EINVAL; and execve's path, arguments and an argument in the
-    // kernel's half, EFAULT.
+    // A thread without its handlers, EINVAL, as Linux says; and execve's
+    // path, arguments and an argument in the kernel's half, EFAULT.
     assert_eq!(run(&["bad-processes"]), ok("-22 -14 -14 -14\n"));
 }
 
@@ -188,4 +188,47 @@ fn a_program_learns_about_the_machine_and_how_nice_it_is() {
         ok("0 [true, true, true, true] [0, 0, -22] [20, 0, 15, 0, 23, 0, 1, -22, -3] \
             exit status: 15 0\n")
     );
+}
+
+#[test_case]
+fn threads_share_their_program() {
+    // What Linux says, from the same program: 4 x 10,000 sums and counts, a
+    // Mutex's and an atomic's; five thread ids, the pid every thread's,
+    // thread-locals their own; 1,000 Condvar turns; a wait that times out,
+    // after its 50 ms; and park, until unparked.
+    assert_eq!(
+        run(&["threads"]),
+        ok("199980000 40000 5 true true 1000 true true
+")
+    );
+}
+
+#[test_case]
+fn futexes_wait_wake_and_requeue() {
+    // What Linux says, from the same program: a word that isn't what's
+    // expected, EAGAIN; a wait for 10 ms and one until a time past,
+    // ETIMEDOUT; no bitset, and a word that isn't aligned, EINVAL; an op
+    // there isn't, ENOSYS; a wake for no one, 0; a requeue for a word that
+    // isn't, EAGAIN. Then one waiter woken, and two moved and woken there.
+    assert_eq!(run(&["futex"]), ok("[-11, -110, -110, -22, -22, -38, 0, -11] 1 0 2 2 [0, 0]\n"));
+}
+
+#[test_case]
+fn a_thread_ends_alone_and_exit_group_ends_them_all() {
+    // What Linux says, from the same program: a thread's exit(5) ends the
+    // program while the first waits for it; and the first's own exit, the
+    // raw system call, leaves the other to go on and end it all.
+    assert_eq!(run(&["thread-exit"]), ok("exit status: 5; after the first, exit status: 3\n"));
+}
+
+#[test_case]
+fn a_thread_that_execs_takes_its_program_over() {
+    // What Linux says, from the same program: the same pid, the thread
+    // numbered as it, and the one thread.
+    assert_eq!(run(&["thread-exec", "/bin/probe"]), ok("true true Threads:\t1\n"));
+}
+
+#[test_case]
+fn a_thread_that_forks_makes_a_copy_with_one_thread() {
+    assert_eq!(run(&["thread-fork"]), ok("child: true Threads:\t1\nparent: exit status: 4\n"));
 }

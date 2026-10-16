@@ -1,8 +1,11 @@
 //! User programs: Linux x86-64 executables, run in ring 3 in an address space
-//! of their own. Each runs on one thread, whose system calls `syscall.rs`
-//! handles, and which a fault ends without touching anything else. A program
-//! can copy itself (`fork`), replace itself with another (`exec`), and wait
-//! for the copies it made to end. Programs are in process groups, which are
+//! of their own. Each runs on threads of its own, one to start with and more
+//! as it makes them (`spawn_thread`), which share all of it but their
+//! registers, `fs` and signal mask; whose system calls `syscall.rs` handles;
+//! and which a fault ends, with the rest of their program, without touching
+//! anything else. A program ends as its last thread does, or all at once with
+//! `exit_group` or a fatal signal. It can copy itself (`fork`), replace
+//! itself with another (`exec`), and wait for the copies it made to end. Programs are in process groups, which are
 //! in sessions, as on Linux: a session's leader has a terminal, and one of
 //! its groups is in the terminal's foreground, which ^C signals.
 //!
@@ -17,9 +20,10 @@
 
 use crate::elf::{self, Elf, Source};
 use crate::fs;
+use crate::futex;
 use crate::io::interrupts::gdt;
 use crate::memory::{AddressSpace, USER_END};
-use crate::signal::{self, Info, Signals};
+use crate::signal::{self, AltStack, Info, Signals, ThreadSignals};
 use crate::syscall;
 use crate::thread::{self, WaitQueue};
 use crate::time;
@@ -54,8 +58,10 @@ pub const STACK_MOST: u64 = 64 << 20;
 /// Where `mmap` stops: a gap below where the stack can grow to.
 pub const MMAP_END: u64 = STACK_TOP - STACK_MOST - 0x10_0000;
 
-/// What `status` holds until the program ends.
+/// What `status` holds until the program ends, and `ending` until it starts
+/// to; and what `ending` holds while one of its threads execs.
 const RUNNING: i32 = i32::MIN;
+const EXECING: i32 = i32::MIN + 1;
 
 /// The exit status of a program a segmentation fault ended, as a shell
 /// reports it: 128 plus the signal.
@@ -116,6 +122,40 @@ pub struct Process {
     pub children: Mutex<Vec<Arc<Process>>>,
     /// Woken as each of them ends.
     pub child_exited: WaitQueue,
+    /// Its threads that haven't ended, the one it started with first while
+    /// it's there. Taken only with interrupts off, as `exec` looks at them
+    /// from `WaitQueue::wait_until`.
+    threads: Mutex<Vec<Arc<Task>>>,
+    /// Woken as each of them ends.
+    thread_exited: WaitQueue,
+    /// `RUNNING`; or how it ends, once a thread of it has ended it all
+    /// (`exit_group`, a fatal signal) and the rest are ending too; or
+    /// `EXECING`, while the rest end for a thread that execs.
+    ending: AtomicI32,
+}
+
+/// One of a program's threads, as the program's others and the kernel see it.
+/// What else it has, its registers and `fs`, is the scheduler's (`UserState`).
+pub struct Task {
+    /// Its thread id, from the same numbers as programs': its program's own
+    /// for the thread it started with, and for one that execs, which takes
+    /// the program over.
+    id: AtomicU64,
+    pub signals: ThreadSignals,
+    /// Where it ends, 0 is written, and a futex there woken, as
+    /// CLONE_CHILD_CLEARTID and `set_tid_address` ask: how `pthread_join`
+    /// hears of it. 0 for nowhere.
+    pub clear_tid: AtomicU64,
+}
+
+impl Task {
+    fn new(id: u64, signals: ThreadSignals) -> Arc<Task> {
+        Arc::new(Task { id: AtomicU64::new(id), signals, clear_tid: AtomicU64::new(0) })
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id.load(Ordering::Relaxed)
+    }
 }
 
 /// What a process runs: its program's name, as Linux's `comm` is, the last
@@ -259,6 +299,52 @@ impl Process {
         }
         parent.child_exited.wake_all();
     }
+
+    /// Its threads that haven't ended.
+    pub fn threads(&self) -> Vec<Arc<Task>> {
+        interrupts::without_interrupts(|| self.threads.lock().clone())
+    }
+
+    /// Start ending it all, with `status`, as `exit_group` and fatal signals
+    /// do: its threads but `me`, the current one, are sent SIGKILL, to end
+    /// as they next can. Unless it's ending already, or a thread execs: then
+    /// that status stands, or the program goes on.
+    fn end_all(&self, me: &Task, status: i32) {
+        let ended = interrupts::without_interrupts(|| {
+            let threads = self.threads.lock();
+            let ending =
+                self.ending.compare_exchange(RUNNING, status, Ordering::AcqRel, Ordering::Acquire);
+            ending.is_ok().then(|| threads.clone())
+        });
+        self.kill_others(me, ended.unwrap_or_default());
+    }
+
+    /// For `exec`: end its threads but `me`, the current one, and wait until
+    /// they have; `me` then has the program's id, as the thread it started
+    /// with did. False if it's ending already, or another thread execs, and
+    /// `me` is to end too.
+    fn alone(&self, me: &Task) -> bool {
+        let others = interrupts::without_interrupts(|| {
+            let threads = self.threads.lock();
+            let execing =
+                self.ending.compare_exchange(RUNNING, EXECING, Ordering::AcqRel, Ordering::Acquire);
+            execing.is_ok().then(|| threads.clone())
+        });
+        let Some(others) = others else { return false };
+        self.kill_others(me, others);
+        self.thread_exited.wait_until(|| self.threads.lock().len() == 1);
+        me.id.store(self.id, Ordering::Relaxed);
+        me.clear_tid.store(0, Ordering::Relaxed);
+        self.ending.store(RUNNING, Ordering::Release);
+        true
+    }
+
+    /// Send SIGKILL to each of `threads` but `me`.
+    fn kill_others(&self, me: &Task, threads: Vec<Arc<Task>>) {
+        for task in threads.iter().filter(|task| !core::ptr::eq(&***task, me)) {
+            signal::send_thread(self, task, signal::SIGKILL, Info::kernel());
+        }
+    }
 }
 
 impl Drop for Process {
@@ -278,6 +364,17 @@ fn register(process: &Arc<Process>) {
 /// The process numbered `id`, if there is one.
 pub fn find(id: u64) -> Option<Arc<Process>> {
     TABLE.lock().get(&id).and_then(Weak::upgrade)
+}
+
+/// The thread numbered `tid`, if there is one, and the process it's a thread
+/// of.
+pub fn find_thread(tid: u64) -> Option<(Arc<Process>, Arc<Task>)> {
+    // Most often the thread a process started with, numbered as it is.
+    let first = find(tid).into_iter();
+    first.chain(all()).find_map(|process| {
+        let task = process.threads().into_iter().find(|task| task.id() == tid)?;
+        Some((process, task))
+    })
 }
 
 /// Every process there is.
@@ -347,6 +444,7 @@ pub fn spawn_with(
     if let Some(tty) = &tty {
         tty.control(id, id);
     }
+    let task = Task::new(id, ThreadSignals::new(0, AltStack::NONE));
     let process = Arc::new(Process {
         id,
         memory: Mutex::new(memory),
@@ -368,10 +466,14 @@ pub fn spawn_with(
         child_exited: WaitQueue::new(),
         command: Mutex::new(Command::new(args.first().copied().unwrap_or_default(), &args)),
         started: time::since_boot(),
+        threads: Mutex::new(vec![task.clone()]),
+        thread_exited: WaitQueue::new(),
+        ending: AtomicI32::new(RUNNING),
     });
     register(&process);
     let user = UserState {
         process: process.clone(),
+        task,
         start,
         pml4,
         kernel_stack_top: VirtAddr::zero(),
@@ -497,17 +599,47 @@ fn program(
     Ok((memory, Registers { rip: image.entry, rsp, ..Registers::default() }))
 }
 
+/// Where `clone` is to write a new thread's id, those that aren't 0: in the
+/// parent's memory (CLONE_PARENT_SETTID); in the child's (CLONE_CHILD_SETTID);
+/// and 0, as the thread ends, in the child's (CLONE_CHILD_CLEARTID).
+#[derive(Clone, Copy, Default)]
+pub struct ThreadIds {
+    pub parent: u64,
+    pub child: u64,
+    pub clear: u64,
+}
+
+/// Write `id` at `at` in `memory`, if `at` isn't 0, as `clone` writes a new
+/// thread's: or not, if it can't be, as Linux doesn't say.
+fn write_id(memory: &mut Memory, at: u64, id: u64) {
+    if at != 0 {
+        let _ = memory.space.write(at, &(id as u32).to_le_bytes());
+    }
+}
+
 /// A copy of `parent`, the current thread's program, as `fork` makes: its
 /// memory, descriptors, working directory and umask, started on a thread of
-/// its own with `registers`. Its id, or `None` when memory runs out.
-pub fn fork(parent: &Arc<Process>, registers: Registers) -> Option<u64> {
-    let memory = {
+/// its own with `registers`, and `fs` at `tls` if that's given, its id
+/// written where `ids` say. Its id, or `None` when memory runs out.
+pub fn fork(
+    parent: &Arc<Process>,
+    registers: Registers,
+    tls: Option<u64>,
+    ids: ThreadIds,
+) -> Option<u64> {
+    let mut memory = {
         let memory = parent.memory.lock();
         Memory { space: memory.space.duplicate()?, ..*memory }
     };
     let pml4 = memory.space.pml4();
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    write_id(&mut memory, ids.child, id);
+    write_id(&mut parent.memory.lock(), ids.parent, id);
+    // Blocking what the thread that made it blocks, its alternate stack too.
+    let task = thread::with_current_user(|user| Task::new(id, user.task.signals.fork()))?;
+    task.clear_tid.store(ids.clear, Ordering::Relaxed);
     let child = Arc::new(Process {
-        id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+        id,
         memory: Mutex::new(memory),
         status: AtomicI32::new(RUNNING),
         exited: WaitQueue::new(),
@@ -527,9 +659,14 @@ pub fn fork(parent: &Arc<Process>, registers: Registers) -> Option<u64> {
         child_exited: WaitQueue::new(),
         command: Mutex::new(parent.command.lock().clone()),
         started: time::since_boot(),
+        threads: Mutex::new(vec![task.clone()]),
+        thread_exited: WaitQueue::new(),
+        ending: AtomicI32::new(RUNNING),
     });
     register(&child);
-    let user = thread::with_current_user(|user| user.fork(child.clone(), pml4, registers))?;
+    let mut user =
+        thread::with_current_user(|user| user.fork(child.clone(), task, pml4, registers))?;
+    user.fs_base = tls.unwrap_or(user.fs_base);
     thread::spawn_user(Box::new(user))?;
     // Even if it has already ended, it's there to be waited for: the parent
     // can't wait until this returns.
@@ -537,9 +674,63 @@ pub fn fork(parent: &Arc<Process>, registers: Registers) -> Option<u64> {
     Some(child.id)
 }
 
+/// A new thread of `process`, the current thread's program, as `clone` makes
+/// one with CLONE_THREAD: sharing all of it, and started with `registers`,
+/// its `fs` at `tls` if that's given, else where the current thread's is,
+/// and its id written where `ids` say before it runs. Blocking what the
+/// current thread blocks, but with no alternate stack, as that one's is the
+/// current thread's. Its id; or the errno saying why not: EAGAIN while the
+/// program is ending, ENOMEM when memory runs out.
+pub fn spawn_thread(
+    process: &Arc<Process>,
+    registers: Registers,
+    tls: Option<u64>,
+    ids: ThreadIds,
+) -> Result<u64, i64> {
+    const EAGAIN: i64 = 11;
+    const ENOMEM: i64 = 12;
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let user = thread::with_current_user(|user| {
+        let task = Task::new(id, user.task.signals.sibling());
+        task.clear_tid.store(ids.clear, Ordering::Relaxed);
+        let mut new = user.fork(process.clone(), task, user.pml4, registers);
+        new.fs_base = tls.unwrap_or(new.fs_base);
+        new
+    })
+    .ok_or(ENOMEM)?;
+    {
+        let mut memory = process.memory.lock();
+        write_id(&mut memory, ids.parent, id);
+        write_id(&mut memory, ids.child, id);
+    }
+    // One of its threads, unless it's ending, which then has none to end.
+    let task = user.task.clone();
+    let joined = interrupts::without_interrupts(|| {
+        let mut threads = process.threads.lock();
+        let running = process.ending.load(Ordering::Acquire) == RUNNING;
+        if running {
+            threads.push(task.clone());
+        }
+        running
+    });
+    if !joined {
+        return Err(EAGAIN);
+    }
+    if thread::spawn_user(Box::new(user)).is_none() {
+        let leave =
+            |threads: &mut Vec<Arc<Task>>| threads.retain(|other| !Arc::ptr_eq(other, &task));
+        interrupts::without_interrupts(|| leave(&mut process.threads.lock()));
+        return Err(ENOMEM);
+    }
+    Ok(id)
+}
+
 /// Replace `process`, the current thread's program, with `elf`, given `args`
-/// and `env`: its memory, `fs` and SSE registers start afresh. The registers
-/// to enter it with; or why it couldn't be loaded, and nothing has changed.
+/// and `env`: its memory, `fs` and SSE registers start afresh, and its other
+/// threads end, the current one taking the program's id, as on Linux. The
+/// registers to enter it with; or why it couldn't be loaded, and nothing has
+/// changed, or that the program is ending, which the current thread is to
+/// do too.
 pub fn exec(
     process: &Process,
     elf: &(impl Source + ?Sized),
@@ -547,12 +738,18 @@ pub fn exec(
     env: &[&[u8]],
 ) -> Result<Registers, &'static str> {
     let (memory, start) = program(elf, args, env)?;
+    let task = thread::current_task().expect("a program execs");
+    if !process.alone(&task) {
+        return Err("the program is ending");
+    }
     let pml4 = memory.space.pml4();
     let old = core::mem::replace(&mut *process.memory.lock(), memory);
     thread::with_current_user(|user| user.start_over(pml4));
-    // Only now that the CPU is off its page tables.
+    // Only now that the CPU is off its page tables, as its other threads,
+    // gone, are.
     drop(old);
     process.signals.exec();
+    task.signals.exec();
     Ok(start)
 }
 
@@ -566,8 +763,14 @@ pub fn grow_stack(addr: u64) -> bool {
     process.memory.lock().space.grow(addr)
 }
 
-/// End the current thread's program as `exit` does, with `code`, from one of
-/// its system calls.
+/// End the current thread as `exit` does, with `code`, from one of its
+/// system calls; and its program, if it's the last of its threads.
+pub fn exit_thread(code: i32) -> ! {
+    leave((code & 0xFF) << 8)
+}
+
+/// End the current thread's program as `exit_group` does, with `code`, from
+/// one of its system calls.
 pub fn exit_current(code: i32) -> ! {
     end_current((code & 0xFF) << 8)
 }
@@ -578,40 +781,78 @@ pub fn kill_current(signal: usize) -> ! {
     end_current(signal as i32)
 }
 
-/// End the current thread's program, which ended as `status` says. Its memory
-/// is freed once its thread is reaped and whoever waits for it lets go.
+/// End the current thread's program, which ended as `status` says: its other
+/// threads as they next can, and the current one now.
 fn end_current(status: i32) -> ! {
-    if let Some(process) = thread::current_process() {
-        // Closing files can wait on the disk, and a fault comes here with
-        // interrupts off.
+    if let Some((process, task)) = thread::current_user() {
+        // Sending signals takes locks taken with interrupts on, and a fault
+        // comes here with them off.
         interrupts::enable();
-        // Now, not when it's freed: whoever reads its pipes waits for them
-        // to close.
-        let tree = fs::lock();
-        let files = core::mem::take(&mut *process.files.lock());
-        drop(files);
-        drop(tree);
-        process.status.store(status, Ordering::Release);
-        process.exited.wake_all();
-        let (code, how) = match status & 0x7f {
-            0 => (signal::CLD_EXITED, status >> 8),
-            signal => (signal::CLD_KILLED, signal),
-        };
-        process.notify_parent(code, how);
-        // A parent that said it won't wait for its children doesn't keep
-        // them once they've ended.
-        if let Some(parent) = process.parent.upgrade()
-            && parent.signals.reaps_children()
-        {
-            let me = interrupts::without_interrupts(|| {
-                let mut children = parent.children.lock();
-                let at = children.iter().position(|child| child.id == process.id);
-                at.map(|at| children.remove(at))
-            });
-            drop(me);
-        }
-        hang_up(&process);
+        process.end_all(&task, status);
     }
+    leave(status)
+}
+
+/// End the current thread, with 0 written where its `clear_tid` says and a
+/// futex there woken. The last of its program's threads ends the program
+/// too: as `status` says, unless one of them ended it all, as that one's
+/// does. Its memory is freed once its thread is reaped and whoever waits for
+/// it lets go.
+fn leave(status: i32) -> ! {
+    let Some((process, task)) = thread::current_user() else { thread::exit() };
+    // Closing files can wait on the disk, and a fault comes here with
+    // interrupts off.
+    interrupts::enable();
+    let clear = task.clear_tid.swap(0, Ordering::Relaxed);
+    if clear != 0 && process.memory.lock().space.write(clear, &0u32.to_le_bytes()).is_some() {
+        futex::wake(process.id, clear, 1, futex::ANY);
+    }
+    // Interrupts off from here until the thread is switched away from for
+    // the last time: once it's out of `threads`, a thread that execs can
+    // free the page table it runs on.
+    interrupts::disable();
+    let last = {
+        let mut threads = process.threads.lock();
+        threads.retain(|other| !Arc::ptr_eq(other, &task));
+        threads.is_empty()
+    };
+    if !last {
+        process.thread_exited.wake_all();
+        drop((process, task));
+        thread::exit()
+    }
+    interrupts::enable();
+    let status = match process.ending.load(Ordering::Acquire) {
+        RUNNING | EXECING => status,
+        ending => ending,
+    };
+    // Now, not when it's freed: whoever reads its pipes waits for them
+    // to close.
+    let tree = fs::lock();
+    let files = core::mem::take(&mut *process.files.lock());
+    drop(files);
+    drop(tree);
+    process.status.store(status, Ordering::Release);
+    process.exited.wake_all();
+    let (code, how) = match status & 0x7f {
+        0 => (signal::CLD_EXITED, status >> 8),
+        signal => (signal::CLD_KILLED, signal),
+    };
+    process.notify_parent(code, how);
+    // A parent that said it won't wait for its children doesn't keep
+    // them once they've ended.
+    if let Some(parent) = process.parent.upgrade()
+        && parent.signals.reaps_children()
+    {
+        let me = interrupts::without_interrupts(|| {
+            let mut children = parent.children.lock();
+            let at = children.iter().position(|child| child.id == process.id);
+            at.map(|at| children.remove(at))
+        });
+        drop(me);
+    }
+    hang_up(&process);
+    drop((process, task));
     thread::exit()
 }
 
@@ -638,6 +879,8 @@ fn hang_up(process: &Process) {
 /// otherwise leave for the next thread to see or to clobber.
 pub struct UserState {
     pub process: Arc<Process>,
+    /// Which of the program's threads it is.
+    pub task: Arc<Task>,
     /// What the thread first enters ring 3 with.
     pub start: Registers,
     /// The program's page table.
@@ -683,14 +926,20 @@ impl UserState {
     }
 
     /// The state for a copy of this thread, which must be the running one,
-    /// running `process` on page table `pml4` from `start`: its `fs` and SSE
-    /// registers as they are now.
-    fn fork(&self, process: Arc<Process>, pml4: PhysFrame, start: Registers) -> UserState {
+    /// running `process` as `task` on page table `pml4` from `start`: its
+    /// `fs` and SSE registers as they are now.
+    fn fork(
+        &self,
+        process: Arc<Process>,
+        task: Arc<Task>,
+        pml4: PhysFrame,
+        start: Registers,
+    ) -> UserState {
         let mut fpu = FpuState::new();
         // Safety: as in `switch_out`; the CPU holds this thread's registers.
         unsafe { core::arch::asm!("fxsave64 [{}]", in(reg) &mut fpu, options(nostack)) };
         let kernel_stack_top = VirtAddr::zero();
-        UserState { process, start, pml4, kernel_stack_top, fs_base: self.fs_base, fpu }
+        UserState { process, task, start, pml4, kernel_stack_top, fs_base: self.fs_base, fpu }
     }
 
     /// Start afresh on page table `pml4`, as `exec` does, with `fs` and the
@@ -791,6 +1040,19 @@ pub struct Registers {
     /// interrupts are always on.
     pub rflags: u64,
     pub rsp: u64,
+}
+
+/// Where a program's thread first goes to ring 3, at `registers`, from
+/// `thread::start`: once it has acted on the signals it has to take, as a
+/// thread `clone` made does on Linux as the call returns. One sent SIGKILL
+/// as its program ended before it ran ends here.
+pub fn start_user(mut registers: Registers) -> ! {
+    if let Some((process, task)) = thread::current_user()
+        && signal::has_signal(&process, &task)
+    {
+        signal::deliver(process, task, &mut registers, None);
+    }
+    enter_user(registers)
 }
 
 /// Drop to ring 3 with `registers`, never to return: the program's thread

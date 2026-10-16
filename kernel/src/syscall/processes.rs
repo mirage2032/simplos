@@ -1,38 +1,204 @@
-//! System calls on programs: copying one (`fork` and the like), replacing
-//! one with another (`execve`), and waiting for copies to end (`wait4`).
+//! System calls on programs and their threads: copying one (`fork` and the
+//! like) or starting a thread of it (`clone`), replacing one with another
+//! (`execve`), waiting for copies to end (`wait4`), and the futexes its
+//! threads wait on each other with.
 
 use super::clocks;
 use super::files::{self, Result, path_at, ret, string_at};
-use super::{EFAULT, EINVAL, ENOMEM};
-use crate::process::{self, Process, Registers};
-use crate::signal::ERESTARTSYS;
+use super::{CLOCK_MONOTONIC, CLOCK_REALTIME, EFAULT, EINVAL, ENOMEM, ENOSYS};
+use super::{deadline, timespec_ms, timespec_ns};
+use crate::futex::{self, Error};
+use crate::process::{self, Process, Registers, ThreadIds};
+use crate::signal::{ERESTARTNOHAND, ERESTARTSYS};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 const E2BIG: i64 = 7;
 const ECHILD: i64 = 10;
+const EAGAIN: i64 = 11;
+const ETIMEDOUT: i64 = 110;
 
 /// What a parent is sent as its child ends, as `fork` asks.
 pub const SIGCHLD: u64 = 17;
 
 /// `fork`, `vfork`, and `clone` as C libraries use it for them: a copy of the
-/// program, which starts with `child`, on `stack` if it isn't 0.
+/// program, or with CLONE_THREAD a new thread of it, which starts with
+/// `child`, on `stack` if it isn't 0, and `fs` at `tls` with CLONE_SETTLS.
+/// Its id is written at `tids`' first, in the parent's memory, with
+/// CLONE_PARENT_SETTID; at the second, in the child's, with
+/// CLONE_CHILD_SETTID; and 0 is, there, as it ends, with
+/// CLONE_CHILD_CLEARTID, and a futex woken.
 ///
-/// shortcut: CLONE_VM is taken as a copy too, and CLONE_VFORK doesn't hold
-/// the parent until the child execs or exits; musl's `posix_spawn`, the one
-/// user, needs neither. Threads, which really share memory, come later.
-pub fn clone(process: &Arc<Process>, mut child: Registers, flags: u64, stack: u64) -> i64 {
+/// shortcut: CLONE_VM without CLONE_THREAD is taken as a copy, and
+/// CLONE_VFORK doesn't hold the parent until the child execs or exits;
+/// musl's `posix_spawn`, the one user, needs neither. And a thread shares
+/// its program's descriptors and working directory, as every libc's do:
+/// CLONE_FILES and CLONE_FS go with CLONE_THREAD, and only with it.
+pub fn clone(
+    process: &Arc<Process>,
+    mut child: Registers,
+    flags: u64,
+    stack: u64,
+    tids: [u64; 2],
+    tls: u64,
+) -> i64 {
     const CLONE_VM: u64 = 0x100;
+    const CLONE_FS: u64 = 0x200;
+    const CLONE_FILES: u64 = 0x400;
+    const CLONE_SIGHAND: u64 = 0x800;
     const CLONE_VFORK: u64 = 0x4000;
+    const CLONE_THREAD: u64 = 0x1_0000;
+    const CLONE_SYSVSEM: u64 = 0x4_0000;
+    const CLONE_SETTLS: u64 = 0x8_0000;
+    const CLONE_PARENT_SETTID: u64 = 0x10_0000;
+    const CLONE_CHILD_CLEARTID: u64 = 0x20_0000;
+    const CLONE_DETACHED: u64 = 0x40_0000;
+    const CLONE_CHILD_SETTID: u64 = 0x100_0000;
     // The low byte: what the parent is sent as the child ends.
     const SIGNAL: u64 = 0xFF;
-    if flags & !(CLONE_VM | CLONE_VFORK | SIGNAL) != 0 {
+    const SHARED: u64 = CLONE_FS | CLONE_FILES | CLONE_SIGHAND;
+    let known = CLONE_VM
+        | SHARED
+        | CLONE_VFORK
+        | CLONE_THREAD
+        | CLONE_SYSVSEM
+        | CLONE_SETTLS
+        | CLONE_PARENT_SETTID
+        | CLONE_CHILD_CLEARTID
+        | CLONE_DETACHED
+        | CLONE_CHILD_SETTID
+        | SIGNAL;
+    let has = |flag: u64| flags & flag != 0;
+    let thread = has(CLONE_THREAD);
+    // As Linux: a thread shares its handlers, and handlers are for memory.
+    let linux = !(thread && !has(CLONE_SIGHAND) || has(CLONE_SIGHAND) && !has(CLONE_VM));
+    let shared = if thread { flags & SHARED == SHARED } else { flags & SHARED == 0 };
+    if flags & !known != 0 || !linux || !shared {
         return -EINVAL;
     }
     if stack != 0 {
         child.rsp = stack;
     }
-    process::fork(process, child).map_or(-ENOMEM, |id| id as i64)
+    let ids = ThreadIds {
+        parent: if has(CLONE_PARENT_SETTID) { tids[0] } else { 0 },
+        child: if has(CLONE_CHILD_SETTID) { tids[1] } else { 0 },
+        clear: if has(CLONE_CHILD_CLEARTID) { tids[1] } else { 0 },
+    };
+    let tls = has(CLONE_SETTLS).then_some(tls);
+    if thread {
+        return ret(process::spawn_thread(process, child, tls, ids).map(|id| id as i64));
+    }
+    process::fork(process, child, tls, ids).map_or(-ENOMEM, |id| id as i64)
+}
+
+/// `futex`: on the 32-bit word at `addr`, `op` says what, of what
+/// `futex.rs` does: wait while it's `value`, with `timeout` the `struct
+/// timespec` there, if it isn't 0, for how long, or with FUTEX_WAIT_BITSET
+/// until when, by CLOCK_MONOTONIC or with FUTEX_CLOCK_REALTIME by that;
+/// wake up to `value` waiters; or wake them and move up to `timeout`'s
+/// value more to `addr2`, if the word is `value3` for FUTEX_CMP_REQUEUE.
+/// The bitset ops' is `value3`. FUTEX_PRIVATE_FLAG is taken, as every
+/// futex here is private.
+///
+/// shortcut: a wait for a while that a signal ends starts again from the
+/// beginning, where Linux waits for what's left; and no priority-inheriting
+/// futexes, nor FUTEX_WAKE_OP, which musl and Rust don't use.
+pub fn futex(
+    process: &Process,
+    addr: u64,
+    op: u64,
+    value: u64,
+    timeout: u64,
+    addr2: u64,
+    value3: u64,
+) -> i64 {
+    const FUTEX_WAIT: u64 = 0;
+    const FUTEX_WAKE: u64 = 1;
+    const FUTEX_REQUEUE: u64 = 3;
+    const FUTEX_CMP_REQUEUE: u64 = 4;
+    const FUTEX_WAIT_BITSET: u64 = 9;
+    const FUTEX_WAKE_BITSET: u64 = 10;
+    const FUTEX_PRIVATE_FLAG: u64 = 128;
+    const FUTEX_CLOCK_REALTIME: u64 = 256;
+    let command = op & !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
+    let realtime = op & FUTEX_CLOCK_REALTIME != 0;
+    let waits = command == FUTEX_WAIT || command == FUTEX_WAIT_BITSET;
+    let known =
+        [FUTEX_WAKE, FUTEX_REQUEUE, FUTEX_CMP_REQUEUE, FUTEX_WAKE_BITSET].contains(&command);
+    if !waits && !known || realtime && !waits {
+        return -ENOSYS;
+    }
+    if !addr.is_multiple_of(4) {
+        return -EINVAL;
+    }
+    let (value, value3) = (value as u32, value3 as u32);
+    let bitset = match command {
+        FUTEX_WAIT_BITSET | FUTEX_WAKE_BITSET if value3 == 0 => return -EINVAL,
+        FUTEX_WAIT_BITSET | FUTEX_WAKE_BITSET => value3,
+        _ => futex::ANY,
+    };
+    let errno = |error: Error| match error {
+        Error::Again => EAGAIN,
+        Error::Fault => EFAULT,
+        Error::TimedOut => ETIMEDOUT,
+        Error::Interrupted if timeout != 0 => ERESTARTNOHAND,
+        Error::Interrupted => ERESTARTSYS,
+    };
+    match command {
+        FUTEX_WAIT | FUTEX_WAIT_BITSET => {
+            let ms = match (timeout, command) {
+                (0, _) => None,
+                (at, FUTEX_WAIT) => Some(timespec_ms(process, at)),
+                (at, _) => {
+                    let clock = if realtime { CLOCK_REALTIME } else { CLOCK_MONOTONIC };
+                    Some(timespec_ns(process, at).and_then(|until| {
+                        let now = clocks::now(process, clock)?;
+                        Ok(until.saturating_sub(now).div_ceil(1_000_000))
+                    }))
+                }
+            };
+            let ms = match ms.transpose() {
+                Ok(ms) => ms,
+                Err(errno) => return -errno,
+            };
+            match futex::wait(process, addr, value, deadline(ms), bitset) {
+                Ok(()) => 0,
+                Err(error) => -errno(error),
+            }
+        }
+        // As Linux does, it wakes one if asked for none.
+        FUTEX_WAKE | FUTEX_WAKE_BITSET => {
+            futex::wake(process.id, addr, (value as i32).max(1) as usize, bitset) as i64
+        }
+        _ => {
+            // The second count comes where a wait's timeout does.
+            let (count, moved) = (value as i32, timeout as i32);
+            if count < 0 || moved < 0 || !addr2.is_multiple_of(4) {
+                return -EINVAL;
+            }
+            let expected = (command == FUTEX_CMP_REQUEUE).then_some(value3);
+            let requeued =
+                futex::requeue(process, addr, count as usize, addr2, moved as usize, expected);
+            requeued.map_or_else(|error| -errno(error), |count| count as i64)
+        }
+    }
+}
+
+/// `membarrier`: with one CPU, each of a program's threads has seen what the
+/// others wrote by the time it runs again, so every barrier asked for is
+/// already made. QUERY says which there are; musl registers for the private
+/// expedited one as it starts its first thread.
+pub fn membarrier(command: u64, flags: u64) -> i64 {
+    const QUERY: u64 = 0;
+    // GLOBAL, GLOBAL_EXPEDITED and its REGISTER, PRIVATE_EXPEDITED and its
+    // REGISTER.
+    const SUPPORTED: u64 = 0b1_1111;
+    match command {
+        _ if flags != 0 => -EINVAL,
+        QUERY => SUPPORTED as i64,
+        command if command & SUPPORTED == command && command.is_power_of_two() => 0,
+        _ => -EINVAL,
+    }
 }
 
 /// Replace the program with the one at `path`, given the `argv` and `envp`

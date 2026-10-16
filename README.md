@@ -180,6 +180,23 @@ disk has the user program as `/bin/probe` (a `disk.img` made before this
 doesn't: delete it), so in the shell, `run spawn /bin/probe hello` has it
 run itself again.
 
+A program can have threads, as on Linux (`process.rs`): `clone` with
+`CLONE_THREAD`, as musl's `pthread_create` and so Rust's `std::thread` ask
+for it, starts one that shares all of the program, its memory, descriptors,
+working directory and signal handlers, with an id (`gettid`), `fs`, SSE
+registers, signal mask and alternate stack of its own. Its threads wait on
+each other with `futex` (`futex.rs`): waits, wakes and requeues, timed or
+not, with bitsets, which musl's and Rust's mutexes, condition variables and
+`pthread_join` are made of; as a thread ends, `clone`'s
+`CLONE_CHILD_CLEARTID` or `set_tid_address` has 0 written to where it said
+and a futex there woken. `exit` ends one thread, and the program once it's
+the last; `exit_group`, a fault or a fatal signal ends them all. A thread
+that calls `execve` takes the program over, its other threads ended, and a
+thread that forks makes a copy with just itself. A signal for the program
+goes to a thread that doesn't block it, `tkill` and `tgkill` to the one
+named, and SIGSTOP stops them all. `membarrier` has nothing to wait for on
+one CPU. The scheduler gives each thread its turns, as it does each program.
+
 A program can ask what it runs on: `uname` says Linux, the interface it's
 talking to, with simplos as the host and in the version; `sched_getaffinity`
 gives it the one CPU; `sysinfo` how long it's been up, how much memory there
@@ -206,9 +223,16 @@ its hash maps' keys, and `/dev/random` and `/dev/urandom` give random bytes
 
 - `fork` copies all of a program's memory at once, rather than sharing it
   until either side writes to it;
-- `clone` makes no threads: asked to share memory (`CLONE_VM`), it copies it
-  too, which is all `posix_spawn` needs, and `CLONE_VFORK` doesn't hold the
-  parent back;
+- `clone` without `CLONE_THREAD` copies the program even when asked to share
+  its memory (`CLONE_VM`), which is all `posix_spawn` needs, and
+  `CLONE_VFORK` doesn't hold the parent back; a thread shares its
+  program's descriptors and working directory, as every libc's do
+  (`CLONE_FILES` and `CLONE_FS` go with `CLONE_THREAD`, and only with it);
+- a futex is its program's alone, as `FUTEX_PRIVATE_FLAG`'s are; there are
+  no priority-inheriting ones, nor `FUTEX_WAKE_OP`, nor robust lists, which
+  musl keeps itself; and a timed wait that a signal ends starts its time
+  again;
+- there's no `/proc/PID/task`, and a thread's CPU time is its program's;
 - a program that ended keeps its memory until it's waited for, and those
   never waited for go with their parent rather than to an init;
 - `execve` reads all of a program's segments into memory as it starts it,
@@ -264,8 +288,8 @@ until ^D. For now:
 
 ## Signals
 
-Signals are Linux's (`signal.rs`): a program sends them with `kill`, `tkill`
-and `tgkill`, to a process or a process group; its terminal sends ^C's
+Signals are Linux's (`signal.rs`): a program sends them with `kill`, to a
+process or a process group, and with `tkill` and `tgkill`, to a thread; its terminal sends ^C's
 SIGINT, ^\'s SIGQUIT and ^Z's SIGTSTP to the group in its foreground; and
 the kernel sends SIGCHLD as a child ends, stops or continues, and SIGPIPE
 as a pipe no one reads is written. Each does what the program asked with

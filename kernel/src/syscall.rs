@@ -20,7 +20,7 @@ use crate::fs::Handle;
 use crate::io::interrupts::gdt;
 use crate::io::interrupts::pit::TIMER_HZ;
 use crate::memory::USER_END;
-use crate::process::{self, LOWEST, MMAP_END, MMAP_START, Process, Registers, pages};
+use crate::process::{self, LOWEST, MMAP_END, MMAP_START, Process, Registers, Task, pages};
 use crate::signal::{self, ERESTARTNOHAND, Syscall};
 use crate::{serial_println, thread};
 use alloc::vec;
@@ -197,13 +197,14 @@ extern "sysv64" fn dispatch(frame: &Frame) -> i64 {
     // Signals to take before going back, or a call one ended to start
     // again: then back by `iretq`, which `sysret` can't do with every
     // register a handler's frame puts back.
-    if let Some(process) = thread::current_process()
-        && (process.signals.has_signal()
+    if let Some((process, task)) = thread::current_user()
+        && (signal::has_signal(&process, &task)
             || result == -signal::ERESTARTSYS
             || result == -ERESTARTNOHAND)
     {
         let mut registers = frame.registers(result as u64);
-        signal::deliver(process, &mut registers, Some(Syscall { number: frame.nr, result }));
+        let call = Some(Syscall { number: frame.nr, result });
+        signal::deliver(process, task, &mut registers, call);
         process::enter_user(registers);
     }
     interrupts::disable();
@@ -211,7 +212,7 @@ extern "sysv64" fn dispatch(frame: &Frame) -> i64 {
 }
 
 fn call(frame: &Frame) -> i64 {
-    let process = thread::current_process().expect("system calls come from programs");
+    let (process, task) = thread::current_user().expect("system calls come from programs");
     let [a0, a1, a2, a3, a4, a5] = [frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9];
     match frame.nr {
         0 => files::read(&process, a0, a1, a2),
@@ -231,14 +232,14 @@ fn call(frame: &Frame) -> i64 {
         11 => munmap(&process, a0, a1),
         12 => brk(&process, a0),
         13 => signals::rt_sigaction(&process, a0, a1, a2, a3),
-        14 => signals::rt_sigprocmask(&process, a0, a1, a2, a3),
-        15 => match signal::sigreturn(&process, frame.rsp) {
+        14 => signals::rt_sigprocmask(&process, &task, a0, a1, a2, a3),
+        15 => match signal::sigreturn(&process, &task, frame.rsp) {
             Some(mut registers) => {
-                signal::deliver(process, &mut registers, None);
+                signal::deliver(process, task, &mut registers, None);
                 process::enter_user(registers)
             }
             None => {
-                drop(process);
+                drop((process, task));
                 process::kill_current(signal::SIGSEGV)
             }
         },
@@ -262,28 +263,32 @@ fn call(frame: &Frame) -> i64 {
         25 => mremap(&process, a0, a1, a2, a3, a4),
         32 => files::dup(&process, a0),
         33 => files::dup3(&process, a0, a1, 0, true),
-        34 => signals::pause(&process),
+        34 => signals::pause(&task),
         35 => clock_nanosleep(&process, CLOCK_MONOTONIC, 0, a0, a1),
         36 => clocks::getitimer(&process, a0, a1),
         37 => clocks::alarm(&process, a0),
         38 => clocks::setitimer(&process, a0, a1, a2),
         39 => process.id as i64,
         40 => files::sendfile(&process, a0, a1, a2, a3),
-        // The copy starts as the call returns, with 0 its result.
-        56 => processes::clone(&process, frame.registers(0), a0, a1),
+        // The copy or the new thread starts as the call returns, with 0
+        // its result.
+        56 => processes::clone(&process, frame.registers(0), a0, a1, [a2, a3], a4),
         // fork, vfork.
-        57 | 58 => processes::clone(&process, frame.registers(0), processes::SIGCHLD, 0),
+        57 | 58 => processes::clone(&process, frame.registers(0), processes::SIGCHLD, 0, [0; 2], 0),
         59 => match processes::execve(&process, a0, a1, a2) {
             Ok(mut registers) => {
                 // Nothing on this stack is ever dropped: `deliver` lets go.
-                signal::deliver(process, &mut registers, None);
+                signal::deliver(process, task, &mut registers, None);
                 process::enter_user(registers)
             }
             Err(errno) => -errno,
         },
-        // exit, exit_group: one thread per program, so the same.
-        60 | 231 => {
-            drop(process);
+        60 => {
+            drop((process, task));
+            process::exit_thread(a0 as i32)
+        }
+        231 => {
+            drop((process, task));
             process::exit_current(a0 as i32)
         }
         61 => processes::wait4(&process, a0, a1, a2, a3),
@@ -322,13 +327,13 @@ fn call(frame: &Frame) -> i64 {
         115 | 116 => system::groups(a0),
         121 => signals::getpgid(&process, a0),
         124 => signals::getsid(&process, a0),
-        127 => signals::rt_sigpending(&process, a0, a1),
-        130 => signals::rt_sigsuspend(&process, a0, a1),
+        127 => signals::rt_sigpending(&process, &task, a0, a1),
+        130 => signals::rt_sigsuspend(&process, &task, a0, a1),
         // fsync, fdatasync.
         74 | 75 => files::fsync(&process, a0),
         76 => files::truncate(&process, a0, a1),
         77 => files::ftruncate(&process, a0, a1),
-        131 => signals::sigaltstack(&process, a0, a1, frame.rsp),
+        131 => signals::sigaltstack(&process, &task, a0, a1, frame.rsp),
         137 => files::statfs(&process, a0, a1),
         138 => files::fstatfs(&process, a0, a1),
         140 => system::getpriority(&process, a0, a1),
@@ -336,14 +341,18 @@ fn call(frame: &Frame) -> i64 {
         158 => arch_prctl(&process, a0, a1),
         160 => system::prlimit(&process, 0, a0, a1, 0),
         162 => files::sync(),
-        // gettid: one thread per program, so its id is the program's.
-        186 => process.id as i64,
-        // set_tid_address: nothing to clear at exit with one thread per program.
+        186 => task.id() as i64,
         200 => signals::tkill(&process, None, a0, a1),
         201 => clocks::time(&process, a0),
+        202 => processes::futex(&process, a0, a1, a2, a3, a4, a5),
         204 => system::sched_getaffinity(&process, a0, a1, a2),
         217 => files::getdents64(&process, a0, a1, a2),
-        218 => process.id as i64,
+        // set_tid_address: where to write 0 and wake a futex as the thread
+        // ends; its id.
+        218 => {
+            task.clear_tid.store(a0, Ordering::Relaxed);
+            task.id() as i64
+        }
         228 => clocks::clock_gettime(&process, a0, a1),
         229 => clocks::clock_getres(&process, a0, a1),
         230 => clock_nanosleep(&process, a0, a1, a2, a3),
@@ -359,8 +368,8 @@ fn call(frame: &Frame) -> i64 {
         267 => files::readlinkat(&process, a0, a1, a2, a3),
         268 => files::fchmodat(&process, a0, a1, a2),
         269 => files::faccessat(&process, a0, a1, a2, 0),
-        270 => pselect6(&process, a0, [a1, a2, a3], a4, a5),
-        271 => ppoll(&process, a0, a1, a2, a3, a4),
+        270 => pselect6(&process, &task, a0, [a1, a2, a3], a4, a5),
+        271 => ppoll(&process, &task, a0, a1, a2, a3, a4),
         280 => files::utimensat(&process, a0, a1, a2, a3),
         292 => files::dup3(&process, a0, a1, a2, false),
         293 => files::pipe2(&process, a0, a1),
@@ -369,6 +378,7 @@ fn call(frame: &Frame) -> i64 {
         306 => files::fsync(&process, a0),
         316 => files::renameat2(&process, a0, a1, a2, a3, a4),
         318 => system::getrandom(&process, a0, a1, a2),
+        324 => processes::membarrier(a0, a1),
         439 => files::faccessat(&process, a0, a1, a2, a3),
         _ => {
             serial_println!("simplos: process {}: no system call {}", process.id, frame.nr);
@@ -468,7 +478,15 @@ fn poll(process: &Process, fds: u64, count: u64, timeout: Option<u64>) -> i64 {
 /// given, `size` bytes long. So a program can block a signal, check for it,
 /// then wait for it or for input without missing it, as busybox's shells
 /// do in `read`.
-fn ppoll(process: &Process, fds: u64, count: u64, timeout: u64, mask: u64, size: u64) -> i64 {
+fn ppoll(
+    process: &Process,
+    task: &Task,
+    fds: u64,
+    count: u64,
+    timeout: u64,
+    mask: u64,
+    size: u64,
+) -> i64 {
     let ms = match timeout {
         0 => None,
         timeout => match timespec_ms(process, timeout) {
@@ -476,13 +494,13 @@ fn ppoll(process: &Process, fds: u64, count: u64, timeout: u64, mask: u64, size:
             Err(errno) => return -errno,
         },
     };
-    masked(process, mask, size, || poll(process, fds, count, ms))
+    masked(process, task, mask, size, || poll(process, fds, count, ms))
 }
 
 /// Run `wait`, a call that waits, with the signals in the set at `mask`
-/// blocked instead, if it's given, `size` bytes long, as `ppoll` and
-/// `pselect6` wait.
-fn masked(process: &Process, mask: u64, size: u64, wait: impl FnOnce() -> i64) -> i64 {
+/// blocked instead for `task`, the current thread, if it's given, `size`
+/// bytes long, as `ppoll` and `pselect6` wait.
+fn masked(process: &Process, task: &Task, mask: u64, size: u64, wait: impl FnOnce() -> i64) -> i64 {
     if mask == 0 {
         return wait();
     }
@@ -493,12 +511,12 @@ fn masked(process: &Process, mask: u64, size: u64, wait: impl FnOnce() -> i64) -
     if process.memory.lock().space.read(mask, &mut set).is_none() {
         return -EFAULT;
     }
-    process.signals.suspend_with(u64::from_le_bytes(set));
+    task.signals.suspend_with(u64::from_le_bytes(set));
     let ready = wait();
     // Ended by a signal, `deliver` puts the mask back: after the handler,
     // which its frame tells, or before starting the call again.
     if ready != -ERESTARTNOHAND {
-        process.signals.end_suspend();
+        task.signals.end_suspend();
     }
     ready
 }
@@ -559,7 +577,14 @@ fn select(process: &Process, count: u64, sets: [u64; 3], timeout: Option<u64>) -
 /// `select`, with its timeout a `struct timespec` at `timeout`, or none;
 /// and while it waits, the signals blocked those of the set the pair at
 /// `mask` names, its address and size, if it's given, as for `ppoll`.
-fn pselect6(process: &Process, count: u64, sets: [u64; 3], timeout: u64, mask: u64) -> i64 {
+fn pselect6(
+    process: &Process,
+    task: &Task,
+    count: u64,
+    sets: [u64; 3],
+    timeout: u64,
+    mask: u64,
+) -> i64 {
     let ms = match timeout {
         0 => None,
         timeout => match timespec_ms(process, timeout) {
@@ -572,7 +597,7 @@ fn pselect6(process: &Process, count: u64, sets: [u64; 3], timeout: u64, mask: u
         return -EFAULT;
     }
     let word = |at: usize| u64::from_le_bytes(pair[at..at + 8].try_into().unwrap());
-    masked(process, word(0), word(8), || select(process, count, sets, ms))
+    masked(process, task, word(0), word(8), || select(process, count, sets, ms))
 }
 
 const PROT_WRITE: u64 = 2;
