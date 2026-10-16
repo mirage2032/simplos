@@ -69,15 +69,18 @@ runs:
         name: ${{ steps.key.outputs.artifact }}
         run-id: ${{ steps.built.outputs.run }}
         github-token: ${{ github.token }}
-        path: ${{ runner.temp }}
+        path: ${{ runner.temp }}/tree
     - if: inputs.mode == 'build' && steps.built.outputs.run != ''
       shell: bash
       env:
+        NAME: ${{ inputs.name }}
         ARTIFACT: ${{ steps.key.outputs.artifact }}
       run: |
         mkdir -p target
-        tar -C target -I zstd -xf "$RUNNER_TEMP/$ARTIFACT"
-        rm "$RUNNER_TEMP/$ARTIFACT"
+        find "$RUNNER_TEMP/tree" -type f -name "$ARTIFACT" -exec tar -C target -I zstd -xf {} \;
+        rm -rf "$RUNNER_TEMP/tree"
+        # What the script would have built, as its stamp says.
+        [[ $(cat "target/$NAME/built") == $(sha256sum "scripts/$NAME.sh" | cut -d' ' -f1) ]]
 
     # Or build it, with an older build's downloads if there is one.
     - if: inputs.mode == 'build' && steps.built.outputs.run == ''

@@ -99,7 +99,8 @@ jobs:
         with:
           ref: ${{ inputs.ref }}
 
-      - uses: ./.github/actions/cargo
+      - name: Set up Rust
+        uses: ./.github/actions/cargo
         with:
           cache: lint
           targets: |
@@ -148,9 +149,11 @@ jobs:
         working-directory: fs/ext4
         run: cargo test
 
-      - uses: ./.github/actions/cargo/save
+      - name: Save the cargo cache
+        uses: ./.github/actions/cargo/save
 
-      - uses: ./.github/actions/passed
+      - name: Record the pass
+        uses: ./.github/actions/passed
         with:
           key: ${{ fromJSON(needs.plan.outputs.keys).lint }}
 
@@ -187,6 +190,7 @@ jobs:
 
       # busybox, uutils, zsh and vim, for tests/shells.rs. uutils is Rust.
       - if: steps.userland.outputs.cache-hit != 'true'
+        name: Set up Rust
         uses: ./.github/actions/cargo
       - if: steps.userland.outputs.cache-hit != 'true'
         name: Build the userland
@@ -239,7 +243,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y qemu-system-x86
 
-      - uses: ./.github/actions/cargo
+      - name: Set up Rust
+        uses: ./.github/actions/cargo
         with:
           cache: test
           targets: |
@@ -247,13 +252,16 @@ jobs:
             tools/boot-test/target
             vendor/bootloader/target
 
-      - uses: ./.github/actions/tree
+      - name: Restore the userland
+        uses: ./.github/actions/tree
         with:
           name: userland
-      - uses: ./.github/actions/tree
+      - name: Restore GCC
+        uses: ./.github/actions/tree
         with:
           name: toolchain
       - if: matrix.half == 'rust'
+        name: Restore Rust
         uses: ./.github/actions/tree
         with:
           name: rust
@@ -281,9 +289,11 @@ jobs:
 
       # Both halves build the same, but one cache is enough.
       - if: matrix.half == 'kernel'
+        name: Save the cargo cache
         uses: ./.github/actions/cargo/save
 
-      - uses: ./.github/actions/passed
+      - name: Record the pass
+        uses: ./.github/actions/passed
         with:
           key: ${{ fromJSON(needs.plan.outputs.keys)[format('test-{0}', matrix.half)] }}
 
@@ -303,27 +313,32 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y qemu-system-x86 qemu-utils
 
-      - uses: ./.github/actions/cargo
+      - name: Set up Rust
+        uses: ./.github/actions/cargo
         with:
           cache: images
           targets: |
             fullkernel/target
             vendor/bootloader/target
 
-      - uses: ./.github/actions/tree
+      - name: Restore the userland
+        uses: ./.github/actions/tree
         with:
           name: userland
-      - uses: ./.github/actions/tree
+      - name: Restore GCC
+        uses: ./.github/actions/tree
         with:
           name: toolchain
-      - uses: ./.github/actions/tree
+      - name: Restore Rust
+        uses: ./.github/actions/tree
         with:
           name: rust
 
       - name: Build the images
         run: scripts/build-images.sh
 
-      - uses: ./.github/actions/cargo/save
+      - name: Save the cargo cache
+        uses: ./.github/actions/cargo/save
 
       # Boots both images for real and checks the kernel's own boot banner —
       # the firmware it came up under and the framebuffer mode it settled on —
@@ -342,7 +357,8 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      - uses: ./.github/actions/passed
+      - name: Record the pass
+        uses: ./.github/actions/passed
         with:
           key: ${{ fromJSON(needs.plan.outputs.keys).images }}
 

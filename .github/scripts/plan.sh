@@ -10,9 +10,9 @@
 # nor develop after merging a pull request that passed it. Only artifacts of
 # this repository's own runs count; a fork's pull request could upload any.
 #
-# Not on develop, though, if the job's cargo cache isn't there: pull requests
-# only read the caches develop's runs save, so the runs on develop that keep
-# them have to run the jobs that save them.
+# On develop, and in a promotion, a job runs anyway if its cargo cache isn't
+# there: pull requests only read the caches develop's runs save, so it's
+# develop's runs that have to run the jobs that save them.
 #
 # Reads JOBS, a line for each job: its name, the cargo cache it saves (- for
 # none) and the paths it depends on; and COMMON, the paths all of them do.
@@ -54,7 +54,7 @@ while read -r job cache paths; do
             --jq "[.actions_caches[] | select(.key == \"$cargo\")] | length") == 0 ]]; then
         runs=true why="passed in run $passed, but $GITHUB_REF hasn't its cargo cache, $cargo, yet"
     else
-        runs=false why="passed in [run $passed]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$passed) on the same"
+        runs=false why="passed with the same in [run $passed]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$passed)"
     fi
     echo "$job: $runs, as $why ($key)"
     keys=$(jq -c --arg job "$job" --arg key "$key" '.[$job] = $key' <<<"$keys")

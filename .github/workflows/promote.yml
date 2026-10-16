@@ -83,7 +83,8 @@ jobs:
 
       # As ci.yml's images job builds, and from its cargo cache, which it only
       # reads.
-      - uses: ./.github/actions/cargo
+      - name: Set up Rust
+        uses: ./.github/actions/cargo
         with:
           cache: images
           targets: |
@@ -140,13 +141,16 @@ jobs:
 
       # The userland, GCC and Rust go on the ext4 disk; the check's trees job
       # has just made sure they're cached.
-      - uses: ./.github/actions/tree
+      - name: Restore the userland
+        uses: ./.github/actions/tree
         with:
           name: userland
-      - uses: ./.github/actions/tree
+      - name: Restore GCC
+        uses: ./.github/actions/tree
         with:
           name: toolchain
-      - uses: ./.github/actions/tree
+      - name: Restore Rust
+        uses: ./.github/actions/tree
         with:
           name: rust
 
