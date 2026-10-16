@@ -228,13 +228,23 @@ const TEST_LIMIT_SECONDS: u64 = 30;
 /// The tick the test running has to be done by; 0 between tests.
 static TEST_DEADLINE: AtomicU64 = AtomicU64::new(0);
 
+/// Give the test running `seconds` more than `TEST_LIMIT_SECONDS`: for the
+/// few that do a lot under emulation, as compiling with GCC does.
+pub fn take_longer(seconds: u64) {
+    let deadline = TEST_DEADLINE.load(Ordering::Relaxed);
+    if deadline != 0 {
+        let more = seconds * u64::from(io::interrupts::pit::TIMER_HZ);
+        TEST_DEADLINE.store(deadline + more, Ordering::Relaxed);
+    }
+}
+
 /// Called as the timer ticks: a test past its deadline fails there and then,
 /// rather than hanging until boot-test gives up on its kernel.
 pub fn check_test_deadline(now: u64) {
     let deadline = TEST_DEADLINE.load(Ordering::Relaxed);
     if deadline != 0 && now >= deadline {
         serial_println!("[failed]\n");
-        serial_println!("Error: not done after {} s\n", TEST_LIMIT_SECONDS);
+        serial_println!("Error: not done after {} s, or as long as it asked\n", TEST_LIMIT_SECONDS);
         exit_qemu(QemuExitCode::Failed);
     }
 }
