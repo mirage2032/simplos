@@ -113,3 +113,111 @@ int main() {
     );
     assert_eq!(sh("cd /tmp && g++ -O2 -o hello hello.cc && ./hello"), ok("hello from g++ 3\n"));
 }
+
+#[test_case]
+fn gcc_compiles_threads_that_run() {
+    // musl's pthreads, as a C program uses them: four threads under a
+    // mutex, joined for what they return; a detached one that posts a
+    // semaphore; pthread_kill, to a thread that sleeps until its handler
+    // runs; and pthread_cancel, of one in pthread_cond_wait, which musl does
+    // with a signal whose handler moves it out of the futex's system call.
+    simplos::take_longer(270);
+    write(
+        "tmp/threads.c",
+        r#"#include <pthread.h>
+#include <semaphore.h>
+#include <signal.h>
+#include <stdio.h>
+#include <unistd.h>
+
+static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t changed = PTHREAD_COND_INITIALIZER;
+static long total;
+static int waiting;
+static sem_t posted;
+static volatile sig_atomic_t poked;
+
+static void *add(void *arg) {
+    long n = (long)arg;
+    for (int i = 0; i < 10000; i++) {
+        pthread_mutex_lock(&lock);
+        total += n;
+        pthread_mutex_unlock(&lock);
+    }
+    return (void *)(n * 2);
+}
+
+static void *post(void *arg) {
+    (void)arg;
+    sem_post(&posted);
+    return 0;
+}
+
+static void poke(int signal) {
+    (void)signal;
+    poked = 1;
+}
+
+static void *sleep_until_poked(void *arg) {
+    (void)arg;
+    while (!poked)
+        usleep(1000);
+    return (void *)1;
+}
+
+static void *wait_forever(void *arg) {
+    (void)arg;
+    pthread_mutex_lock(&lock);
+    waiting = 1;
+    pthread_cond_signal(&changed);
+    for (;;)
+        pthread_cond_wait(&changed, &lock);
+    return 0;
+}
+
+int main(void) {
+    pthread_t threads[4];
+    long joined = 0;
+    for (long i = 0; i < 4; i++)
+        pthread_create(&threads[i], 0, add, (void *)(i + 1));
+    for (int i = 0; i < 4; i++) {
+        void *got;
+        pthread_join(threads[i], &got);
+        joined += (long)got;
+    }
+    printf("total %ld, joined %ld\n", total, joined);
+
+    sem_init(&posted, 0, 0);
+    pthread_attr_t detached;
+    pthread_attr_init(&detached);
+    pthread_attr_setdetachstate(&detached, PTHREAD_CREATE_DETACHED);
+    pthread_t poster;
+    pthread_create(&poster, &detached, post, 0);
+    sem_wait(&posted);
+    printf("posted\n");
+
+    signal(SIGUSR1, poke);
+    pthread_t sleeper;
+    void *slept;
+    pthread_create(&sleeper, 0, sleep_until_poked, 0);
+    pthread_kill(sleeper, SIGUSR1);
+    pthread_join(sleeper, &slept);
+    printf("poked %ld\n", (long)slept);
+
+    pthread_t waiter;
+    void *how;
+    pthread_create(&waiter, 0, wait_forever, 0);
+    pthread_mutex_lock(&lock);
+    while (!waiting)
+        pthread_cond_wait(&changed, &lock);
+    pthread_mutex_unlock(&lock);
+    pthread_cancel(waiter);
+    pthread_join(waiter, &how);
+    printf("cancelled %d\n", how == PTHREAD_CANCELED);
+    return 0;
+}
+"#,
+    );
+    let script = "cd /tmp && gcc -O2 -Wall -pthread -o threads threads.c && ./threads";
+    assert_eq!(sh(script), ok("total 100000, joined 20\nposted\npoked 1\ncancelled 1\n"));
+}

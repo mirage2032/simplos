@@ -4,7 +4,7 @@
 
 use super::files::{Result, ret};
 use super::{EFAULT, EINVAL, EPERM};
-use crate::process::{self, Process};
+use crate::process::{self, Process, Task};
 use crate::signal::{self, Action, AltStack, COUNT, ERESTARTNOHAND, Info, SI_TKILL};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -53,14 +53,22 @@ pub fn rt_sigaction(process: &Process, signal: u64, new: u64, old: u64, size: u6
             process.memory.lock().space.write(old, &bytes).ok_or(EFAULT)?;
         }
         if new != 0 {
-            process.signals.set_action(signal, Action::from_bytes(&action));
+            signal::set_action(process, signal, Action::from_bytes(&action));
         }
         Ok(0)
     })())
 }
 
-/// Block more signals, fewer, or just these; and say which were.
-pub fn rt_sigprocmask(process: &Process, how: u64, new: u64, old: u64, size: u64) -> i64 {
+/// Block more signals, fewer, or just these, for `task`, the current thread;
+/// and say which were.
+pub fn rt_sigprocmask(
+    process: &Process,
+    task: &Task,
+    how: u64,
+    new: u64,
+    old: u64,
+    size: u64,
+) -> i64 {
     const SIG_BLOCK: u64 = 0;
     const SIG_UNBLOCK: u64 = 1;
     const SIG_SETMASK: u64 = 2;
@@ -68,7 +76,7 @@ pub fn rt_sigprocmask(process: &Process, how: u64, new: u64, old: u64, size: u64
         if size != SET_SIZE {
             return Err(EINVAL);
         }
-        let blocked = process.signals.blocked();
+        let blocked = task.signals.blocked();
         let mask = match new {
             0 => None,
             new => Some(read_set(process, new)?),
@@ -83,23 +91,25 @@ pub fn rt_sigprocmask(process: &Process, how: u64, new: u64, old: u64, size: u64
         if old != 0 {
             write_set(process, old, blocked)?;
         }
-        process.signals.set_blocked(blocked_now);
+        task.signals.set_blocked(blocked_now);
         Ok(0)
     })())
 }
 
-/// The signals sent and not yet taken: those blocked, as any other would
-/// have been taken as the call that unblocked it returned.
-pub fn rt_sigpending(process: &Process, set: u64, size: u64) -> i64 {
+/// The signals sent to `task`, the current thread, or to its program, and
+/// not yet taken: those blocked, as any other would have been taken as the
+/// call that unblocked it returned.
+pub fn rt_sigpending(process: &Process, task: &Task, set: u64, size: u64) -> i64 {
     if size != SET_SIZE {
         return -EINVAL;
     }
-    ret(write_set(process, set, process.signals.pending()).map(|()| 0))
+    let pending = process.signals.pending() | task.signals.pending();
+    ret(write_set(process, set, pending).map(|()| 0))
 }
 
 /// Block just `mask` and wait for a signal; once its handler has run, what
 /// was blocked before is again. Returns EINTR, then.
-pub fn rt_sigsuspend(process: &Process, mask: u64, size: u64) -> i64 {
+pub fn rt_sigsuspend(process: &Process, task: &Task, mask: u64, size: u64) -> i64 {
     if size != SET_SIZE {
         return -EINVAL;
     }
@@ -107,13 +117,14 @@ pub fn rt_sigsuspend(process: &Process, mask: u64, size: u64) -> i64 {
         Ok(mask) => mask,
         Err(errno) => return -errno,
     };
-    process.signals.suspend_with(mask);
-    pause(process)
+    task.signals.suspend_with(mask);
+    pause(task)
 }
 
-/// Wait for a signal: one whose handler runs ends it, with EINTR.
-pub fn pause(process: &Process) -> i64 {
-    let _ = process.signals.arrived.wait_until_interruptible(|| false);
+/// Wait for a signal for `task`, the current thread: one whose handler runs
+/// ends it, with EINTR.
+pub fn pause(task: &Task) -> i64 {
+    let _ = task.signals.arrived.wait_until_interruptible(|| false);
     -ERESTARTNOHAND
 }
 
@@ -122,11 +133,12 @@ const SS_ONSTACK: u64 = 1;
 const SS_DISABLE: u64 = 2;
 const SS_AUTODISARM: u64 = 1 << 31;
 
-/// Where handlers that ask to run on another stack run, and where they did.
-pub fn sigaltstack(process: &Process, new: u64, old: u64, rsp: u64) -> i64 {
+/// Where handlers that ask to run on another stack run, and where they did:
+/// for `task`, the current thread, each having its own.
+pub fn sigaltstack(process: &Process, task: &Task, new: u64, old: u64, rsp: u64) -> i64 {
     const MINSIGSTKSZ: u64 = 2048;
     ret((|| {
-        let current = process.signals.altstack();
+        let current = task.signals.altstack();
         let on_it = current.holds(rsp);
         let mut stack = [0u8; 24];
         if new != 0 {
@@ -156,19 +168,23 @@ pub fn sigaltstack(process: &Process, new: u64, old: u64, rsp: u64) -> i64 {
                 0 => AltStack { sp, size, enabled: true },
                 _ => return Err(EINVAL),
             };
-            process.signals.set_altstack(altstack);
+            task.signals.set_altstack(altstack);
         }
         Ok(0)
     })())
 }
 
-/// Send `signal` to process `pid`; to the caller's group, for 0; to every
-/// process but the first and the caller, for -1; or to group `-pid`. Signal
-/// 0 just asks whether there's anyone to send it to.
+/// Send `signal` to process `pid`, or the one whose thread that is; to the
+/// caller's group, for 0; to every process but the first and the caller,
+/// for -1; or to group `-pid`. Signal 0 just asks whether there's anyone to
+/// send it to.
 pub fn kill(process: &Process, pid: u64, signal: u64) -> i64 {
     let pid = pid as i32 as i64;
     let targets: Vec<Arc<Process>> = match pid {
-        1.. => process::find(pid as u64).into_iter().collect(),
+        1.. => {
+            let thread_of = || process::find_thread(pid as u64).map(|(process, _)| process);
+            process::find(pid as u64).or_else(thread_of).into_iter().collect()
+        }
         0 => process::group(process.pgid()),
         -1 => process::all().into_iter().filter(|p| p.id != 1 && p.id != process.id).collect(),
         _ => process::group(pid.unsigned_abs()),
@@ -176,19 +192,32 @@ pub fn kill(process: &Process, pid: u64, signal: u64) -> i64 {
     ret(send_to(&targets, signal, Info::user(process.id)))
 }
 
-/// `tkill` and `tgkill`: to one thread, which with a thread to each program
-/// is to the program, `tid`; `tgkill`'s `tgid` must be its.
+/// `tkill` and `tgkill`: to one thread, `tid`, for it to take; `tgkill`'s
+/// `tgid` must be its program's.
 pub fn tkill(process: &Process, tgid: Option<u64>, tid: u64, signal: u64) -> i64 {
-    let target = process::find(tid).filter(|target| tgid.is_none_or(|tgid| tgid == target.id));
+    let target =
+        process::find_thread(tid).filter(|(target, _)| tgid.is_none_or(|tgid| tgid == target.id));
     let info = Info { code: SI_TKILL, pid: process.id, status: 0 };
-    ret(send_to(&target.into_iter().collect::<Vec<_>>(), signal, info))
+    ret((|| {
+        let signal = number_or_none(signal)?;
+        let (target, task) = target.ok_or(ESRCH)?;
+        if let Some(signal) = signal {
+            signal::send_thread(&target, &task, signal, info);
+        }
+        Ok(0)
+    })())
+}
+
+/// A signal number a program passed, or `None` for 0, which sends nothing.
+fn number_or_none(signal: u64) -> Result<Option<usize>> {
+    match signal {
+        0 => Ok(None),
+        signal => signal_number(signal).map(Some),
+    }
 }
 
 fn send_to(targets: &[Arc<Process>], signal: u64, info: Info) -> Result<i64> {
-    let signal = match signal {
-        0 => None,
-        signal => Some(signal_number(signal)?),
-    };
+    let signal = number_or_none(signal)?;
     if targets.is_empty() {
         return Err(ESRCH);
     }

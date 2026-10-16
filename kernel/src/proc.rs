@@ -246,8 +246,8 @@ fn process_stat(process: &Process) -> String {
         times.children_system.load(Relaxed) as i64,
         20 + nice,
         nice,
-        // One thread; no interval timer; when it started.
-        1,
+        // Its threads; no interval timer; when it started.
+        threads(process) as i64,
         0,
         (process.started / TICK) as i64,
         // Its memory, in bytes and in pages, all of it there; no limit.
@@ -261,8 +261,8 @@ fn process_stat(process: &Process) -> String {
         0,
         0,
         // Its signals, pending, blocked, ignored and caught.
-        process.signals.pending() as i64,
-        process.signals.blocked() as i64,
+        pending(process) as i64,
+        blocked(process) as i64,
         0,
         0,
         // What it waits in, swap twice, and what its parent is sent as it
@@ -301,15 +301,33 @@ fn status(process: &Process) -> String {
     let (state, word) = state(process);
     format!(
         "Name:\t{}\nUmask:\t{:04o}\nState:\t{state} ({word})\nTgid:\t{id}\nPid:\t{id}\n\
-         PPid:\t{}\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nThreads:\t1\nSigPnd:\t{:016x}\n\
+         PPid:\t{}\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nThreads:\t{}\nSigPnd:\t{:016x}\n\
          SigBlk:\t{:016x}\n",
         process.command.lock().name,
         process.umask.load(Relaxed),
         process.parent_id(),
-        process.signals.pending(),
-        process.signals.blocked(),
+        threads(process),
+        pending(process),
+        blocked(process),
         id = process.id,
     )
+}
+
+/// How many threads it has: one still once it has ended, as Linux keeps the
+/// one it started with until it's waited for.
+fn threads(process: &Process) -> usize {
+    process.threads().len().max(1)
+}
+
+/// The signals sent to it, and to its first thread, and not yet taken.
+fn pending(process: &Process) -> u64 {
+    let first = process.threads().first().map_or(0, |task| task.signals.pending());
+    process.signals.pending() | first
+}
+
+/// The signals its first thread blocks.
+fn blocked(process: &Process) -> u64 {
+    process.threads().first().map_or(0, |task| task.signals.blocked())
 }
 
 #[cfg(test)]

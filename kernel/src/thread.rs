@@ -18,7 +18,8 @@
 
 use crate::io::interrupts::{idt::TIMER_COUNTER, pit::TIMER_HZ};
 use crate::memory::{self, KernelStack};
-use crate::process::{self, Process, UserState};
+use crate::process::{self, Process, Task, UserState};
+use crate::signal;
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
@@ -98,6 +99,17 @@ pub fn spawn_user(mut user: Box<UserState>) -> Option<()> {
 /// The program the current thread runs, if it runs one.
 pub fn current_process() -> Option<Arc<Process>> {
     with_current_user(|user| user.process.clone())
+}
+
+/// Which of its program's threads the current thread is, if it runs one.
+pub fn current_task() -> Option<Arc<Task>> {
+    with_current_user(|user| user.task.clone())
+}
+
+/// The program the current thread runs, and which of its threads it is, if
+/// it runs one.
+pub fn current_user() -> Option<(Arc<Process>, Arc<Task>)> {
+    with_current_user(|user| (user.process.clone(), user.task.clone()))
 }
 
 /// Run `f` on the current thread's user state, if it has one. With interrupts
@@ -230,24 +242,25 @@ impl WaitQueue {
     }
 
     /// `wait_until`, but ended early, `Err`, by a signal for the current
-    /// thread's program that it doesn't block, as Linux's interruptible
-    /// waits are. Kernel threads, which have no signals, just wait.
+    /// thread that it doesn't block, as Linux's interruptible waits are; or
+    /// as its program stops. Kernel threads, which have no signals, just
+    /// wait.
     pub fn wait_until_interruptible(
         &self,
         mut done: impl FnMut() -> bool,
     ) -> Result<(), Interrupted> {
-        let Some(process) = current_process() else {
+        let Some((process, task)) = current_user() else {
             self.wait_until(done);
             return Ok(());
         };
         // Where `signal::send` wakes it.
-        process.signals.waiting_in(Some(self));
+        task.signals.waiting_in(Some(self));
         let mut finished = false;
         self.wait_until(|| {
             finished = done();
-            finished || process.signals.has_signal()
+            finished || signal::has_signal(&process, &task)
         });
-        process.signals.waiting_in(None);
+        task.signals.waiting_in(None);
         if finished { Ok(()) } else { Err(Interrupted) }
     }
 
@@ -415,7 +428,7 @@ extern "C" fn start() -> ! {
     // Whoever switched here may have just exited.
     reap();
     if let Some(registers) = user {
-        process::enter_user(registers);
+        process::start_user(registers);
     }
     entry.expect("a new thread has an entry or a program")();
     exit()

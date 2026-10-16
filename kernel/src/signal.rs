@@ -15,7 +15,7 @@
 //! where Linux queues them.
 
 use crate::io::interrupts::gdt;
-use crate::process::{self, Process, Registers};
+use crate::process::{self, Process, Registers, Task};
 use crate::thread::{self, WaitQueue};
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU64, Ordering};
@@ -169,7 +169,7 @@ pub struct AltStack {
 }
 
 impl AltStack {
-    const NONE: AltStack = AltStack { sp: 0, size: 0, enabled: false };
+    pub const NONE: AltStack = AltStack { sp: 0, size: 0, enabled: false };
 
     /// Whether `rsp` is on it.
     pub fn holds(&self, rsp: u64) -> bool {
@@ -177,24 +177,16 @@ impl AltStack {
     }
 }
 
-/// A program's signals: what's pending and blocked, what each does, and
+/// A program's signals, which its threads share: what each does, those
+/// sent to the program as a whole and not yet taken by one of them, and
 /// whether it's stopped.
 pub struct Signals {
     /// By bit (`bit`); taken by anyone, with interrupts on or off.
     pending: AtomicU64,
-    blocked: AtomicU64,
-    /// Taken with interrupts on, as are the next three.
+    /// Taken with interrupts on, as is `info`.
     actions: Mutex<[Action; COUNT]>,
     /// Each pending signal's sender.
     info: Mutex<[Info; COUNT]>,
-    altstack: Mutex<AltStack>,
-    /// `rt_sigsuspend`'s: the mask to go back to once a handler has run.
-    saved_mask: Mutex<Option<u64>>,
-    /// The queue its thread waits in, while it waits in a way a signal ends,
-    /// for `send` to wake it.
-    waiting_on: AtomicPtr<WaitQueue>,
-    /// Woken by nothing but signals: what `pause` waits on.
-    pub(crate) arrived: WaitQueue,
     stopped: AtomicBool,
     /// What `wait4` hasn't yet told the parent: that it stopped, or 0xffff
     /// that it continued; 0 for nothing.
@@ -204,52 +196,131 @@ pub struct Signals {
 
 impl Signals {
     pub fn new() -> Signals {
-        Signals::with([Action::DEFAULT; COUNT], 0, AltStack::NONE)
+        Signals::with([Action::DEFAULT; COUNT])
     }
 
-    fn with(actions: [Action; COUNT], blocked: u64, altstack: AltStack) -> Signals {
+    fn with(actions: [Action; COUNT]) -> Signals {
         Signals {
             pending: AtomicU64::new(0),
-            blocked: AtomicU64::new(blocked),
             actions: Mutex::new(actions),
             info: Mutex::new([Info::default(); COUNT]),
-            altstack: Mutex::new(altstack),
-            saved_mask: Mutex::new(None),
-            waiting_on: AtomicPtr::new(core::ptr::null_mut()),
-            arrived: WaitQueue::new(),
             stopped: AtomicBool::new(false),
             report: AtomicI32::new(0),
             continued: WaitQueue::new(),
         }
     }
 
-    /// A child's, as `fork` makes it: the same actions, mask and alternate
-    /// stack, and nothing pending.
+    /// A child's, as `fork` makes it: the same actions, and nothing pending.
     pub fn fork(&self) -> Signals {
-        let blocked = self.blocked.load(Ordering::Relaxed);
-        Signals::with(*self.actions.lock(), blocked, *self.altstack.lock())
+        Signals::with(*self.actions.lock())
     }
 
     /// As `execve` leaves them: handlers back to the default, as the code they
-    /// were in is gone, and no alternate stack; what's ignored, blocked and
-    /// pending stays.
+    /// were in is gone; what's ignored and pending stays.
     pub fn exec(&self) {
         for action in self.actions.lock().iter_mut() {
             if action.handler != SIG_IGN {
                 *action = Action::DEFAULT;
             }
         }
-        *self.altstack.lock() = AltStack::NONE;
-    }
-
-    /// Whether a signal is pending that isn't blocked.
-    pub fn has_signal(&self) -> bool {
-        self.pending.load(Ordering::Acquire) & !self.blocked.load(Ordering::Relaxed) != 0
     }
 
     /// Whether it's stopped, by SIGSTOP or the like.
     pub fn stopped(&self) -> bool {
         self.stopped.load(Ordering::Acquire)
+    }
+
+    pub fn pending(&self) -> u64 {
+        self.pending.load(Ordering::Acquire)
+    }
+
+    pub fn action(&self, signal: usize) -> Action {
+        self.actions.lock()[signal - 1]
+    }
+
+    /// Whether the parent asked not to hear when its children stop or
+    /// continue (SA_NOCLDSTOP).
+    pub fn ignores_child_stops(&self) -> bool {
+        self.action(SIGCHLD).flags & SA_NOCLDSTOP != 0
+    }
+
+    /// Whether children that end are freed at once, never waited for: as
+    /// asked by ignoring SIGCHLD, or with SA_NOCLDWAIT.
+    pub fn reaps_children(&self) -> bool {
+        let action = self.action(SIGCHLD);
+        action.handler == SIG_IGN || action.flags & SA_NOCLDWAIT != 0
+    }
+
+    /// What `wait4` hasn't told the parent: the stop, if `stops`; the
+    /// continuing, if `continues`. Taken, so it's told once.
+    pub fn take_report(&self, stops: bool, continues: bool) -> Option<i32> {
+        let report = self.report.load(Ordering::Acquire);
+        let wanted = match report {
+            0 => false,
+            CONTINUED => continues,
+            _ => stops,
+        };
+        (wanted
+            && self.report.compare_exchange(report, 0, Ordering::AcqRel, Ordering::Acquire).is_ok())
+        .then_some(report)
+    }
+}
+
+impl core::default::Default for Signals {
+    fn default() -> Signals {
+        Signals::new()
+    }
+}
+
+/// A thread's own signals: those sent to it alone and not yet taken, which
+/// it blocks, and where its handlers run.
+pub struct ThreadSignals {
+    /// By bit; taken by anyone, with interrupts on or off, as is `blocked`.
+    pending: AtomicU64,
+    blocked: AtomicU64,
+    /// Each pending signal's sender. Taken with interrupts on, as are the
+    /// next two.
+    info: Mutex<[Info; COUNT]>,
+    altstack: Mutex<AltStack>,
+    /// `rt_sigsuspend`'s: the mask to go back to once a handler has run.
+    saved_mask: Mutex<Option<u64>>,
+    /// The queue the thread waits in, while it waits in a way a signal ends,
+    /// for `send` to wake it.
+    waiting_on: AtomicPtr<WaitQueue>,
+    /// Woken by nothing but signals: what `pause` waits on.
+    pub(crate) arrived: WaitQueue,
+}
+
+impl ThreadSignals {
+    /// A thread's that blocks `blocked`, with `altstack` for its handlers.
+    pub fn new(blocked: u64, altstack: AltStack) -> ThreadSignals {
+        ThreadSignals {
+            pending: AtomicU64::new(0),
+            blocked: AtomicU64::new(blocked),
+            info: Mutex::new([Info::default(); COUNT]),
+            altstack: Mutex::new(altstack),
+            saved_mask: Mutex::new(None),
+            waiting_on: AtomicPtr::new(core::ptr::null_mut()),
+            arrived: WaitQueue::new(),
+        }
+    }
+
+    /// For the thread a copy of this one starts on, as `fork` makes it: the
+    /// same mask and alternate stack, and nothing pending.
+    pub fn fork(&self) -> ThreadSignals {
+        ThreadSignals::new(self.blocked(), self.altstack())
+    }
+
+    /// For a new thread of the same program, as `clone` makes one: the same
+    /// mask, but no alternate stack, as that one is this thread's.
+    pub fn sibling(&self) -> ThreadSignals {
+        ThreadSignals::new(self.blocked(), AltStack::NONE)
+    }
+
+    /// As `execve` leaves them: no alternate stack; what's blocked and
+    /// pending stays.
+    pub fn exec(&self) {
+        *self.altstack.lock() = AltStack::NONE;
     }
 
     pub fn pending(&self) -> u64 {
@@ -279,32 +350,6 @@ impl Signals {
         }
     }
 
-    pub fn action(&self, signal: usize) -> Action {
-        self.actions.lock()[signal - 1]
-    }
-
-    /// Set what `signal` does. One that's now ignored and pending goes, as
-    /// POSIX says.
-    pub fn set_action(&self, signal: usize, action: Action) {
-        self.actions.lock()[signal - 1] = action;
-        if action.ignores(signal) {
-            self.pending.fetch_and(!bit(signal), Ordering::AcqRel);
-        }
-    }
-
-    /// Whether the parent asked not to hear when its children stop or
-    /// continue (SA_NOCLDSTOP).
-    pub fn ignores_child_stops(&self) -> bool {
-        self.action(SIGCHLD).flags & SA_NOCLDSTOP != 0
-    }
-
-    /// Whether children that end are freed at once, never waited for: as
-    /// asked by ignoring SIGCHLD, or with SA_NOCLDWAIT.
-    pub fn reaps_children(&self) -> bool {
-        let action = self.action(SIGCHLD);
-        action.handler == SIG_IGN || action.flags & SA_NOCLDWAIT != 0
-    }
-
     pub fn altstack(&self) -> AltStack {
         *self.altstack.lock()
     }
@@ -313,21 +358,7 @@ impl Signals {
         *self.altstack.lock() = altstack;
     }
 
-    /// What `wait4` hasn't told the parent: the stop, if `stops`; the
-    /// continuing, if `continues`. Taken, so it's told once.
-    pub fn take_report(&self, stops: bool, continues: bool) -> Option<i32> {
-        let report = self.report.load(Ordering::Acquire);
-        let wanted = match report {
-            0 => false,
-            CONTINUED => continues,
-            _ => stops,
-        };
-        (wanted
-            && self.report.compare_exchange(report, 0, Ordering::AcqRel, Ordering::Acquire).is_ok())
-        .then_some(report)
-    }
-
-    /// Wake its thread if it waits in a way a signal ends.
+    /// Wake the thread if it waits in a way a signal ends.
     fn wake(&self) {
         interrupts::without_interrupts(|| {
             let queue = self.waiting_on.load(Ordering::Acquire);
@@ -348,19 +379,38 @@ impl Signals {
     }
 }
 
-impl core::default::Default for Signals {
-    fn default() -> Signals {
-        Signals::new()
+/// Whether `task`, a thread of `process`, has a signal to act on: one sent
+/// to it or to the program that it doesn't block; or its program is
+/// stopped, which it's to stop for too. Atomics only, so it can be asked
+/// with interrupts off.
+pub fn has_signal(process: &Process, task: &Task) -> bool {
+    let pending = process.signals.pending() | task.signals.pending();
+    pending & !task.signals.blocked() != 0 || process.signals.stopped()
+}
+
+/// Set what `signal` does for `process`. One that's now ignored and pending,
+/// for the program or any of its threads, goes, as POSIX says.
+pub fn set_action(process: &Process, signal: usize, action: Action) {
+    process.signals.actions.lock()[signal - 1] = action;
+    if action.ignores(signal) {
+        process.signals.pending.fetch_and(!bit(signal), Ordering::AcqRel);
+        for task in process.threads() {
+            task.signals.pending.fetch_and(!bit(signal), Ordering::AcqRel);
+        }
     }
 }
 
-/// Send `signal` to `target`, from `info`. One the target ignores goes, but
-/// for one it blocks, which waits; SIGCONT continues it now, if it's stopped,
-/// whatever it does with SIGCONT.
-pub fn send(target: &Process, signal: usize, info: Info) {
+/// What every signal sent does first, to the program or one of its threads:
+/// SIGCONT continues it now, if it's stopped, whatever it does with SIGCONT;
+/// one that stops it takes back a SIGCONT not yet taken, and the other way
+/// round. Whether the signal is to be kept: not if it's ignored, unless
+/// `blocked`, in which case it waits.
+fn prepare(target: &Process, signal: usize, blocked: bool) -> bool {
     let signals = &target.signals;
     if signal == SIGCONT {
-        signals.pending.fetch_and(!STOPS, Ordering::AcqRel);
+        let unstop = |pending: &AtomicU64| pending.fetch_and(!STOPS, Ordering::AcqRel);
+        unstop(&signals.pending);
+        target.threads().iter().for_each(|task| _ = unstop(&task.signals.pending));
         if signals.stopped.swap(false, Ordering::AcqRel) {
             signals.report.store(CONTINUED, Ordering::Release);
             target.notify_parent(CLD_CONTINUED, SIGCONT as i32);
@@ -368,27 +418,52 @@ pub fn send(target: &Process, signal: usize, info: Info) {
         }
     } else if bit(signal) & STOPS != 0 {
         signals.pending.fetch_and(!bit(SIGCONT), Ordering::AcqRel);
+        for task in target.threads() {
+            task.signals.pending.fetch_and(!bit(SIGCONT), Ordering::AcqRel);
+        }
     }
-    if signals.action(signal).ignores(signal) && signals.blocked() & bit(signal) == 0 {
+    !signals.action(signal).ignores(signal) || blocked
+}
+
+/// Send `signal` to `target`, from `info`, for whichever of its threads
+/// doesn't block it to take: each that doesn't is woken, if it waits. One
+/// the target ignores goes, unless all its threads block it, when it waits.
+pub fn send(target: &Process, signal: usize, info: Info) {
+    let threads = target.threads();
+    let blocked = |task: &Task| task.signals.blocked() & bit(signal) != 0;
+    if !prepare(target, signal, !threads.is_empty() && threads.iter().all(|task| blocked(task))) {
         return;
     }
+    let signals = &target.signals;
     signals.info.lock()[signal - 1] = info;
     signals.pending.fetch_or(bit(signal), Ordering::AcqRel);
-    signals.wake();
+    threads.iter().filter(|task| !blocked(task)).for_each(|task| task.signals.wake());
+}
+
+/// Send `signal` to `task`, one of `target`'s threads, alone, from `info`,
+/// as `tgkill` does: it's the one to take it.
+pub fn send_thread(target: &Process, task: &Task, signal: usize, info: Info) {
+    let own = &task.signals;
+    if !prepare(target, signal, own.blocked() & bit(signal) != 0) {
+        return;
+    }
+    own.info.lock()[signal - 1] = info;
+    own.pending.fetch_or(bit(signal), Ordering::AcqRel);
+    own.wake();
 }
 
 /// As the timer interrupt goes back to the current thread's program: if it
 /// has a signal to take, act on it, `registers` being what the program had,
 /// and go back to it from here.
 pub fn on_interrupt_return(registers: impl FnOnce() -> Registers) {
-    let Some(process) = thread::current_process() else { return };
-    if !process.signals.has_signal() {
+    let Some((process, task)) = thread::current_user() else { return };
+    if !has_signal(&process, &task) {
         return;
     }
     // As a system call runs: what follows can take locks and wait.
     interrupts::enable();
     let mut registers = registers();
-    deliver(process, &mut registers, None);
+    deliver(process, task, &mut registers, None);
     process::enter_user(registers)
 }
 
@@ -406,24 +481,53 @@ impl Syscall {
     }
 }
 
-/// Act on the signals the current thread's program, `process`, has pending
-/// and doesn't block, before it goes back to ring 3 with `registers`, maybe
-/// from `syscall`. A handler is run by changing `registers` to its start; the
-/// next waits for its `rt_sigreturn`. A default action may end the program,
-/// and then this doesn't return, having let go of `process` first.
-pub fn deliver(process: Arc<Process>, registers: &mut Registers, mut syscall: Option<Syscall>) {
-    let signals = &process.signals;
+/// Take the next signal for `task`, a thread of `process`, to act on, of
+/// those it doesn't block, with who sent it: SIGKILL first; then its own,
+/// the lowest first, as Linux takes them; then the program's, which another
+/// thread may take first.
+fn take(process: &Process, task: &Task) -> Option<(usize, Info)> {
+    let (shared, own) = (&process.signals, &task.signals);
     loop {
-        let ready = signals.pending() & !signals.blocked();
+        let blocked = own.blocked();
+        let mine = own.pending() & !blocked;
+        let theirs = shared.pending() & !blocked;
+        let kill = bit(SIGKILL);
+        let (pending, info, ready) = if mine & kill == 0 && theirs & kill != 0 || mine == 0 {
+            (&shared.pending, &shared.info, theirs)
+        } else {
+            (&own.pending, &own.info, mine)
+        };
         if ready == 0 {
-            break;
+            return None;
         }
-        // SIGKILL first; then the lowest, as Linux does.
-        let signal = match ready & bit(SIGKILL) {
+        let signal = match ready & kill {
             0 => ready.trailing_zeros() as usize + 1,
             _ => SIGKILL,
         };
-        signals.pending.fetch_and(!bit(signal), Ordering::AcqRel);
+        if pending.fetch_and(!bit(signal), Ordering::AcqRel) & bit(signal) != 0 {
+            return Some((signal, info.lock()[signal - 1]));
+        }
+    }
+}
+
+/// Act on the signals `task`, the current thread, a thread of `process`,
+/// has to take, before it goes back to ring 3 with `registers`, maybe from
+/// `syscall`; and while the program is stopped, wait until it's continued.
+/// A handler is run by changing `registers` to its start; the next waits for
+/// its `rt_sigreturn`. A default action may end the program, and then this
+/// doesn't return, having let go of `process` and `task` first.
+pub fn deliver(
+    process: Arc<Process>,
+    task: Arc<Task>,
+    registers: &mut Registers,
+    mut syscall: Option<Syscall>,
+) {
+    let (signals, own) = (&process.signals, &task.signals);
+    loop {
+        if signals.stopped() {
+            wait_while_stopped(&process, &task);
+        }
+        let Some((signal, info)) = take(&process, &task) else { break };
         let action = signals.action(signal);
         if action.handler == SIG_IGN && bit(signal) & UNBLOCKABLE == 0 {
             continue;
@@ -441,7 +545,7 @@ pub fn deliver(process: Arc<Process>, registers: &mut Registers, mut syscall: Op
                     continue;
                 }
                 Default::End => {
-                    drop(process);
+                    drop((process, task));
                     process::kill_current(signal);
                 }
             }
@@ -453,15 +557,14 @@ pub fn deliver(process: Arc<Process>, registers: &mut Registers, mut syscall: Op
                 false => registers.rax = -EINTR as u64,
             }
         }
-        let info = signals.info.lock()[signal - 1];
-        let old_mask = signals.saved_mask.lock().take().unwrap_or(signals.blocked());
-        if setup_frame(&process, registers, signal, action, info, old_mask).is_none() {
+        let old_mask = own.saved_mask.lock().take().unwrap_or(own.blocked());
+        if setup_frame(&process, &task, registers, signal, action, info, old_mask).is_none() {
             // Nowhere to run it: as Linux does, the program ends.
-            drop(process);
+            drop((process, task));
             process::kill_current(SIGSEGV);
         }
         let deferred = if action.flags & SA_NODEFER != 0 { 0 } else { bit(signal) };
-        signals.set_blocked(signals.blocked() | action.mask | deferred);
+        own.set_blocked(own.blocked() | action.mask | deferred);
         if action.flags & SA_RESETHAND != 0 {
             signals.actions.lock()[signal - 1] = Action::DEFAULT;
         }
@@ -472,7 +575,7 @@ pub fn deliver(process: Arc<Process>, registers: &mut Registers, mut syscall: Op
     if let Some(call) = syscall.filter(Syscall::interrupted) {
         restart(registers, call.number);
     }
-    signals.end_suspend();
+    own.end_suspend();
 }
 
 /// Back to the `syscall` instruction, two bytes back, with its number again.
@@ -481,18 +584,28 @@ fn restart(registers: &mut Registers, number: u64) {
     registers.rip -= 2;
 }
 
-/// Stop `process`, the current thread's, as `signal` would: until SIGCONT
-/// continues it or SIGKILL comes.
+/// Stop `process`, the current thread's, as `signal` would, all its threads:
+/// until SIGCONT continues it or SIGKILL comes. The first to stop it tells
+/// its parent; and wakes the others, which stop in `deliver` as they next
+/// go back to the program, as those that run it now do on the next tick.
 fn stop(process: &Process, signal: usize) {
     let signals = &process.signals;
-    signals.stopped.store(true, Ordering::Release);
-    signals.report.store(((signal as i32) << 8) | 0x7f, Ordering::Release);
-    process.notify_parent(CLD_STOPPED, signal as i32);
-    signals.waiting_in(Some(&signals.continued));
+    if !signals.stopped.swap(true, Ordering::AcqRel) {
+        signals.report.store(((signal as i32) << 8) | 0x7f, Ordering::Release);
+        process.notify_parent(CLD_STOPPED, signal as i32);
+        process.threads().iter().for_each(|task| task.signals.wake());
+    }
+}
+
+/// Wait while `process`, the program `task`, the current thread, is a
+/// thread of, is stopped: until it's continued, or SIGKILL comes for it.
+fn wait_while_stopped(process: &Process, task: &Task) {
+    let (signals, own) = (&process.signals, &task.signals);
+    own.waiting_in(Some(&signals.continued));
     signals.continued.wait_until(|| {
-        !signals.stopped.load(Ordering::Acquire) || signals.pending() & bit(SIGKILL) != 0
+        !signals.stopped() || (signals.pending() | own.pending()) & bit(SIGKILL) != 0
     });
-    signals.waiting_in(None);
+    own.waiting_in(None);
 }
 
 /// A signal frame's parts and size: the restorer's address, the
@@ -511,6 +624,7 @@ const SIGMASK: usize = GREGS + 256;
 /// at the handler. `None` if the stack can't be written.
 fn setup_frame(
     process: &Process,
+    task: &Task,
     registers: &mut Registers,
     signal: usize,
     action: Action,
@@ -519,7 +633,7 @@ fn setup_frame(
 ) -> Option<()> {
     const SS_ONSTACK: u64 = 1;
     const SS_DISABLE: u64 = 2;
-    let altstack = process.signals.altstack();
+    let altstack = task.signals.altstack();
     let on_altstack = altstack.holds(registers.rsp);
     let top = match action.flags & SA_ONSTACK != 0 && altstack.enabled && !on_altstack {
         // An alternate stack past the end of memory is one nothing can be
@@ -586,11 +700,12 @@ fn setup_frame(
     Some(())
 }
 
-/// `rt_sigreturn`: back from a handler, to the registers, mask and FPU state
-/// its frame saved; `uc` is the frame's `ucontext`, where the handler's
-/// return to the restorer left the stack pointer. `None` if it can't be
-/// read, which on Linux ends the program with SIGSEGV.
-pub fn sigreturn(process: &Process, uc: u64) -> Option<Registers> {
+/// `rt_sigreturn`: back from a handler that `task`, the current thread of
+/// `process`, ran, to the registers, mask and FPU state its frame saved;
+/// `uc` is the frame's `ucontext`, where the handler's return to the
+/// restorer left the stack pointer. `None` if it can't be read, which on
+/// Linux ends the program with SIGSEGV.
+pub fn sigreturn(process: &Process, task: &Task, uc: u64) -> Option<Registers> {
     let mut bytes = [0u8; UCONTEXT];
     process.memory.lock().space.read(uc, &mut bytes)?;
     let word = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
@@ -623,6 +738,6 @@ pub fn sigreturn(process: &Process, uc: u64) -> Option<Registers> {
             process::load_fpu(&fpu);
         }
     }
-    process.signals.set_blocked(word(SIGMASK));
+    task.signals.set_blocked(word(SIGMASK));
     Some(registers)
 }

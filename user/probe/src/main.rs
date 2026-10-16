@@ -1605,6 +1605,275 @@ fn main() {
                 name.trim_end()
             );
         }
+        // std's threads: four adding into a Mutex and an atomic, each with an
+        // id and thread-locals of its own and the program's pid; a Condvar
+        // passed back and forth; one waited on until it timed out; and park.
+        Some("threads") => {
+            use std::sync::{Arc, Condvar, Mutex};
+            thread_local!(static MINE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) });
+            let pid = getpid();
+            let (total, count) = (Arc::new(Mutex::new(0u64)), Arc::new(AtomicU64::new(0)));
+            let workers: Vec<_> = (1..=4)
+                .map(|n| {
+                    let (total, count) = (total.clone(), count.clone());
+                    std::thread::spawn(move || {
+                        MINE.set(n);
+                        for i in 0..10_000 {
+                            *total.lock().unwrap() += i;
+                            count.fetch_add(1, Ordering::SeqCst);
+                        }
+                        (getpid() == pid, gettid(), MINE.get() == n)
+                    })
+                })
+                .collect();
+            let seen: Vec<_> = workers.into_iter().map(|worker| worker.join().unwrap()).collect();
+            let mut ids: Vec<isize> = seen.iter().map(|seen| seen.1).collect();
+            ids.push(gettid());
+            ids.sort();
+            ids.dedup();
+            let pids = seen.iter().all(|seen| seen.0);
+            let locals = seen.iter().all(|seen| seen.2) && MINE.get() == 0;
+            // Turns taken, even by this thread, odd by the other.
+            let turn = Arc::new((Mutex::new(0u32), Condvar::new()));
+            let take_turns = |turn: &(Mutex<u32>, Condvar), mine: u32| {
+                let (lock, changed) = turn;
+                for round in 0..500 {
+                    let mut now = lock.lock().unwrap();
+                    while *now != round * 2 + mine {
+                        now = changed.wait(now).unwrap();
+                    }
+                    *now += 1;
+                    changed.notify_one();
+                }
+            };
+            let other = {
+                let turn = turn.clone();
+                std::thread::spawn(move || take_turns(&turn, 1))
+            };
+            take_turns(&turn, 0);
+            other.join().unwrap();
+            let turns = *turn.0.lock().unwrap();
+            let (lock, never) = (Mutex::new(()), Condvar::new());
+            let started = Instant::now();
+            let waited = never.wait_timeout(lock.lock().unwrap(), Duration::from_millis(50));
+            let timed_out = waited.unwrap().1.timed_out();
+            let long_enough = started.elapsed() >= Duration::from_millis(50);
+            let unparked = Arc::new(AtomicU32::new(0));
+            let unparker = {
+                let (main, unparked) = (std::thread::current(), unparked.clone());
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(20));
+                    unparked.store(1, Ordering::SeqCst);
+                    main.unpark();
+                })
+            };
+            while unparked.load(Ordering::SeqCst) == 0 {
+                std::thread::park();
+            }
+            unparker.join().unwrap();
+            println!(
+                "{} {} {} {pids} {locals} {turns} {timed_out} {long_enough}",
+                *total.lock().unwrap(),
+                count.load(Ordering::SeqCst),
+                ids.len()
+            );
+        }
+        // futex, called directly: what it refuses, and wakes and requeues
+        // counted.
+        Some("futex") => {
+            const WAIT: usize = 0;
+            const WAKE: usize = 1;
+            const CMP_REQUEUE: usize = 4;
+            const WAIT_BITSET: usize = 9;
+            const PRIVATE: usize = 128;
+            let word: &'static AtomicU32 = Box::leak(Box::new(AtomicU32::new(1)));
+            let other: &'static AtomicU32 = Box::leak(Box::new(AtomicU32::new(0)));
+            let (at, to) = (word.as_ptr() as usize, other.as_ptr() as usize);
+            let futex = |at: usize, op: usize, value: usize, timeout: usize, to: usize, value3| {
+                syscall6(202, [at, op, value, timeout, to], value3)
+            };
+            let (soon, past) = ([0i64, 10_000_000], [0i64, 0]);
+            let refused = [
+                futex(at, WAIT | PRIVATE, 0, 0, 0, 0),
+                futex(at, WAIT | PRIVATE, 1, soon.as_ptr() as usize, 0, 0),
+                futex(at, WAIT_BITSET | PRIVATE, 1, past.as_ptr() as usize, 0, !0),
+                futex(at, WAIT_BITSET | PRIVATE, 1, 0, 0, 0),
+                futex(at + 1, WAKE | PRIVATE, 1, 0, 0, 0),
+                futex(at, 99, 1, 0, 0, 0),
+                futex(at, WAKE | PRIVATE, 1, 0, 0, 0),
+                futex(at, CMP_REQUEUE | PRIVATE, 0, 1, to, 5),
+            ];
+            // Woken until one is, as it may not be waiting yet.
+            let wake_until = |at: usize, count: isize| {
+                let mut woken = 0;
+                while woken < count {
+                    woken += futex(at, WAKE | PRIVATE, count as usize, 0, 0, 0);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                woken
+            };
+            let waiter = move || futex(at, WAIT | PRIVATE, 1, 0, 0, 0);
+            let one = std::thread::spawn(waiter);
+            let woken = wake_until(at, 1);
+            let waited = one.join().unwrap();
+            // Two moved to the other word, then woken there.
+            let two = [std::thread::spawn(waiter), std::thread::spawn(waiter)];
+            let mut moved = 0;
+            while moved < 2 {
+                moved += futex(at, CMP_REQUEUE | PRIVATE, 0, 2, to, 1);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let woken_there = wake_until(to, 2);
+            let waited_there: Vec<isize> = two.map(|waiter| waiter.join().unwrap()).into();
+            println!("{refused:?} {woken} {waited} {moved} {woken_there} {waited_there:?}");
+        }
+        // A thread's exit(5) ends its program, though the first waits for it
+        // to end; and in a copy, the first thread's own exit leaves the
+        // other to go on, whose exit_group(3) then ends it.
+        Some("thread-exit") => {
+            let child = syscall(57, 0, 0, 0);
+            if child == 0 {
+                let worker = std::thread::spawn(|| {
+                    std::thread::sleep(Duration::from_millis(20));
+                    std::process::exit(5)
+                });
+                let _ = worker.join();
+                std::process::exit(1);
+            }
+            let first = wait(child).1;
+            let (mut reader, writer) = or_fail("pipe", io::pipe());
+            let child = syscall(57, 0, 0, 0);
+            if child == 0 {
+                drop(reader);
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(30));
+                    or_fail("pipe", (&writer).write_all(b"after the first"));
+                    syscall(231, 3, 0, 0)
+                });
+                syscall(60, 0, 0, 0);
+                unreachable!("exit returned");
+            }
+            drop(writer);
+            let mut said = String::new();
+            or_fail("pipe", reader.read_to_string(&mut said));
+            println!("{first}; {said}, {}", wait(child).1);
+        }
+        // Signals and threads: one sent to the program goes to the thread
+        // that doesn't block it; tgkill, to the thread named, or ESRCH for a
+        // group not its own or a thread there isn't; and
+        // a thread's alternate stack is its own.
+        Some("thread-signals") => {
+            static TAKER: AtomicIsize = AtomicIsize::new(0);
+            extern "C" fn note(_signal: i32, _info: *const u8, _context: *const u8) {
+                TAKER.store(gettid(), Ordering::SeqCst);
+            }
+            let (pid, main) = (getpid(), gettid());
+            sigaction(SIGUSR1, note, SA_SIGINFO);
+            sigaction(SIGUSR2, note, SA_SIGINFO);
+            sigprocmask(SIG_BLOCK, bit(SIGUSR1));
+            let stack = vec![0u8; 64 * 1024];
+            let given = [stack.as_ptr() as u64, 0, stack.len() as u64];
+            syscall(131, given.as_ptr() as usize, 0, 0);
+            let (told, heard) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                sigprocmask(SIG_UNBLOCK, bit(SIGUSR1));
+                told.send(gettid()).unwrap();
+                while TAKER.load(Ordering::SeqCst) == 0 {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            });
+            let worker_id = heard.recv().unwrap();
+            kill(pid, SIGUSR1);
+            worker.join().unwrap();
+            let to_worker = TAKER.swap(0, Ordering::SeqCst) == worker_id;
+            let sent =
+                std::thread::spawn(move || syscall(234, pid as usize, main as usize, SIGUSR2));
+            let sent = sent.join().unwrap();
+            getpid();
+            let to_main = TAKER.load(Ordering::SeqCst) == main;
+            let wrong_group = syscall(234, pid as usize + 1, main as usize, SIGUSR2);
+            let none = syscall(234, pid as usize, 999_999, SIGUSR2);
+            let mut mine = [0u64; 3];
+            syscall(131, 0, mine.as_mut_ptr() as usize, 0);
+            let kept = mine[0] == given[0] && mine[1] == 0;
+            println!("{to_worker} {sent} {to_main} {wrong_group} {none} {kept}");
+        }
+        // A copy with a thread that spins, stopped, continued and killed: all
+        // of it stops, as its CPU time standing still says.
+        Some("thread-stops") => {
+            let (mut ready, ready_writer) = or_fail("pipe", io::pipe());
+            let child = syscall(57, 0, 0, 0);
+            if child == 0 {
+                std::thread::spawn(|| {
+                    loop {
+                        std::hint::spin_loop();
+                    }
+                });
+                or_fail("pipe", (&ready_writer).write_all(b"r"));
+                loop {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            or_fail("pipe", ready.read_exact(&mut [0]));
+            // Its time running and in the kernel, in ticks.
+            let time = || {
+                let stat = fs::read_to_string(format!("/proc/{child}/stat")).unwrap_or_default();
+                let fields: Vec<u64> = stat
+                    .rsplit_once(") ")
+                    .map(|(_, rest)| rest.split(' ').map(|f| f.parse().unwrap_or(0)).collect())
+                    .unwrap_or_default();
+                fields.get(11).zip(fields.get(12)).map(|(user, system)| user + system)
+            };
+            kill(child, SIGSTOP);
+            let stopped = wait_status(child, WUNTRACED);
+            std::thread::sleep(Duration::from_millis(30));
+            let before = time();
+            std::thread::sleep(Duration::from_millis(100));
+            let still = before.is_some() && time() == before;
+            kill(child, SIGCONT);
+            let continued = wait_status(child, WCONTINUED);
+            kill(child, SIGKILL);
+            println!("{stopped:#x} {still} {continued:#x} {}", wait(child).1);
+        }
+        // A thread that execs PROGRAM, a probe: the others end, and the
+        // program goes on as its `ids`, told the pid it had.
+        Some("thread-exec") => {
+            let (pid, program) = (getpid(), arg(2));
+            std::thread::spawn(|| {
+                loop {
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+            });
+            let execs = std::thread::spawn(move || {
+                let error = Command::new(&program).args(["ids", &pid.to_string()]).exec();
+                or_fail::<()>(&program, Err(error));
+            });
+            let _ = execs.join();
+            std::process::exit(1);
+        }
+        // Whether it's still PID, its thread numbered as it is; and how many
+        // threads /proc says it has.
+        Some("ids") => {
+            let status = or_fail("status", fs::read_to_string("/proc/self/status"));
+            let threads = status.lines().find(|line| line.starts_with("Threads:"));
+            let was = getpid().to_string() == arg(2);
+            println!("{was} {} {}", gettid() == getpid(), threads.unwrap_or_default());
+        }
+        // A thread that forks: the copy has the one thread, numbered as the
+        // copy is; and the thread that made it is the one to wait for it.
+        Some("thread-fork") => {
+            let made = std::thread::spawn(|| {
+                let child = syscall(57, 0, 0, 0);
+                if child == 0 {
+                    let status = or_fail("status", fs::read_to_string("/proc/self/status"));
+                    let threads = status.lines().find(|line| line.starts_with("Threads:"));
+                    println!("child: {} {}", gettid() == getpid(), threads.unwrap_or_default());
+                    std::process::exit(4);
+                }
+                wait(child).1
+            });
+            println!("parent: {}", made.join().unwrap());
+        }
         Some(other) => {
             eprintln!("probe: unknown mode {other:?}");
             std::process::exit(2);
@@ -1725,6 +1994,10 @@ fn kill(pid: isize, signal: usize) -> isize {
 
 fn getpid() -> isize {
     syscall(39, 0, 0, 0)
+}
+
+fn gettid() -> isize {
+    syscall(186, 0, 0, 0)
 }
 
 /// What `record` saw: how many signals, and of the last its number, its
