@@ -715,14 +715,24 @@ fn mmap(
     if prot == 0 {
         return start as i64;
     }
+    // Reading the file takes the tree, which mustn't wait with this held:
+    // /proc takes the two the other way round.
+    if let Some(handle) = &file
+        && prot & PROT_WRITE == 0
+    {
+        drop(memory);
+        if let Err(errno) = map_file(process, handle, offset, start, len, page_flags(prot)) {
+            process.memory.lock().space.unmap(pages(start, end));
+            return -errno;
+        }
+        return start as i64;
+    }
     if memory.space.map(pages(start, end), page_flags(prot)).is_none() {
         // What memory there was goes back: the program, told it got none,
         // has no address to unmap it by.
         memory.space.unmap(pages(start, end));
         return -ENOMEM;
     }
-    // Reading the file takes the tree, which mustn't wait with this held:
-    // /proc takes the two the other way round.
     drop(memory);
     if let Some(handle) = file
         && let Err(errno) = fill(process, &handle, offset, start, len)
@@ -731,6 +741,42 @@ fn mmap(
         return -errno;
     }
     start as i64
+}
+
+/// Map the `len` bytes of the file `handle` is open on from `offset` on at
+/// `start`, never writable, with `flags`: its own pages, from the page
+/// cache, shared with whatever else maps them, so that what's written to
+/// the file shows, as on Linux; zeros past its end.
+fn map_file(
+    process: &Process,
+    handle: &Handle,
+    offset: u64,
+    start: u64,
+    len: u64,
+    flags: PageTableFlags,
+) -> Result<(), i64> {
+    let Handle::File { file, .. } = handle else { return Ok(()) };
+    let size = {
+        let _tree = crate::fs::lock();
+        file.size().map_err(crate::fs::errno)?
+    };
+    for done in (0..len).step_by(4096) {
+        let page = page(start + done);
+        let frame = match offset + done < size {
+            true => {
+                let _tree = crate::fs::lock();
+                Some(crate::cache::page(file, (offset + done) / 4096).map_err(crate::fs::errno)?)
+            }
+            false => None,
+        };
+        let mut memory = process.memory.lock();
+        let mapped = match frame {
+            Some(frame) => memory.space.map_shared(page, frame, flags),
+            None => memory.space.map(Page::range(page, page + 1), flags),
+        };
+        mapped.ok_or(ENOMEM)?;
+    }
+    Ok(())
 }
 
 /// Copy `len` bytes of the file `handle` is open on, from `offset` on, into
@@ -745,7 +791,7 @@ fn fill(process: &Process, handle: &Handle, offset: u64, start: u64, len: u64) -
         let want = (len - done).min(piece.len() as u64) as usize;
         let read = {
             let _tree = crate::fs::lock();
-            file.read_at(offset + done, &mut piece[..want]).map_err(|_| EIO)?
+            crate::cache::read(file, offset + done, &mut piece[..want]).map_err(|_| EIO)?
         };
         if read == 0 {
             break;
@@ -760,9 +806,12 @@ fn fill(process: &Process, handle: &Handle, offset: u64, start: u64, len: u64) -
 /// it MADV_DONTNEED and MADV_FREE acted on, which say it needs nothing that
 /// is there, which is zeroed, as Linux does to private anonymous memory.
 ///
-/// shortcut: a file's copy is zeroed too, where Linux reads it from the
-/// file again; and memory that's PROT_NONE, which here isn't mapped, is
-/// ENOMEM.
+/// A page of a file that's mapped read-only holds what the file does, and
+/// stays as it is, as Linux would have it read from the file again.
+///
+/// shortcut: a file's page that's mapped writable is a copy, which is
+/// zeroed too, where Linux reads it from the file again; and memory that's
+/// PROT_NONE, which here isn't mapped, is ENOMEM.
 fn madvise(process: &Process, addr: u64, len: u64, advice: u64) -> i64 {
     const MADV_DONTNEED: u64 = 4;
     const MADV_FREE: u64 = 8;
@@ -894,7 +943,9 @@ fn mprotect(process: &Process, addr: u64, len: u64, prot: u64) -> i64 {
     if memory.space.map(pages(start, end), page_flags(prot)).is_none() {
         return -ENOMEM;
     }
-    memory.space.protect(pages(start, end), page_flags(prot));
+    if memory.space.protect(pages(start, end), page_flags(prot)).is_none() {
+        return -ENOMEM;
+    }
     0
 }
 

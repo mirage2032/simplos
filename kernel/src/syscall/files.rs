@@ -417,7 +417,7 @@ fn read_data(process: &Process, fd: u64, count: u64, at: Option<u64>) -> Result<
             let _tree = fs::lock();
             let from = at.unwrap_or_else(|| offset.load(Relaxed));
             let mut data = vec![0; count];
-            let read = file.read_at(from, &mut data).map_err(fs::errno)?;
+            let read = crate::cache::read(file, from, &mut data).map_err(fs::errno)?;
             data.truncate(read);
             if at.is_none() {
                 offset.store(from + read as u64, Relaxed);

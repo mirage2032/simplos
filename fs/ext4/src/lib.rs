@@ -126,6 +126,25 @@ pub struct DirEntry {
     pub inode: u32,
 }
 
+/// A change to what's in a file, for whoever keeps a copy of files'
+/// contents, as a kernel's page cache does: see `Ext4::watch`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Change<'a> {
+    /// `bytes` written from `offset` on.
+    Written { offset: u64, bytes: &'a [u8] },
+    /// Made `size` bytes long: cut short, or longer with zeros.
+    Resized { size: u64 },
+    /// Nothing kept of it holds: it lost its last name, or was replaced by
+    /// another file, or it's a new file, whose number may have been one
+    /// that's gone.
+    Gone,
+}
+
+/// Told each `Change` once it's made, with the file's inode number: before
+/// anything else is done on the mount, with nothing of it held, from the
+/// thread that made it.
+pub type Watcher = fn(inode: u32, change: Change<'_>);
+
 /// What `stat` tells of a file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Metadata {
@@ -225,6 +244,8 @@ struct Mount {
     pending: Mutex<Option<Pending>>,
     /// Why what was held couldn't be written, for the next `sync` to tell.
     failed: Mutex<Option<Error>>,
+    /// Who's told what changes in files: `Ext4::watch`.
+    watcher: Mutex<Option<Watcher>>,
 }
 
 /// Writes to an open file, one after another from `offset` on, not made
@@ -299,6 +320,7 @@ impl Ext4 {
             kept: Mutex::new(Vec::new()),
             pending: Mutex::new(None),
             failed: Mutex::new(None),
+            watcher: Mutex::new(None),
         };
         // The slot stays taken until `mount`'s `Drop` has undone whatever
         // `attach` managed, if it fails: that takes the lock, so it runs
@@ -307,6 +329,12 @@ impl Ext4 {
         let mounted = mount.attach();
         drop(slots);
         mounted.map(|()| Ext4 { mount: Arc::new(mount) })
+    }
+
+    /// Tell `watcher` of every change to what's in a file from now on,
+    /// whoever makes it, through this `Ext4` or a `File` opened on it.
+    pub fn watch(&self, watcher: Watcher) {
+        *self.mount.watcher.lock() = Some(watcher);
     }
 
     /// lwext4's path for `path`, which is relative to the file system's root.
@@ -421,13 +449,22 @@ impl Ext4 {
         self.mount.open.lock().push(inode);
         let file = File { mount: self.mount.clone(), raw, inode, writable, touched: 0.into() };
         // A new file has all its times set; one emptied, when.
-        match (made, flags & O_TRUNC != 0) {
-            (true, _) => self.mount.stamp(inode)?,
-            (false, true) => file.touch()?,
-            (false, false) => {}
-        }
+        let change = match (made, flags & O_TRUNC != 0) {
+            (true, _) => {
+                self.mount.stamp(inode)?;
+                Some(Change::Gone)
+            }
+            (false, true) => {
+                file.touch()?;
+                Some(Change::Resized { size: 0 })
+            }
+            (false, false) => None,
+        };
         // Not dropped while the lock is held: closing it takes the lock.
         drop(_lwext4);
+        if let Some(change) = change {
+            self.mount.tell(inode, change);
+        }
         Ok(file)
     }
 
@@ -470,10 +507,13 @@ impl Ext4 {
             return Err(Error::IsADirectory);
         }
         let path = self.path(path)?;
-        let _lwext4 = self.mount.lock();
+        let lwext4 = self.mount.lock();
         self.keep(&path, &metadata)?;
         // Safety: as in `metadata`.
-        check(unsafe { ffi::ext4_fremove(path.as_ptr()) })
+        check(unsafe { ffi::ext4_fremove(path.as_ptr()) })?;
+        drop(lwext4);
+        self.mount.tell(metadata.inode, Change::Gone);
+        Ok(())
     }
 
     /// Before the file at `at`, lwext4's path, loses its last name: if it's
@@ -559,12 +599,17 @@ impl Ext4 {
         };
         self.check_parent(to)?;
         let (from, to) = (self.path(from)?, self.path(to)?);
-        let _lwext4 = self.mount.lock();
-        if let Some(replaced) = replaced {
-            self.keep(&to, &replaced)?;
+        let lwext4 = self.mount.lock();
+        if let Some(replaced) = &replaced {
+            self.keep(&to, replaced)?;
         }
         // Safety: as in `metadata`.
-        check(unsafe { ffi::ext4_frename(from.as_ptr(), to.as_ptr()) })
+        check(unsafe { ffi::ext4_frename(from.as_ptr(), to.as_ptr()) })?;
+        drop(lwext4);
+        if let Some(replaced) = replaced {
+            self.mount.tell(replaced.inode, Change::Gone);
+        }
+        Ok(())
     }
 
     /// Set the permission bits of the file at `path`: `0o644` and the like.
@@ -669,6 +714,15 @@ const O_CREAT: c_int = 0o100;
 const O_TRUNC: c_int = 0o1000;
 
 impl Mount {
+    /// Tell the watcher, if there's one, of `change` to the file `inode`.
+    fn tell(&self, inode: u32, change: Change<'_>) {
+        // Not held as it's told: it may look at the mount.
+        let watcher = *self.watcher.lock();
+        if let Some(watcher) = watcher {
+            watcher(inode, change);
+        }
+    }
+
     /// `LWEXT4`, to do anything on this mount but hold a write: what's held
     /// is written first.
     fn lock(&self) -> MutexGuard<'static, [bool; MOUNTS]> {
@@ -880,6 +934,12 @@ unsafe impl Send for File {}
 unsafe impl Sync for File {}
 
 impl File {
+    /// Its inode's number, which no other file on the mount has while it's
+    /// open.
+    pub fn inode(&self) -> u32 {
+        self.inode
+    }
+
     pub fn metadata(&self) -> Result<Metadata, Error> {
         let _lwext4 = self.mount.lock();
         self.mount.stat(self.inode)
@@ -923,7 +983,7 @@ impl File {
         if !self.writable {
             return Err(Error::ReadOnly);
         }
-        let _lwext4 = LWEXT4.lock();
+        let lwext4 = LWEXT4.lock();
         let written = match self.hold(offset, buf)? {
             true => buf.len(),
             false => {
@@ -937,6 +997,8 @@ impl File {
         // write over, and having it written again.
         if written > 0 {
             let _ = self.touch();
+            drop(lwext4);
+            self.mount.tell(self.inode, Change::Written { offset, bytes: &buf[..written] });
         }
         Ok(written)
     }
@@ -989,14 +1051,17 @@ impl File {
         if !self.writable {
             return Err(Error::ReadOnly);
         }
-        let _lwext4 = self.mount.lock();
+        let lwext4 = self.mount.lock();
         let end = self.mount.stat(self.inode)?.size;
         if size < end {
             // Safety: open until `drop`.
             check(unsafe { ffi::ext4_ftruncate(self.raw, size) })?;
         }
         self.fill(end, size)?;
-        self.touch()
+        self.touch()?;
+        drop(lwext4);
+        self.mount.tell(self.inode, Change::Resized { size });
+        Ok(())
     }
 
     /// Change what `changes` says of the file, and its change time.
@@ -1046,6 +1111,7 @@ impl Drop for File {
         let at = open.iter().position(|inode| *inode == self.inode).expect("it was opened");
         open.swap_remove(at);
         let mut kept = self.mount.kept.lock();
+        let mut gone = false;
         if !open.contains(&self.inode)
             && let Some(at) = kept.iter().position(|inode| *inode == self.inode)
         {
@@ -1053,6 +1119,11 @@ impl Drop for File {
             // The last of a file whose other names are gone: it goes too.
             // Safety: as in `Ext4::metadata`.
             unsafe { ffi::ext4_fremove(self.mount.keeper(self.inode).as_ptr()) };
+            gone = true;
+        }
+        drop((kept, open, _lwext4));
+        if gone {
+            self.mount.tell(self.inode, Change::Gone);
         }
     }
 }

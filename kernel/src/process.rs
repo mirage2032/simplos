@@ -1206,9 +1206,21 @@ fn load(
     let outside = "a segment outside the program's area";
     let mut end = 0;
     let mut phdr = None;
-    // What's copied from the file, a piece at a time: a program can be
+    // What's copied from the file, a page at a time: a program can be
     // bigger than the kernel's heap.
-    let mut piece = vec![0; 64 << 10];
+    let mut piece = vec![0; 4096];
+    // The pages each loadable segment is in. One that's in two holds what
+    // two pages of the file do, and is copied.
+    let spans: Vec<_> = elf
+        .segments()
+        .filter(|segment| segment.kind == elf::PT_LOAD)
+        .map(|segment| {
+            let start = base.wrapping_add(segment.vaddr);
+            (start / 4096, start.wrapping_add(segment.memsz).div_ceil(4096))
+        })
+        .collect();
+    let in_one =
+        |page: u64| spans.iter().filter(|span| (span.0..span.1).contains(&page)).count() == 1;
     for segment in elf.segments() {
         match segment.kind {
             elf::PT_LOAD => {
@@ -1224,13 +1236,34 @@ fn load(
                 if segment.flags & elf::PF_X == 0 {
                     flags |= PageTableFlags::NO_EXECUTE;
                 }
-                space.map(pages(start, stop), flags).ok_or(NO_MEMORY)?;
-                let mut done = 0;
-                while done < segment.filesz {
-                    let piece = &mut piece[..(segment.filesz - done).min(64 << 10) as usize];
-                    file.read_at(segment.offset + done, piece).ok_or(elf::UNREADABLE)?;
-                    space.load(start + done, piece).ok_or(outside)?;
-                    done += piece.len() as u64;
+                // A read-only segment's pages are the file's own, from the
+                // page cache, shared with whatever else maps them: those
+                // wholly its, with nothing past what's in the file, which
+                // are zeros. The rest are copies.
+                let shareable =
+                    segment.flags & elf::PF_W == 0 && segment.vaddr % 4096 == segment.offset % 4096;
+                let in_file = start + segment.filesz;
+                for page in pages(start, stop) {
+                    let at = page.start_address().as_u64();
+                    let whole = at + 4096 <= in_file || segment.memsz == segment.filesz;
+                    // Where it is in the file, a whole page there, as the
+                    // segment starts as far into a page in both.
+                    if shareable
+                        && whole
+                        && in_one(at / 4096)
+                        && let Some(frame) = file.page((segment.offset + at - start) / 4096)
+                    {
+                        space.map_shared(page, frame, flags).ok_or(NO_MEMORY)?;
+                        continue;
+                    }
+                    space.map(Page::range(page, page + 1), flags).ok_or(NO_MEMORY)?;
+                    let (from, to) = (at.max(start), (at + 4096).min(in_file));
+                    if from < to {
+                        let piece = &mut piece[..(to - from) as usize];
+                        file.read_at(segment.offset + from - start, piece)
+                            .ok_or(elf::UNREADABLE)?;
+                        space.load(from, piece).ok_or(outside)?;
+                    }
                 }
                 end = end.max(stop);
                 // Without a PT_PHDR, the headers are in the segment that

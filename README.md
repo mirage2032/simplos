@@ -116,6 +116,25 @@ done by `fs/ext4` (see below), behind a lock that sleeps whoever waits for
 it (`thread::SleepLock`), since a call can wait on the disk for a long time.
 The disk is trusted: lwext4 is C, parsing it in ring 0, and isn't fuzzed yet.
 
+What's read of a file is kept in memory, a page at a time, in the page cache
+(`cache.rs`): read again, it comes from there rather than the disk. Programs
+map its pages of their code, and of files they map read-only, all of them
+the same frames, so every program running uutils' coreutils, or linked to
+`libc.so`, has one copy of it between them. What's written goes to the file
+as it's written, and into whatever of it is kept: ext4 tells the cache of
+every change to a file, whoever makes it (`Ext4::watch`). It keeps up to
+128 MiB, gives back the pages no program maps, those used longest ago
+first, as free memory runs low, and all of them when it runs out; and
+`/proc/meminfo` counts them as `Cached`. Under emulation, ten runs of
+uutils' 14 MB `coreutils true` took 10 s before it and take 1 s; a second
+`gcc -O2` of a hello world, 10 s before and 0.7 s now. For now:
+
+- a page a program can write, of its data or of a file it maps writable,
+  is a copy, made as it starts or maps it rather than as it's first
+  written;
+- what's cut off the end of a file stays in the pages programs map of it,
+  where Linux sends SIGBUS for a page past the end.
+
 Programs use it through Linux's system calls, so Rust's `std::fs` (or C's
 stdio) works as it does on Linux: `open`, `openat`, `close`, `read`, `write`,
 `pread64`, `pwrite64`, `lseek`, `stat`, `lstat`, `fstat`, `newfstatat`,
@@ -235,8 +254,9 @@ its hash maps' keys, and `/dev/random` and `/dev/urandom` give random bytes
   stack mapped a page at a time as it's used, and the same turns at the CPU
   as any other;
 
-- `fork` copies all of a program's memory at once, rather than sharing it
-  until either side writes to it;
+- `fork` copies a program's memory at once, but for the page cache's pages
+  it maps, its code's among them, which it shares; rather than sharing all
+  of it until either side writes to it;
 - `clone` without `CLONE_THREAD` copies the program even when asked to share
   its memory (`CLONE_VM`), which is all `posix_spawn` needs, and
   `CLONE_VFORK` doesn't hold the parent back; a thread shares its
@@ -249,10 +269,10 @@ its hash maps' keys, and `/dev/random` and `/dev/urandom` give random bytes
 - there's no `/proc/PID/task`, and a thread's CPU time is its program's;
 - a program that ended keeps its memory until it's waited for, and those
   never waited for go with their parent rather than to an init;
-- `execve` reads all of a program's segments into memory as it starts it,
-  rather than as they're used; and `mmap` all it maps of a file, so a
-  shared library is read from the disk into each program that loads it,
-  rather than shared between them;
+- `execve` maps all of a program's segments as it starts it, rather than
+  as they're used: those it can't write, the page cache's pages, read in if
+  they aren't there, and the rest copied; and `mmap` all it maps of a
+  file;
 - an interpreter must be position-independent, as loaders are, rather than
   at addresses of its own;
 - random bytes come from RDRAND when the CPU has it, which QEMU's default
@@ -423,8 +443,8 @@ needs no new build:
 
 What the completion system knows of its 998 functions it keeps in
 `~/.zcompdump`, which the build makes for root, by running the same zsh:
-made on simplos, it takes half a minute, most of it reading the functions
-a byte at a time, each byte from the disk.
+made on simplos, it takes ten seconds under emulation, most of it reading
+the functions a byte at a time, a system call for each.
 
 `cargo run`'s disk gets all of it as it's made: delete `fullkernel/disk.img`
 for one that has it. Then zsh is what you type at, and once it ends, the
@@ -434,10 +454,6 @@ kernel's own shell. For now:
   which wants a console and an `inittab` there aren't; and without `tc`;
 - the disk's files belong to whoever made it, as `mke2fs -d` copies owners,
   which is why `/etc/zshrc` has `compinit -u`;
-- what's read a little at a time is read from the disk each time, as
-  lwext4 keeps no file's data in memory, so zsh's `read`, which reads a
-  byte at a time, is slow, and vim takes a few seconds to start under
-  emulation, reading its scripts;
 - vim is built without `timer_create`, whose `SIGEV_THREAD` takes a thread,
   so it times what it times out (a regexp, `'redrawtime'`) with `setitimer`;
   and the `flock` it puts on its temporary directory, against cleaners
@@ -480,16 +496,17 @@ the script changes. It builds on x86-64 Linux only.
 AHCI controller, and `cargo run` gives the guest 1 GiB of memory unless `-m`
 is given; a hello world, even in C++ with `<iostream>`, compiles in QEMU's
 default 128 MiB. Under emulation, `gcc -O2` compiles a C hello world there
-in 4 s, and `g++ -O2` an `<iostream>` one in 9 s, or in 28 s with
-`-static`, which reads what it needs of `libstdc++.a` into it. For now:
+in 5 s the first time, and in under 1 s after that, the compiler being in
+the page cache by then; `g++ -O2` an `<iostream>` one in 9 s, then 4 s, or
+14 s with `-static`, which copies what it needs of `libstdc++.a` into it.
+For now:
 
-- a program is read whole as it starts, and that's most of the time it
-  takes: `cc1`, 36 MB, takes 6 s to start from an AHCI disk, read by DMA,
-  and 25 s from an IDE one, read a word at a time by port I/O;
-- a program linked dynamically reads its shared libraries from the disk
-  each time it starts, simplos having nowhere to keep them, so one linked
-  statically starts sooner: that C++ hello world in 0.09 s rather than
-  0.23 s;
+- a program is read whole the first time it starts, and that's most of
+  that time: `cc1`, 36 MB, takes 6 s to read from an AHCI disk, by DMA,
+  and 25 s from an IDE one, a word at a time by port I/O;
+- a program linked dynamically starts a little later than one linked
+  statically, as the loader finds and maps its libraries, which are in the
+  page cache by then: that C++ hello world in 0.03 s rather than 0.01 s;
 - there's no LTO and no sanitizers.
 
 gcc and binutils are GPL-3.0, with GCC's runtime library exception for what's

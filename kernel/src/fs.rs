@@ -18,6 +18,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use ext4::{BlockDevice, DirEntry, Error, Ext4, Kind, Metadata};
+use x86_64::structures::paging::PhysFrame;
 
 /// The mounted file system, if a disk had one. Calls into it can wait on the
 /// disk for a long time, so whoever waits for them sleeps.
@@ -66,6 +67,8 @@ pub fn init() {
         match Ext4::mount_writable(Box::new(Disk { index, sectors: info.sectors })) {
             Ok(fs) => {
                 serial_println!("simplos: ext4 on disk {}", index);
+                fs.watch(crate::cache::changed);
+                crate::cache::clear();
                 *ROOT.lock() = Some(fs);
                 return;
             }
@@ -88,6 +91,7 @@ fn is_ext4(index: usize) -> bool {
 /// Unmount it, leaving the disk clean: before the machine goes off.
 pub fn unmount() {
     ROOT.lock().take();
+    crate::cache::clear();
 }
 
 /// What a file descriptor refers to. Copies of a descriptor share one, and
@@ -566,7 +570,7 @@ pub fn open_program(path: &str) -> Result<Program, i64> {
 }
 
 /// A program's file, open, for its segments to be read from as it's
-/// loaded.
+/// loaded, through the page cache, or mapped from it.
 pub struct Program {
     /// Always there but as it's dropped, which takes the tree.
     file: Option<ext4::File>,
@@ -580,15 +584,16 @@ impl elf::Source for Program {
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Option<()> {
         let _tree = lock();
-        let file = self.file.as_ref()?;
-        let mut done = 0;
-        while done < buf.len() {
-            match file.read_at(offset + done as u64, &mut buf[done..]).ok()? {
-                0 => return None,
-                read => done += read,
-            }
+        let read = crate::cache::read(self.file.as_ref()?, offset, buf).ok()?;
+        (read == buf.len()).then_some(())
+    }
+
+    fn page(&self, index: u64) -> Option<PhysFrame> {
+        if index * 4096 >= self.size {
+            return None;
         }
-        Some(())
+        let _tree = lock();
+        crate::cache::page(self.file.as_ref()?, index).ok()
     }
 }
 

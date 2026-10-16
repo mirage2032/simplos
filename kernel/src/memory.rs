@@ -1,3 +1,4 @@
+use alloc::collections::BTreeMap;
 use bootloader_api::info::{MemoryRegionKind, MemoryRegions};
 use core::ops::Range;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -7,7 +8,9 @@ use x86_64::{
     PhysAddr, VirtAddr,
     structures::paging::{
         FrameAllocator, FrameDeallocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags,
-        PhysFrame, Size4KiB, Translate, mapper::TranslateResult, page::PageRange,
+        PhysFrame, Size4KiB, Translate,
+        mapper::{MappedFrame, TranslateResult},
+        page::PageRange,
     },
 };
 
@@ -178,6 +181,14 @@ pub fn alloc_dma_frame() -> Option<(PhysAddr, *mut u8)> {
     Some((frame.start_address(), ptr))
 }
 
+/// A page whose frame others may hold too: the page cache, and other
+/// address spaces mapping the same page of a file. Never writable, so
+/// never written through; copied to a frame of its own before it's made
+/// writable (`map`, `protect`), let go of rather than freed (`unmap`), and
+/// shared again rather than copied by `fork`. One of the bits the CPU
+/// leaves to the OS.
+pub const SHARED: PageTableFlags = PageTableFlags::BIT_9;
+
 /// A user program's memory: a PML4 of its own, whose upper half is the
 /// kernel's and whose lower half starts empty. Pages are mapped with fresh,
 /// zeroed frames, and dropping it frees every frame and page table in the
@@ -211,12 +222,20 @@ impl AddressSpace {
     }
 
     /// A copy, as `fork` makes for the child: the same mappings, each with a
-    /// frame of its own holding what the original's holds. `None` when
-    /// memory runs out.
+    /// frame of its own holding what the original's holds, but for `SHARED`
+    /// ones, which share theirs. `None` when memory runs out, even once the
+    /// page cache has given back what it can.
     ///
     /// shortcut: every page is copied at once; share them copy-on-write when
     /// forking big programs gets slow.
     pub fn duplicate(&self) -> Option<AddressSpace> {
+        self.try_duplicate().or_else(|| {
+            crate::cache::shrink();
+            self.try_duplicate()
+        })
+    }
+
+    fn try_duplicate(&self) -> Option<AddressSpace> {
         let mut copy = AddressSpace::new()?;
         copy.pages = self.pages;
         copy.stack = self.stack.clone();
@@ -264,8 +283,18 @@ impl AddressSpace {
 
     /// Map fresh zeroed frames over `pages`, accessible to the program, with
     /// `flags` besides. A page already mapped keeps its frame and gets the
-    /// union of its flags and these. `None` when memory runs out.
+    /// union of its flags and these, but a `SHARED` one made writable,
+    /// which gets a copy of its own. `None` when memory runs out, even once
+    /// the page cache has given back what it can.
     pub fn map(&mut self, pages: PageRange, flags: PageTableFlags) -> Option<()> {
+        // Again from the start: what's mapped already stays as it is.
+        self.try_map(pages, flags).or_else(|| {
+            crate::cache::shrink();
+            self.try_map(pages, flags)
+        })
+    }
+
+    fn try_map(&mut self, pages: PageRange, flags: PageTableFlags) -> Option<()> {
         let flags = flags | PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
         // The tables above must let ring 3 through too.
         let table_flags =
@@ -283,6 +312,10 @@ impl AddressSpace {
                     // Writable if either asks; no-execute only if both do.
                     let nx = PageTableFlags::NO_EXECUTE;
                     let union = ((old | flags) & !nx) | (old & flags & nx);
+                    if old.contains(SHARED) && union.contains(PageTableFlags::WRITABLE) {
+                        unshare(&mut mapper, page, union, frames)?;
+                        continue;
+                    }
                     // Safety: the program's own page, keeping its frame.
                     unsafe { mapper.update_flags(page, union) }.ok()?.flush();
                     continue;
@@ -303,28 +336,72 @@ impl AddressSpace {
         done
     }
 
-    /// Unmap `pages` and free their frames. Pages that aren't mapped are skipped.
+    /// Map `frame`, a shared one, at `page`, as `SHARED`, and never
+    /// writable, whatever `flags` say: the hold on it the caller had is this
+    /// mapping's now. What `page` mapped before goes. `None` when memory for
+    /// a page table runs out; then the hold is let go.
+    pub fn map_shared(
+        &mut self,
+        page: Page,
+        frame: PhysFrame,
+        flags: PageTableFlags,
+    ) -> Option<()> {
+        self.unmap(Page::range(page, page + 1));
+        let flags = (flags - PageTableFlags::WRITABLE)
+            | SHARED
+            | PageTableFlags::PRESENT
+            | PageTableFlags::USER_ACCESSIBLE;
+        let table_flags =
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+        let mut frames = FRAMES.lock();
+        let frames = frames.as_mut()?;
+        // Safety: a lower-half page of this address space, unmapped just now;
+        // and a frame whose holders only read it.
+        match unsafe {
+            self.mapper().map_to_with_table_flags(page, frame, flags, table_flags, frames)
+        } {
+            Ok(flush) => flush.flush(),
+            Err(_) => {
+                frames.release(frame);
+                return None;
+            }
+        }
+        self.pages += 1;
+        Some(())
+    }
+
+    /// Unmap `pages` and free their frames, or let go of them if they're
+    /// `SHARED`. Pages that aren't mapped are skipped.
     pub fn unmap(&mut self, pages: PageRange) {
         let mut frames = FRAMES.lock();
         let Some(frames) = frames.as_mut() else { return };
         let mut mapper = self.mapper();
         let mut unmapped = 0;
         for page in pages {
+            let shared = matches!(mapper.translate(page.start_address()),
+                TranslateResult::Mapped { flags, .. } if flags.contains(SHARED));
             if let Ok((frame, flush)) = mapper.unmap(page) {
                 flush.flush();
-                // Safety: unmapped from the only address space that had it.
-                unsafe { frames.deallocate_frame(frame) };
+                match shared {
+                    true => frames.release(frame),
+                    // Safety: unmapped from the only address space that had it.
+                    false => unsafe { frames.deallocate_frame(frame) },
+                }
                 unmapped += 1;
             }
         }
         self.pages -= unmapped;
     }
 
-    /// Zero what's in the mapped pages among `pages`, which stay mapped.
+    /// Zero what's in the mapped pages among `pages`, which stay mapped:
+    /// but for `SHARED` ones, which hold what a file does, and stay as they
+    /// are.
     pub fn zero(&mut self, pages: PageRange) {
         let mapper = self.mapper();
         for page in pages {
-            if let TranslateResult::Mapped { frame, .. } = mapper.translate(page.start_address())
+            if let TranslateResult::Mapped { frame, flags, .. } =
+                mapper.translate(page.start_address())
+                && !flags.contains(SHARED)
                 && let Some(at) = phys_ptr(frame.start_address())
             {
                 // Safety: a frame of the program's, mapped, 4 KiB.
@@ -334,16 +411,37 @@ impl AddressSpace {
     }
 
     /// Give the mapped pages among `pages` these flags, besides being present
-    /// and accessible to the program.
-    pub fn protect(&mut self, pages: PageRange, flags: PageTableFlags) {
+    /// and accessible to the program: a `SHARED` one made writable gets a
+    /// copy of its own first. `None` when memory for one runs out, even
+    /// once the page cache has given back what it can.
+    pub fn protect(&mut self, pages: PageRange, flags: PageTableFlags) -> Option<()> {
+        // Again from the start: what's done stays done.
+        self.try_protect(pages, flags).or_else(|| {
+            crate::cache::shrink();
+            self.try_protect(pages, flags)
+        })
+    }
+
+    fn try_protect(&mut self, pages: PageRange, flags: PageTableFlags) -> Option<()> {
         let flags = flags | PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+        let mut frames = FRAMES.lock();
+        let frames = frames.as_mut()?;
         let mut mapper = self.mapper();
         for page in pages {
+            let TranslateResult::Mapped { flags: old, .. } = mapper.translate(page.start_address())
+            else {
+                continue;
+            };
+            if old.contains(SHARED) && flags.contains(PageTableFlags::WRITABLE) {
+                unshare(&mut mapper, page, flags, frames)?;
+                continue;
+            }
             // Safety: the program's own pages, keeping their frames.
-            if let Ok(flush) = unsafe { mapper.update_flags(page, flags) } {
+            if let Ok(flush) = unsafe { mapper.update_flags(page, flags | (old & SHARED)) } {
                 flush.flush();
             }
         }
+        Some(())
     }
 
     /// Put the mapped pages among `pages` out of the program's reach, as
@@ -352,7 +450,11 @@ impl AddressSpace {
     pub fn hide(&mut self, pages: PageRange) {
         let mut mapper = self.mapper();
         for page in pages {
-            let flags = PageTableFlags::PRESENT | PageTableFlags::NO_EXECUTE;
+            let TranslateResult::Mapped { flags: old, .. } = mapper.translate(page.start_address())
+            else {
+                continue;
+            };
+            let flags = PageTableFlags::PRESENT | PageTableFlags::NO_EXECUTE | (old & SHARED);
             // Safety: the program's own pages, keeping their frames.
             if let Ok(flush) = unsafe { mapper.update_flags(page, flags) } {
                 flush.flush();
@@ -389,9 +491,10 @@ impl AddressSpace {
         Some(())
     }
 
-    /// Copy `bytes` to `addr`, whatever the pages' protection: for the loader.
+    /// Copy `bytes` to `addr`, whatever the pages' protection, but never
+    /// into a `SHARED` one: for the loader.
     pub fn load(&mut self, addr: u64, bytes: &[u8]) -> Option<()> {
-        self.copy(addr, bytes.len(), PageTableFlags::PRESENT, |at, range| {
+        self.copy(addr, bytes.len(), PageTableFlags::PRESENT, SHARED, |at, range| {
             // Safety: `copy` hands out mapped frames, `range.len()` long.
             unsafe {
                 core::ptr::copy_nonoverlapping(bytes[range.clone()].as_ptr(), at, range.len())
@@ -404,7 +507,7 @@ impl AddressSpace {
     pub fn write(&mut self, addr: u64, bytes: &[u8]) -> Option<()> {
         let need =
             PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::WRITABLE;
-        self.copy(addr, bytes.len(), need, |at, range| {
+        self.copy(addr, bytes.len(), need, SHARED, |at, range| {
             // Safety: as in `load`.
             unsafe {
                 core::ptr::copy_nonoverlapping(bytes[range.clone()].as_ptr(), at, range.len())
@@ -416,7 +519,8 @@ impl AddressSpace {
     /// for it. `None` if any of it isn't: the system call's EFAULT.
     pub fn read(&mut self, addr: u64, buf: &mut [u8]) -> Option<()> {
         let need = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
-        self.copy(addr, buf.len(), need, |at, range| {
+        let anything = PageTableFlags::empty();
+        self.copy(addr, buf.len(), need, anything, |at, range| {
             // Safety: as in `load`.
             unsafe {
                 core::ptr::copy_nonoverlapping(at, buf[range.clone()].as_mut_ptr(), range.len())
@@ -426,12 +530,14 @@ impl AddressSpace {
 
     /// Walk `len` bytes from `addr` a page at a time, through the page tables
     /// rather than the addresses themselves, so it works from any address
-    /// space and an unmapped page is an error instead of a page fault.
+    /// space and an unmapped page is an error instead of a page fault: as
+    /// is one without all of `need`, or with any of `forbid`.
     fn copy(
         &mut self,
         addr: u64,
         len: usize,
         need: PageTableFlags,
+        forbid: PageTableFlags,
         mut each: impl FnMut(*mut u8, Range<usize>),
     ) -> Option<()> {
         if addr.checked_add(len as u64)? > USER_END {
@@ -448,7 +554,7 @@ impl AddressSpace {
                 }
                 return None;
             };
-            if !flags.contains(need) {
+            if !flags.contains(need) || flags.intersects(forbid) {
                 return None;
             }
             let chunk = (len - done).min(4096 - (at % 4096) as usize);
@@ -478,6 +584,8 @@ fn free_tables(frame: PhysFrame, level: u8, entries: usize, frames: &mut BootInf
             let below = PhysFrame::containing_address(entry.addr());
             if level > 1 {
                 free_tables(below, level - 1, 512, frames);
+            } else if entry.flags().contains(SHARED) {
+                frames.release(below);
             } else {
                 // Safety: a page of the program's, which is gone.
                 unsafe { frames.deallocate_frame(below) };
@@ -490,9 +598,10 @@ fn free_tables(frame: PhysFrame, level: u8, entries: usize, frames: &mut BootInf
 
 /// Copy what's mapped below `from`, a page table of `level`, through its
 /// first `entries` entries, into `to`, an empty one of the same level: new
-/// tables, and new frames holding the same bytes. Each new table is linked
-/// into `to` before anything goes into it, so a copy cut short by running
-/// out of memory is still freed whole, by its address space's `drop`.
+/// tables, and new frames holding the same bytes, but for `SHARED` pages,
+/// whose frames are held once more instead. Each new table is linked into
+/// `to` before anything goes into it, so a copy cut short by running out
+/// of memory is still freed whole, by its address space's `drop`.
 fn copy_tables(
     from: PhysFrame,
     to: PhysFrame,
@@ -505,6 +614,11 @@ fn copy_tables(
             continue;
         }
         let below = PhysFrame::containing_address(entry.addr());
+        if level == 1 && entry.flags().contains(SHARED) {
+            frames.hold(below);
+            table(to)[i].set_frame(below, entry.flags());
+            continue;
+        }
         let frame = frames.allocate_frame()?;
         if level > 1 {
             table(frame).zero();
@@ -518,6 +632,38 @@ fn copy_tables(
             table(to)[i].set_frame(frame, entry.flags());
         }
     }
+    Some(())
+}
+
+/// Give `page`, mapped `SHARED`, a frame of its own holding what the shared
+/// one does, mapped with `flags`, letting go of the shared one: as copy on
+/// write does, done before it's written. `None` when memory runs out; then
+/// it's as it was.
+fn unshare(
+    mapper: &mut OffsetPageTable,
+    page: Page,
+    flags: PageTableFlags,
+    frames: &mut BootInfoFrameAllocator,
+) -> Option<()> {
+    let table_flags =
+        PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+    let TranslateResult::Mapped { frame: MappedFrame::Size4KiB(shared), .. } =
+        mapper.translate(page.start_address())
+    else {
+        return None;
+    };
+    let own = frames.allocate_frame()?;
+    let (source, target) = (phys_ptr(shared.start_address())?, phys_ptr(own.start_address())?);
+    // Safety: a frame the page maps, and one just allocated.
+    unsafe { core::ptr::copy_nonoverlapping(source, target, 4096) };
+    let (_, flush) = mapper.unmap(page).ok()?;
+    flush.flush();
+    frames.release(shared);
+    // Safety: the page just unmapped, whose tables are still there, now with
+    // a frame no one else has.
+    unsafe { mapper.map_to_with_table_flags(page, own, flags - SHARED, table_flags, frames) }
+        .expect("a page's tables stay as it's unmapped")
+        .flush();
     Some(())
 }
 
@@ -577,6 +723,10 @@ pub struct BootInfoFrameAllocator {
     freed: Option<PhysFrame>,
     /// How many frames are handed out now.
     used: u64,
+    /// The frames handed out to be held by more than one holder (`SHARED`
+    /// pages): how many hold each, by its address. The last to let go of
+    /// one frees it.
+    shared: BTreeMap<u64, u32>,
 }
 
 /// Ends the `freed` stack. Not 0, because frame 0 can be usable memory.
@@ -597,7 +747,14 @@ impl BootInfoFrameAllocator {
     /// requirement is that all frames that are marked as `USABLE` in it are
     /// really unused.
     pub unsafe fn init(memory_map: &'static MemoryRegions) -> Self {
-        BootInfoFrameAllocator { memory_map, region: 0, next: 0, freed: None, used: 0 }
+        BootInfoFrameAllocator {
+            memory_map,
+            region: 0,
+            next: 0,
+            freed: None,
+            used: 0,
+            shared: BTreeMap::new(),
+        }
     }
 
     /// The bytes of memory there are to hand out, and of those the bytes
@@ -609,6 +766,37 @@ impl BootInfoFrameAllocator {
             .map(|region| (region.end / 4096).saturating_sub(region.start.div_ceil(4096)))
             .sum();
         (frames * 4096, (frames - self.used) * 4096)
+    }
+
+    /// A frame for more than one holder to hold, held once, by whoever
+    /// asked: zero it before anyone else reads it.
+    pub fn allocate_shared(&mut self) -> Option<PhysFrame> {
+        let frame = self.allocate_frame()?;
+        self.shared.insert(frame.start_address().as_u64(), 1);
+        Some(frame)
+    }
+
+    /// Hold `frame`, a shared one, once more.
+    pub fn hold(&mut self, frame: PhysFrame) {
+        let holders = self.shared.get_mut(&frame.start_address().as_u64());
+        *holders.expect("a shared frame") += 1;
+    }
+
+    /// Let go of `frame`, a shared one: the last holder to frees it.
+    pub fn release(&mut self, frame: PhysFrame) {
+        let at = frame.start_address().as_u64();
+        let holders = self.shared.get_mut(&at).expect("a shared frame");
+        *holders -= 1;
+        if *holders == 0 {
+            self.shared.remove(&at);
+            // Safety: no one holds it any more.
+            unsafe { self.deallocate_frame(frame) };
+        }
+    }
+
+    /// How many hold `frame`, a shared one: 0 for one that isn't.
+    pub fn holders(&self, frame: PhysFrame) -> u32 {
+        self.shared.get(&frame.start_address().as_u64()).copied().unwrap_or(0)
     }
 
     /// The most recently freed frame, or else the next never handed out.
@@ -680,4 +868,42 @@ fn kernel_stacks_sit_above_a_guard_page() {
     assert!(!mapped(bottom - 1u64), "the guard page below the stack is mapped");
     drop(stack);
     assert!(!mapped(top) && !mapped(bottom), "a dropped stack is still mapped");
+}
+
+#[test_case]
+fn a_shared_page_made_writable_is_copied_first() {
+    // A frame of the kind the page cache shares, holding 0x11s, mapped
+    // read-only; then made writable, by `protect` and by `map`: each time
+    // the page gets a frame of its own holding the same, and the shared one
+    // is let go of, as it was.
+    let frame = FRAMES.lock().as_mut().unwrap().allocate_shared().unwrap();
+    let bytes = || phys_ptr(frame.start_address()).unwrap();
+    // Safety: the frame just allocated, 4 KiB.
+    unsafe { bytes().write_bytes(0x11, 4096) };
+    let holders = || FRAMES.lock().as_ref().unwrap().holders(frame);
+    let page = Page::containing_address(VirtAddr::new(0x1000_0000));
+    let writable = PageTableFlags::WRITABLE;
+    let ways: [fn(&mut AddressSpace, PageRange) -> Option<()>; 2] = [
+        |space, pages| space.protect(pages, PageTableFlags::WRITABLE),
+        |space, pages| space.map(pages, PageTableFlags::WRITABLE),
+    ];
+    for made_writable in ways {
+        let mut space = AddressSpace::new().unwrap();
+        FRAMES.lock().as_mut().unwrap().hold(frame);
+        space.map_shared(page, frame, PageTableFlags::empty()).unwrap();
+        assert_eq!(space.flags(page).map(|flags| flags.contains(SHARED)), Some(true));
+        assert_eq!(holders(), 2);
+        made_writable(&mut space, Page::range(page, page + 1)).unwrap();
+        let flags = space.flags(page).unwrap();
+        assert!(flags.contains(writable) && !flags.contains(SHARED), "{flags:?}");
+        assert_eq!(holders(), 1, "the shared frame is still held");
+        let mut read = [0; 2];
+        space.write(0x1000_0000, &[0x22]).unwrap();
+        space.read(0x1000_0000, &mut read).unwrap();
+        assert_eq!(read, [0x22, 0x11]);
+        // Safety: as above.
+        assert_eq!(unsafe { bytes().read() }, 0x11, "written through the shared frame");
+    }
+    FRAMES.lock().as_mut().unwrap().release(frame);
+    assert_eq!(holders(), 0);
 }
