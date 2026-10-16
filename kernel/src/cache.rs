@@ -17,9 +17,10 @@ use ext4::{Change, Error, File};
 use spin::Mutex;
 use x86_64::structures::paging::PhysFrame;
 
-/// The most pages kept: 128 MiB. Each also takes a little of the kernel's
-/// heap, which is 20 MiB, for good.
-const MOST: usize = 32768;
+/// The most pages kept, but for what programs map: 256 MiB, room for
+/// rustc's 230 MB librustc_driver. Each costs the kernel's heap, which is a
+/// fixed 20 MiB, about 70 bytes.
+const MOST: usize = 65536;
 
 /// Bytes in a page.
 const PAGE: u64 = 4096;
@@ -36,9 +37,11 @@ struct Cache {
     pages: BTreeMap<(u32, u64), Page>,
     /// Counts each use of a page.
     clock: u64,
+    /// Pages read in since `make_room` last looked for some to give back.
+    read_in: usize,
 }
 
-static CACHE: Mutex<Cache> = Mutex::new(Cache { pages: BTreeMap::new(), clock: 0 });
+static CACHE: Mutex<Cache> = Mutex::new(Cache { pages: BTreeMap::new(), clock: 0, read_in: 0 });
 
 /// How many pages are kept, for /proc/meminfo.
 pub fn pages() -> usize {
@@ -184,10 +187,22 @@ pub fn changed(inode: u32, change: Change<'_>) {
 }
 
 /// Give back pages no program maps if free memory is down to a sixteenth
-/// of all of it, or `MOST` are kept: an eighth of them.
+/// of all of it, or `MOST` are kept: an eighth of them. Looked into once an
+/// eighth as many pages as are kept have been read in since the last time,
+/// as looking goes through them all: while programs map most of them, as
+/// rustc maps its 230 MB library, there may be nothing to give back for a
+/// long while.
 fn make_room() {
+    let kept = {
+        let mut cache = CACHE.lock();
+        cache.read_in += 1;
+        if cache.read_in < (cache.pages.len() / 8).max(64) {
+            return;
+        }
+        cache.read_in = 0;
+        cache.pages.len()
+    };
     let (total, free) = FRAMES.lock().as_ref().map_or((0, 0), |frames| frames.memory());
-    let kept = CACHE.lock().pages.len();
     if free < total / 16 || kept >= MOST {
         give_back(kept / 8 + 1);
     }
