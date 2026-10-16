@@ -324,6 +324,133 @@ fn main() {
             map.insert("key", 42);
             println!("{got:?} {differ} {refused:?} {devices:?} {}", map["key"]);
         }
+        // The *at calls given AT_FDCWD zero-extended, as rustix passes it,
+        // which Linux reads as the int it is: PATH written, then opened and
+        // read with openat, a link to it made with symlinkat and read with
+        // readlinkat, and both removed with unlinkat.
+        Some("at-fdcwd") => {
+            const CWD: usize = 0xFFFF_FF9C;
+            let path = arg(2);
+            or_fail(&path, fs::write(&path, "through the working directory"));
+            let name = std::ffi::CString::new(path.clone()).unwrap();
+            let link = std::ffi::CString::new(format!("{path}.link")).unwrap();
+            let (name, link) = (name.as_ptr() as usize, link.as_ptr() as usize);
+            let fd = syscall(257, CWD, name, 0);
+            let mut buf = [0u8; 64];
+            let read = syscall(0, fd as usize, buf.as_mut_ptr() as usize, 64).max(0) as usize;
+            let linked = syscall(266, name, CWD, link);
+            let mut target = [0u8; 64];
+            let len = syscall5(267, [CWD, link, target.as_mut_ptr() as usize, 64, 0]).max(0);
+            let same = str_of(&target[..len as usize]) == path;
+            let removed = [syscall(263, CWD, link, 0), syscall(263, CWD, name, 0)];
+            println!("{} {:?} {linked} {same} {removed:?}", fd > 2, str_of(&buf[..read]));
+        }
+        // The extended attribute calls on PATH, by path, by path without
+        // following a link, and by descriptor: get, list, set and remove;
+        // then get of a path that isn't there and of a descriptor not open.
+        Some("xattrs") => {
+            let file = or_fail(&arg(2), fs::File::open(arg(2)));
+            let fd = file.as_raw_fd() as usize;
+            let path = std::ffi::CString::new(arg(2)).unwrap();
+            let (path, name) = (path.as_ptr() as usize, c"user.probe".as_ptr() as usize);
+            let mut buf = [0u8; 64];
+            let buf = buf.as_mut_ptr() as usize;
+            let calls = [
+                syscall5(191, [path, name, buf, 64, 0]),
+                syscall5(192, [path, name, buf, 64, 0]),
+                syscall5(193, [fd, name, buf, 64, 0]),
+                syscall(194, path, buf, 64),
+                syscall(195, path, buf, 64),
+                syscall(196, fd, buf, 64),
+                syscall5(188, [path, name, buf, 1, 0]),
+                syscall(197, path, name, 0),
+                syscall5(191, [c"/missing".as_ptr() as usize, name, buf, 64, 0]),
+                syscall5(193, [1000, name, buf, 64, 0]),
+            ];
+            println!("{calls:?}");
+        }
+        // fadvise64 on PATH: advice taken; and what it refuses, advice there
+        // isn't, a pipe and a descriptor not open.
+        Some("fadvise") => {
+            let file = or_fail(&arg(2), fs::File::open(arg(2)));
+            let (reader, _writer) = or_fail("pipe", io::pipe());
+            let fadvise = |fd: usize, advice: usize| syscall5(221, [fd, 0, 0, advice, 0]);
+            let fd = file.as_raw_fd() as usize;
+            let results = [
+                fadvise(fd, 4),
+                fadvise(fd, 99),
+                fadvise(reader.as_raw_fd() as usize, 0),
+                fadvise(1000, 0),
+            ];
+            println!("{results:?}");
+        }
+        // socketpair, as Rust's Command makes one: each end reads what the
+        // other writes, with write(2) and read(2) and with send and recv;
+        // close-on-exec, as asked; a socket, to fstat; ready to be written
+        // and not read, to poll. Once one end is closed the other reads
+        // nothing, poll says so, and a send is EPIPE. Then what it refuses:
+        // a family there isn't, a protocol, two types, and send and recv on
+        // what isn't a socket.
+        Some("socketpair") => {
+            let socketpair = |domain: usize, kind: usize, protocol: usize, fds: &mut [i32; 2]| {
+                syscall5(53, [domain, kind, protocol, fds.as_mut_ptr() as usize, 0])
+            };
+            let mut fds = [0i32; 2];
+            let made = socketpair(1, 1 | 0o2000000, 0, &mut fds);
+            let [a, b] = fds.map(|fd| fd as usize);
+            let mut buf = [0u8; 16];
+            let wrote = syscall(1, a, b"ping".as_ptr() as usize, 4);
+            let read = syscall(0, b, buf.as_mut_ptr() as usize, 16);
+            let sent = syscall6(44, [b, b"pong".as_ptr() as usize, 4, 0x4000, 0], 0);
+            let got = syscall6(45, [a, buf[4..].as_mut_ptr() as usize, 12, 0, 0], 0);
+            let cloexec = syscall(72, a, 1, 0);
+            let mut stat = [0u8; 144];
+            syscall(5, a, stat.as_mut_ptr() as usize, 0);
+            let mode = u32::from_le_bytes(stat[24..28].try_into().unwrap());
+            let socket = mode & 0o170000 == 0o140000;
+            let poll = |fd: usize| {
+                let mut pollfd = [0u8; 8];
+                pollfd[..4].copy_from_slice(&(fd as i32).to_le_bytes());
+                pollfd[4..6].copy_from_slice(&(1i16 | 4).to_le_bytes());
+                syscall(7, pollfd.as_mut_ptr() as usize, 1, 0);
+                i16::from_le_bytes(pollfd[6..8].try_into().unwrap())
+            };
+            let open = poll(a);
+            syscall(3, b, 0, 0);
+            let closed = poll(a);
+            let eof = syscall(0, a, buf.as_mut_ptr() as usize, 16);
+            let broken = syscall6(44, [a, b"ping".as_ptr() as usize, 4, 0x4000, 0], 0);
+            let (reader, _writer) = or_fail("pipe", io::pipe());
+            let pipe = reader.as_raw_fd() as usize;
+            let refused = [
+                socketpair(999, 1, 0, &mut fds),
+                socketpair(1, 1, 5, &mut fds),
+                socketpair(1, 4, 0, &mut fds),
+                socketpair(1, 12, 0, &mut fds),
+                syscall6(44, [pipe, b"ping".as_ptr() as usize, 4, 0, 0], 0),
+                syscall6(45, [pipe, buf.as_mut_ptr() as usize, 4, 0, 0], 0),
+            ];
+            println!(
+                "{made} {wrote} {read} {sent} {got} {:?} {cloexec} {socket} {open} {closed} \
+                 {eof} {broken} {refused:?}",
+                str_of(&buf[..8])
+            );
+        }
+        // Rust's Command where posix_spawn won't do, as with a pre_exec
+        // closure: fork, then exec, whose failure it hears of through a
+        // socket pair. PROGRAM run with `hello`, then a program that isn't
+        // there.
+        Some("pre-exec") => {
+            let run = |program: &str| {
+                let mut command = Command::new(program);
+                // Safety: the closure does nothing, which is safe after fork.
+                unsafe { command.arg("hello").pre_exec(|| Ok(())) };
+                command.output()
+            };
+            let ran = or_fail(&arg(2), run(&arg(2)));
+            print!("{}", String::from_utf8_lossy(&ran.stdout));
+            println!("{:?}", run("/missing").map(|_| ()).map_err(|error| error.raw_os_error()));
+        }
         // That the LEN bytes at ADDR are i % 251 for each i: what tools/boot-test
         // puts in /bin/big, a segment bigger than the kernel's heap.
         Some("peek") => {

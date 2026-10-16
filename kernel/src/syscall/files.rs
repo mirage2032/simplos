@@ -3,7 +3,7 @@
 
 use super::{EBADF, EFAULT, EINVAL, ENOTTY, EPERM};
 use crate::fs::{self, Device, Handle};
-use crate::pipe::{self, ReadError, WriteError};
+use crate::pipe::{self, PipeEnd, ReadError, WriteError};
 use crate::process;
 use crate::process::{Fd, Process};
 use crate::signal::{self, ERESTARTSYS, Info};
@@ -23,6 +23,7 @@ const ENOTDIR: i64 = 20;
 const EISDIR: i64 = 21;
 const EMFILE: i64 = 24;
 const ESPIPE: i64 = 29;
+const ENOTSOCK: i64 = 88;
 const ERANGE: i64 = 34;
 const ENAMETOOLONG: i64 = 36;
 const ENOTEMPTY: i64 = 39;
@@ -43,6 +44,13 @@ const O_CLOEXEC: u64 = 0o2000000;
 
 /// A `dirfd` that means the working directory.
 pub const AT_FDCWD: u64 = -100i64 as u64;
+
+/// Whether `dirfd` is `AT_FDCWD`. It's an `int` to Linux, which reads only
+/// its low 32 bits, and rustix, which Rust programs from uutils' on make
+/// their calls through, passes it zero-extended.
+fn is_cwd(dirfd: u64) -> bool {
+    dirfd as u32 == AT_FDCWD as u32
+}
 pub const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
 /// The longest path, with its NUL.
 const PATH_MAX: usize = 4096;
@@ -60,7 +68,7 @@ const MOST: usize = 1 << 20;
 /// it.
 fn most_written(process: &Process, fd: u64) -> usize {
     match handle(process, fd).as_deref() {
-        Ok(Handle::Pipe { .. }) => pipe::CAPACITY,
+        Ok(Handle::Pipe { .. } | Handle::Socket { .. }) => pipe::CAPACITY,
         _ => MOST,
     }
 }
@@ -160,7 +168,7 @@ pub(super) fn lookup_with(
     if path.is_empty() {
         return Err(ENOENT);
     }
-    let base = match (path.starts_with('/'), dirfd == AT_FDCWD) {
+    let base = match (path.starts_with('/'), is_cwd(dirfd)) {
         (true, _) => String::new(),
         (false, true) => process.cwd.lock().clone(),
         (false, false) => match &*handle(process, dirfd)? {
@@ -371,7 +379,9 @@ fn read_at(process: &Process, fd: u64, buf: u64, count: u64, at: Option<u64>) ->
 fn read_data(process: &Process, fd: u64, count: u64, at: Option<u64>) -> Result<Vec<u8>> {
     let count = (count as usize).min(MOST);
     match &*handle(process, fd)? {
-        Handle::Tty { .. } | Handle::Pipe { .. } if at.is_some() => Err(ESPIPE),
+        Handle::Tty { .. } | Handle::Pipe { .. } | Handle::Socket { .. } if at.is_some() => {
+            Err(ESPIPE)
+        }
         Handle::Tty { tty, nonblocking } => {
             tty.read_or_wait(count, !nonblocking.load(Relaxed)).map_err(read_errno)
         }
@@ -387,6 +397,10 @@ fn read_data(process: &Process, fd: u64, count: u64, at: Option<u64>) -> Result<
         Handle::Pipe { .. } if count == 0 => Ok(Vec::new()),
         Handle::Pipe { end, nonblocking } => {
             end.read(count, !nonblocking.load(Relaxed)).map_err(read_errno)
+        }
+        Handle::Socket { .. } if count == 0 => Ok(Vec::new()),
+        Handle::Socket { input, nonblocking, .. } => {
+            input.read(count, !nonblocking.load(Relaxed)).map_err(read_errno)
         }
         Handle::Dir { .. } => Err(EISDIR),
         Handle::Proc { data, offset, .. } => {
@@ -424,27 +438,21 @@ fn write_at(process: &Process, fd: u64, buf: u64, count: u64, at: Option<u64>) -
 fn write_data(process: &Process, fd: u64, data: &[u8], at: Option<u64>) -> Result<i64> {
     let handle = handle(process, fd)?;
     match &*handle {
-        Handle::Tty { .. } | Handle::Pipe { .. } if at.is_some() => Err(ESPIPE),
+        Handle::Tty { .. } | Handle::Pipe { .. } | Handle::Socket { .. } if at.is_some() => {
+            Err(ESPIPE)
+        }
         Handle::Tty { tty, .. } => {
             tty.write(data);
             Ok(data.len() as i64)
         }
         Handle::Null | Handle::Zero | Handle::Random { .. } => Ok(data.len() as i64),
         Handle::Pipe { end, .. } if !end.write => Err(EBADF),
-        Handle::Pipe { end, nonblocking } => match end.write(data, !nonblocking.load(Relaxed)) {
-            Ok(written) => Ok(written as i64),
-            // And SIGPIPE, to the thread that wrote, as Linux sends it,
-            // which ends a program that doesn't ignore it.
-            Err(WriteError::Broken) => {
-                let info = Info::user(process.id);
-                if let Some(task) = crate::thread::current_task() {
-                    signal::send_thread(process, &task, signal::SIGPIPE, info);
-                }
-                Err(EPIPE)
-            }
-            Err(WriteError::Full) => Err(EAGAIN),
-            Err(WriteError::Interrupted) => Err(ERESTARTSYS),
-        },
+        Handle::Pipe { end, nonblocking } => {
+            write_pipe(process, end, data, !nonblocking.load(Relaxed), true)
+        }
+        Handle::Socket { output, nonblocking, .. } => {
+            write_pipe(process, output, data, !nonblocking.load(Relaxed), true)
+        }
         Handle::Dir { .. } | Handle::Proc { .. } | Handle::File { write: false, .. } => Err(EBADF),
         Handle::File { file, append, offset, .. } => {
             let _tree = fs::lock();
@@ -461,6 +469,30 @@ fn write_data(process: &Process, fd: u64, data: &[u8], at: Option<u64>) -> Resul
             }
             Ok(written as i64)
         }
+    }
+}
+
+/// Write `data` into the pipe `end` writes, waiting for room if `wait`: and
+/// if no one reads it any more, EPIPE, and SIGPIPE if `sigpipe`, which ends
+/// a program that doesn't ignore it.
+fn write_pipe(
+    process: &Process,
+    end: &PipeEnd,
+    data: &[u8],
+    wait: bool,
+    sigpipe: bool,
+) -> Result<i64> {
+    match end.write(data, wait) {
+        Ok(written) => Ok(written as i64),
+        Err(WriteError::Broken) => {
+            // To the thread that wrote, as Linux sends it.
+            if sigpipe && let Some(task) = crate::thread::current_task() {
+                signal::send_thread(process, &task, signal::SIGPIPE, Info::user(process.id));
+            }
+            Err(EPIPE)
+        }
+        Err(WriteError::Full) => Err(EAGAIN),
+        Err(WriteError::Interrupted) => Err(ERESTARTSYS),
     }
 }
 
@@ -532,7 +564,7 @@ pub fn lseek(process: &Process, fd: u64, offset: u64, whence: u64) -> i64 {
     ret((|| {
         let offset = offset as i64;
         match &*handle(process, fd)? {
-            Handle::Tty { .. } | Handle::Pipe { .. } => Err(ESPIPE),
+            Handle::Tty { .. } | Handle::Pipe { .. } | Handle::Socket { .. } => Err(ESPIPE),
             Handle::Null | Handle::Zero | Handle::Random { .. } => Ok(0),
             handle @ (Handle::File { offset: place, .. } | Handle::Proc { offset: place, .. }) => {
                 let _tree = fs::lock();
@@ -610,7 +642,7 @@ pub fn newfstatat(process: &Process, dirfd: u64, path: u64, buf: u64, flags: u64
     ret((|| {
         let path = path_at(process, path)?;
         // The file `dirfd` is open on itself.
-        if path.is_empty() && flags & AT_EMPTY_PATH != 0 && dirfd != AT_FDCWD {
+        if path.is_empty() && flags & AT_EMPTY_PATH != 0 && !is_cwd(dirfd) {
             return put_stat(process, &metadata(&*handle(process, dirfd)?)?, buf);
         }
         let path = match path.is_empty() && flags & AT_EMPTY_PATH != 0 {
@@ -748,6 +780,7 @@ pub fn fcntl(process: &Process, fd: u64, command: u64, arg: u64) -> i64 {
                 Handle::Pipe { end, nonblocking } => {
                     end.write as i64 | nonblocking_flag(nonblocking)
                 }
+                Handle::Socket { nonblocking, .. } => 2 | nonblocking_flag(nonblocking),
                 Handle::Dir { .. } => (O_RDONLY | O_DIRECTORY) as i64,
                 Handle::Proc { .. } => O_RDONLY as i64,
                 Handle::File { read, write, append, .. } => {
@@ -876,28 +909,161 @@ pub fn pipe2(process: &Process, fds: u64, flags: u64) -> i64 {
         if flags & !(O_CLOEXEC | O_NONBLOCK) != 0 {
             return Err(EINVAL);
         }
-        let cloexec = flags & O_CLOEXEC != 0;
         let (read, write) = pipe::new();
-        let (read, write) = (Handle::pipe(read), Handle::pipe(write));
-        set_nonblocking(&read, flags);
-        set_nonblocking(&write, flags);
-        let read = install(process, read, cloexec)?;
-        let installed = install(process, write, cloexec).and_then(|write| {
-            let mut ends = [0u8; 8];
-            ends[..4].copy_from_slice(&(read as i32).to_le_bytes());
-            ends[4..].copy_from_slice(&(write as i32).to_le_bytes());
-            if process.memory.lock().space.write(fds, &ends).is_none() {
-                let gone = process.files.lock()[write as usize].take();
-                drop(gone);
-                return Err(EFAULT);
-            }
-            Ok(0)
-        });
-        if installed.is_err() {
-            let gone = process.files.lock()[read as usize].take();
+        install_pair(process, [Handle::pipe(read), Handle::pipe(write)], flags, fds)
+    })())
+}
+
+/// Give the two handles of a pipe or a socket pair descriptors, with
+/// O_NONBLOCK and O_CLOEXEC as `flags` asks, and write the two at `fds`, as
+/// `int`s: neither, if they can't be.
+fn install_pair(process: &Process, pair: [Handle; 2], flags: u64, fds: u64) -> Result<i64> {
+    let cloexec = flags & O_CLOEXEC != 0;
+    let [first, second] = pair;
+    set_nonblocking(&first, flags);
+    set_nonblocking(&second, flags);
+    let first = install(process, first, cloexec)?;
+    let installed = install(process, second, cloexec).and_then(|second| {
+        let mut ends = [0u8; 8];
+        ends[..4].copy_from_slice(&(first as i32).to_le_bytes());
+        ends[4..].copy_from_slice(&(second as i32).to_le_bytes());
+        if process.memory.lock().space.write(fds, &ends).is_none() {
+            let gone = process.files.lock()[second as usize].take();
             drop(gone);
+            return Err(EFAULT);
         }
-        installed
+        Ok(0)
+    });
+    if installed.is_err() {
+        let gone = process.files.lock()[first as usize].take();
+        drop(gone);
+    }
+    installed
+}
+
+/// The flags `send`, `recv` and the like take: not to wait, not to be sent
+/// SIGPIPE, and those this has nothing for.
+const MSG_OOB: u64 = 0x1;
+const MSG_PEEK: u64 = 0x2;
+const MSG_DONTWAIT: u64 = 0x40;
+const MSG_WAITALL: u64 = 0x100;
+const MSG_NOSIGNAL: u64 = 0x4000;
+const EOPNOTSUPP: i64 = 95;
+
+/// `socketpair`: two connected sockets, each reading what the other writes,
+/// as Rust's `Command` makes to hear whether `execve` failed. Unix-domain
+/// sockets only: there's no network.
+pub fn socketpair(process: &Process, domain: u64, kind: u64, protocol: u64, fds: u64) -> i64 {
+    const AF_UNIX: u64 = 1;
+    const SOCK_STREAM: u64 = 1;
+    const SOCK_DGRAM: u64 = 2;
+    const SOCK_RAW: u64 = 3;
+    const SOCK_SEQPACKET: u64 = 5;
+    const EPROTONOSUPPORT: i64 = 93;
+    const ESOCKTNOSUPPORT: i64 = 94;
+    const EAFNOSUPPORT: i64 = 97;
+    ret((|| {
+        if domain != AF_UNIX {
+            return Err(EAFNOSUPPORT);
+        }
+        // SOCK_NONBLOCK and SOCK_CLOEXEC are O_NONBLOCK and O_CLOEXEC.
+        let flags = kind & (O_NONBLOCK | O_CLOEXEC);
+        match kind & !flags {
+            // A raw one is a datagram one, for Unix-domain sockets.
+            SOCK_STREAM | SOCK_DGRAM | SOCK_RAW | SOCK_SEQPACKET => {}
+            11.. => return Err(EINVAL),
+            _ => return Err(ESOCKTNOSUPPORT),
+        }
+        if protocol != 0 {
+            return Err(EPROTONOSUPPORT);
+        }
+        let (one_in, two_out) = pipe::new();
+        let (two_in, one_out) = pipe::new();
+        let pair = [Handle::socket(one_in, one_out), Handle::socket(two_in, two_out)];
+        install_pair(process, pair, flags, fds)
+    })())
+}
+
+/// `sendto`, which `send` comes to: `write`, but for a socket, ENOTSOCK
+/// otherwise; MSG_DONTWAIT not to wait for room, MSG_NOSIGNAL not to be sent
+/// SIGPIPE. A connected socket takes no address to send to.
+pub fn sendto(process: &Process, fd: u64, buf: u64, len: u64, flags: u64, to: [u64; 2]) -> i64 {
+    const EISCONN: i64 = 106;
+    ret((|| {
+        let handle = handle(process, fd)?;
+        let Handle::Socket { output, nonblocking, .. } = &*handle else { return Err(ENOTSOCK) };
+        if flags & MSG_OOB != 0 {
+            return Err(EOPNOTSUPP);
+        }
+        if to[0] != 0 && to[1] != 0 {
+            return Err(EISCONN);
+        }
+        let mut data = vec![0; (len as usize).min(pipe::CAPACITY)];
+        process.memory.lock().space.read(buf, &mut data).ok_or(EFAULT)?;
+        let wait = !nonblocking.load(Relaxed) && flags & MSG_DONTWAIT == 0;
+        write_pipe(process, output, &data, wait, flags & MSG_NOSIGNAL == 0)
+    })())
+}
+
+/// `recvfrom`, which `recv` comes to: `read`, but for a socket, ENOTSOCK
+/// otherwise, and MSG_DONTWAIT not to wait. Where it came from, if asked, is
+/// nowhere: the other end of a pair has no address, so its length is 0, as
+/// Linux says.
+///
+/// shortcut: no MSG_PEEK or MSG_WAITALL; nothing has needed them.
+pub fn recvfrom(process: &Process, fd: u64, buf: u64, len: u64, flags: u64, from: [u64; 2]) -> i64 {
+    ret((|| {
+        let handle = handle(process, fd)?;
+        let Handle::Socket { input, nonblocking, .. } = &*handle else { return Err(ENOTSOCK) };
+        if flags & (MSG_OOB | MSG_PEEK | MSG_WAITALL) != 0 {
+            return Err(EOPNOTSUPP);
+        }
+        let wait = !nonblocking.load(Relaxed) && flags & MSG_DONTWAIT == 0;
+        let data = match len {
+            0 => Vec::new(),
+            len => input.read((len as usize).min(MOST), wait).map_err(read_errno)?,
+        };
+        let mut memory = process.memory.lock();
+        memory.space.write(buf, &data).ok_or(EFAULT)?;
+        if from[0] != 0 && from[1] != 0 {
+            memory.space.write(from[1], &0u32.to_le_bytes()).ok_or(EFAULT)?;
+        }
+        Ok(data.len() as i64)
+    })())
+}
+
+/// The extended attribute calls, `setxattr` (188) to `fremovexattr` (199),
+/// in threes: by path, by path without following a link at its end, and by
+/// descriptor, as `kind` says, 0 to 2. There are none here, as on a file
+/// system without them on Linux: what lists them lists none, and what gets,
+/// sets or removes one is EOPNOTSUPP, once what they name is found. Which
+/// uutils' `cp -a` takes as nothing to copy.
+pub fn xattr(process: &Process, number: u64, target: u64) -> i64 {
+    const LISTXATTR: u64 = 194;
+    ret((|| {
+        match (number - 188) % 3 {
+            2 => drop(handle(process, target)?),
+            kind => {
+                let path = lookup_with(process, AT_FDCWD, &path_at(process, target)?, kind == 0)?;
+                fs::lock().metadata(&path).map_err(fs::errno)?;
+            }
+        }
+        if (LISTXATTR..LISTXATTR + 3).contains(&number) { Ok(0) } else { Err(EOPNOTSUPP) }
+    })())
+}
+
+/// `fadvise64`: advice on how the file `fd` is open on will be read,
+/// taken, as nothing here reads ahead or keeps less for it; but not for a
+/// pipe (ESPIPE), and not advice there isn't.
+pub fn fadvise(process: &Process, fd: u64, advice: u64) -> i64 {
+    ret((|| {
+        if let Handle::Pipe { .. } = &*handle(process, fd)? {
+            return Err(ESPIPE);
+        }
+        if advice > 5 {
+            return Err(EINVAL);
+        }
+        Ok(0)
     })())
 }
 

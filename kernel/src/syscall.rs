@@ -271,6 +271,11 @@ fn call(frame: &Frame) -> i64 {
         38 => clocks::setitimer(&process, a0, a1, a2),
         39 => process.id as i64,
         40 => files::sendfile(&process, a0, a1, a2, a3),
+        44 => files::sendto(&process, a0, a1, a2, a3, [a4, a5]),
+        45 => files::recvfrom(&process, a0, a1, a2, a3, [a4, a5]),
+        53 => files::socketpair(&process, a0, a1, a2, a3),
+        188..=199 => files::xattr(&process, frame.nr, a0),
+        221 => files::fadvise(&process, a0, a3),
         // The copy or the new thread starts as the call returns, with 0
         // its result.
         56 => processes::clone(&process, frame.registers(0), a0, a1, [a2, a3], a4),
@@ -413,6 +418,17 @@ fn readiness(handle: &Handle) -> i16 {
                     } else {
                         0
                     }
+                }
+            }
+        }
+        // Once the other end has closed, a read or a write won't wait: one
+        // gets nothing, the other EPIPE.
+        Handle::Socket { input, output, .. } => {
+            let (incoming, outgoing) = (input.poll(), output.poll());
+            match incoming.closed {
+                true => POLLIN | POLLOUT | POLLHUP,
+                false => {
+                    (if incoming.now { POLLIN } else { 0 }) | if outgoing.now { POLLOUT } else { 0 }
                 }
             }
         }

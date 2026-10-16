@@ -112,6 +112,13 @@ pub enum Handle {
         /// O_NONBLOCK: a read or write that would wait fails instead.
         nonblocking: AtomicBool,
     },
+    /// One of a pair of connected sockets, as `socketpair` makes them: a
+    /// pipe each way, what's written into one read out of the other.
+    ///
+    /// shortcut: datagram and sequenced-packet sockets as stream ones, the
+    /// messages written into them not kept apart; nothing reads more than
+    /// one at a time from them here, as Rust's `Command` doesn't.
+    Socket { input: crate::pipe::PipeEnd, output: crate::pipe::PipeEnd, nonblocking: AtomicBool },
     File {
         file: ext4::File,
         read: bool,
@@ -148,10 +155,16 @@ impl Handle {
         Handle::Pipe { end, nonblocking: AtomicBool::new(false) }
     }
 
+    pub fn socket(input: crate::pipe::PipeEnd, output: crate::pipe::PipeEnd) -> Handle {
+        Handle::Socket { input, output, nonblocking: AtomicBool::new(false) }
+    }
+
     /// Its O_NONBLOCK, for what can make a program wait: none for the rest.
     pub fn nonblocking(&self) -> Option<&AtomicBool> {
         match self {
-            Handle::Tty { nonblocking, .. } | Handle::Pipe { nonblocking, .. } => Some(nonblocking),
+            Handle::Tty { nonblocking, .. }
+            | Handle::Pipe { nonblocking, .. }
+            | Handle::Socket { nonblocking, .. } => Some(nonblocking),
             _ => None,
         }
     }
@@ -239,6 +252,7 @@ pub fn special(handle: &Handle) -> Option<Metadata> {
         Handle::Random { urandom: true } => Some(device_metadata(Device::Urandom)),
         // A FIFO.
         Handle::Pipe { .. } => Some(special_metadata(0, 0o010600)),
+        Handle::Socket { .. } => Some(special_metadata(0, 0o140777)),
         Handle::File { .. } | Handle::Dir { .. } | Handle::Proc { .. } => None,
     }
 }

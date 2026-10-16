@@ -88,6 +88,9 @@ pub fn node(path: &str, disk: Option<&Ext4>) -> Option<Node> {
                 "status" => file(status(&process)),
                 "cmdline" => Some(Node::File(process.command.lock().args.clone())),
                 "comm" => file(format!("{}\n", process.command.lock().name)),
+                // What's mounted where it sees: as everyone does.
+                "mounts" => file(mounts(disk)),
+                "mountinfo" => file(mountinfo(disk)),
                 _ => None,
             }
         }
@@ -95,7 +98,7 @@ pub fn node(path: &str, disk: Option<&Ext4>) -> Option<Node> {
 }
 
 /// What's in each process's directory, but for `fd`.
-const PROCESS_FILES: [&str; 4] = ["cmdline", "comm", "stat", "status"];
+const PROCESS_FILES: [&str; 6] = ["cmdline", "comm", "mountinfo", "mounts", "stat", "status"];
 
 /// The entries of a directory of `process`'s open descriptors, at `path`,
 /// a path from the root: /dev/fd or /proc/PID/fd.
@@ -185,6 +188,18 @@ fn mounts(disk: Option<&Ext4>) -> String {
         None => "rootfs / rootfs ro 0 0\n",
     };
     format!("{root}devtmpfs /dev devtmpfs rw 0 0\nproc /proc proc rw 0 0\n")
+}
+
+/// The same, as /proc/PID/mountinfo has it, which uutils' `df` reads: for
+/// each, numbers for it and the one it's on, its device's, the root of
+/// what's mounted, where, its options, a dash, then its type, what it's
+/// mounted from and the file system's own options.
+fn mountinfo(disk: Option<&Ext4>) -> String {
+    let root = match disk {
+        Some(_) => "1 1 8:0 / / rw,relatime - ext4 /dev/root rw\n",
+        None => "1 1 0:1 / / ro - rootfs rootfs ro\n",
+    };
+    format!("{root}2 1 0:5 / /dev rw - devtmpfs devtmpfs rw\n3 1 0:4 / /proc rw - proc proc rw\n")
 }
 
 /// Each disk's reads and writes since boot, and their sectors, by the
