@@ -146,8 +146,9 @@ impl Action {
 pub struct Info {
     pub code: i32,
     pub pid: u64,
-    /// A child's exit status, or the signal that ended or stopped it.
-    pub status: i32,
+    /// A child's exit status, or the signal that ended or stopped it; or
+    /// what a timer was set to send, which can be a pointer.
+    pub status: i64,
 }
 
 impl Info {
@@ -656,7 +657,8 @@ pub fn siginfo(signal: usize, info: Info) -> [u8; SIGINFO] {
     put(0, signal as i32);
     put(8, info.code);
     put(16, info.pid as i32);
-    put(24, info.status);
+    // A child's status is an `int`, with padding after it to `si_value`'s 8.
+    bytes[24..32].copy_from_slice(&info.status.to_le_bytes());
     bytes
 }
 

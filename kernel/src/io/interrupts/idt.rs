@@ -36,6 +36,11 @@ pub static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     }
     idt[InterruptIndex::Keyboard.as_u8()].set_handler_fn(keyboard_interrupt_handler);
     idt[InterruptIndex::Ps2Mouse.as_u8()].set_handler_fn(mouse_interrupt_handler);
+    // What an 8259 sends on its last line, masked or not, when an interrupt
+    // went before it was taken. With no handler, a fault: real hardware's
+    // halted the kernel, or ended whichever program was running.
+    idt[InterruptIndex::Parallel1.as_u8()].set_handler_fn(spurious_at_master);
+    idt[InterruptIndex::SecondaryAta.as_u8()].set_handler_fn(spurious_at_slave);
     idt
 });
 /// A breakpoint is a trap, not a fault: `int3` is how a debugger (or a test)
@@ -326,6 +331,16 @@ extern "x86-interrupt" fn general_protection_fault_handler(frame: InterruptStack
 extern "x86-interrupt" fn alignment_check_handler(frame: InterruptStackFrame, error: u64) {
     fault(&frame, format_args!("alignment check ({error:#x})"), SIGBUS)
 }
+
+/// The master's spurious interrupt: not one, so not ended either.
+extern "x86-interrupt" fn spurious_at_master(_stack_frame: InterruptStackFrame) {}
+
+/// The slave's: the master, which passed it on, still has to be told it's
+/// done with it.
+extern "x86-interrupt" fn spurious_at_slave(_stack_frame: InterruptStackFrame) {
+    pic::end_at_master();
+}
+
 extern "x86-interrupt" fn mouse_interrupt_handler(_stack_frame: InterruptStackFrame) {
     if let Some(controller) = PS2_CONTROLLER.lock().as_mut()
         && controller.output_has_data()

@@ -446,7 +446,7 @@ int ext4_mount(const char *dev_name, const char *mount_point,
 int ext4_umount(const char *mount_point)
 {
 	int i;
-	int r;
+	int r, fini;
 	struct ext4_mountpoint *mp = 0;
 
 	for (i = 0; i < CONFIG_EXT4_MOUNTPOINTS_COUNT; ++i) {
@@ -459,17 +459,20 @@ int ext4_umount(const char *mount_point)
 	if (!mp)
 		return ENODEV;
 
+	/* LOCAL PATCH: unmounted even if the superblock can't be written.
+	 * Left mounted, the slot kept its name and the device, which the
+	 * caller frees, and the next mount by that name was taken as done
+	 * already, on the freed device. */
 	r = ext4_fs_fini(&mp->fs);
-	if (r != EOK)
-		goto Finish;
 
 	mp->mounted = 0;
 
 	ext4_bcache_cleanup(mp->fs.bdev->bc);
 	ext4_bcache_fini_dynamic(mp->fs.bdev->bc);
 
-	r = ext4_block_fini(mp->fs.bdev);
-Finish:
+	fini = ext4_block_fini(mp->fs.bdev);
+	if (r == EOK)
+		r = fini;
 	mp->fs.bdev->fs = NULL;
 	return r;
 }
@@ -528,7 +531,10 @@ static int __ext4_journal_stop(const char *mount_point)
 	if (!mp)
 		return ENOENT;
 
-	if (mp->fs.read_only)
+	/* LOCAL PATCH: stopped if it was started, though the file system may
+	 * be read-only since (see __ext4_trans_stop): left, the next mount in
+	 * this slot found it, and started transactions on it. */
+	if (!mp->fs.jbd_journal)
 		return EOK;
 
 	if (ext4_sb_feature_com(&mp->fs.sb,
@@ -643,6 +649,13 @@ static int __ext4_trans_stop(struct ext4_mountpoint *mp)
 		struct jbd_trans *trans = mp->fs.curr_trans;
 		r = jbd_journal_commit_trans(journal, trans);
 		mp->fs.curr_trans = NULL;
+		/* LOCAL PATCH: a transaction the journal couldn't take is lost,
+		 * though what it changed shows in memory, and none of the callers
+		 * looks at this: nothing more is written, as Linux's
+		 * errors=remount-ro has it, and src/glue.c's
+		 * simplos_ext4_stopped tells sync. */
+		if (r != EOK)
+			mp->fs.read_only = true;
 	}
 	return r;
 }
@@ -761,7 +774,9 @@ static int ext4_path_check(const char *path, bool *is_goal)
 {
 	int i;
 
-	for (i = 0; i < EXT4_DIRECTORY_FILENAME_LEN; ++i) {
+	/* LOCAL PATCH: to the byte after the longest name, which ends it: a
+	 * name of exactly 255 bytes, ext4's most, wasn't found. */
+	for (i = 0; i <= EXT4_DIRECTORY_FILENAME_LEN; ++i) {
 
 		if (path[i] == '/') {
 			*is_goal = false;
@@ -1696,18 +1711,19 @@ static int ext4_ftruncate_no_lock(ext4_file *file, uint64_t size)
 		goto Finish;
 
 	r = ext4_trunc_inode(file->mp, ref.index, size);
+
+	/*Stop write back cache mode*/
+	/* LOCAL PATCH: whether that worked or not. Left on, a mount without a
+	 * journal kept every block it changed after in memory, and sync
+	 * didn't write them. The same in ext4_fwrite and ext4_fsymlink_set. */
+	ext4_block_cache_write_back(file->mp->fs.bdev, 0);
+
 	if (r != EOK)
 		goto Finish;
 
 	file->fsize = size;
 	if (file->fpos > size)
 		file->fpos = size;
-
-	/*Stop write back cache mode*/
-	ext4_block_cache_write_back(file->mp->fs.bdev, 0);
-
-	if (r != EOK)
-		goto Finish;
 
 Finish:
 	ext4_fs_put_inode_ref(&ref);
@@ -1930,6 +1946,7 @@ int ext4_fwrite(ext4_file *file, const void *buf, size_t size, size_t *wcnt)
 	struct ext4_inode_ref ref;
 	const uint8_t *u8_buf = buf;
 	int r, rr = EOK;
+	bool write_back = false;
 
 	ext4_assert(file && file->mp);
 
@@ -1997,6 +2014,7 @@ int ext4_fwrite(ext4_file *file, const void *buf, size_t size, size_t *wcnt)
 	r = ext4_block_cache_write_back(file->mp->fs.bdev, 1);
 	if (r != EOK)
 		goto Finish;
+	write_back = true;
 
 	fblock_start = 0;
 	fblock_count = 0;
@@ -2057,6 +2075,7 @@ int ext4_fwrite(ext4_file *file, const void *buf, size_t size, size_t *wcnt)
 
 	/*Stop write back cache mode*/
 	ext4_block_cache_write_back(file->mp->fs.bdev, 0);
+	write_back = false;
 
 	if (r != EOK)
 		goto Finish;
@@ -2093,6 +2112,11 @@ out_fsize:
 	}
 
 Finish:
+	/* LOCAL PATCH: stopped on the ways out above that skip it, as in
+	 * ext4_ftruncate_no_lock. */
+	if (write_back)
+		ext4_block_cache_write_back(file->mp->fs.bdev, 0);
+
 	r = ext4_fs_put_inode_ref(&ref);
 
 	if (r != EOK)
@@ -2616,7 +2640,7 @@ static int ext4_fsymlink_set(ext4_file *f, const void *buf, uint32_t size)
 		ext4_fs_inode_blocks_init(&f->mp->fs, &ref);
 		r = ext4_fs_append_inode_dblk(&ref, &fblock, &sblock);
 		if (r != EOK)
-			goto Finish;
+			goto Stop;
 
 		/* LOCAL PATCH: the target in a block otherwise zeroed, as Linux
 		 * writes it. The block can hold whatever a file freed before left
@@ -2625,17 +2649,18 @@ static int ext4_fsymlink_set(ext4_file *f, const void *buf, uint32_t size)
 		uint8_t *block = ext4_calloc(1, block_size);
 		if (!block) {
 			r = ENOMEM;
-			goto Finish;
+			goto Stop;
 		}
 		memcpy(block, buf, size);
 		off = fblock * block_size;
 		r = ext4_block_writebytes(f->mp->fs.bdev, off, block, block_size);
 		ext4_free(block);
-		if (r != EOK)
-			goto Finish;
 	}
 
+Stop:
 	/*Stop write back cache mode*/
+	/* LOCAL PATCH: whether that worked or not, as in
+	 * ext4_ftruncate_no_lock. */
 	ext4_block_cache_write_back(f->mp->fs.bdev, 0);
 
 	if (r != EOK)

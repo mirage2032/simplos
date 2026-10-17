@@ -42,22 +42,16 @@ pub fn init_pics() {
 }
 
 pub fn config_pics() {
-    // Read the current interrupt masks
-    let mut masks = unsafe { PICS.lock().read_masks() };
+    // The lines with handlers, and no others, whatever the firmware left
+    // open: an interrupt with none is a fault. IRQ 0 (timer), 1 (keyboard)
+    // and 2 (the slave) on the master, and IRQ 12 (mouse) on the slave.
+    unsafe { PICS.lock().write_masks(!0b0000_0111, !0b0001_0000) };
+}
 
-    // Unmask required IRQs
-    let timer_bit = !(1 << 0); // Bit 0 corresponds to IRQ0 (timer)
-    let keyboard_bit = !(1 << 1); // Bit 1 corresponds to IRQ1 (keyboard)
-    let pic2_bit = !(1 << 2); // Bit 2 corresponds to IRQ2 (cascade)
-    let mouse_bit = !(1 << 4); // Bit 4 corresponds to IRQ12 (mouse on PIC2)
-
-    masks[0] &= timer_bit; // Clear the mask for IRQ0 on PIC1
-    masks[0] &= keyboard_bit; // Clear the mask for IRQ1 on PIC1
-    masks[0] &= pic2_bit; // Clear the mask for IRQ2 on PIC1
-    masks[1] &= mouse_bit; // Clear the mask for IRQ12 on PIC2
-
-    // Write the updated masks back to the PICs
-    unsafe { PICS.lock().write_masks(masks[0], masks[1]) };
+/// End an interrupt at the master alone, as the slave's spurious one is.
+pub fn end_at_master() {
+    // Safety: 0x20 is the master's command port, and 0x20 there is EOI.
+    unsafe { x86_64::instructions::port::Port::<u8>::new(0x20).write(0x20u8) };
 }
 
 pub fn notify_end_of_interrupt(interrupt_index: &InterruptIndex) {

@@ -108,7 +108,7 @@ pub struct Timer {
     pub clock: u64,
     pub signal: usize,
     pub thread: Option<u64>,
-    pub value: i32,
+    pub value: i64,
 }
 
 /// The most timers a program can have at once.

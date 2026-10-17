@@ -61,8 +61,11 @@ const VEOL2: usize = 16;
 /// The most a line can hold, as on Linux: the rest of what's typed into it
 /// is dropped, but for the end of the line.
 const MOST_LINE: usize = 4095;
-/// The most typed ahead, outside canonical mode, before more is dropped.
+/// The most typed ahead before more is dropped.
 const MOST_READY: usize = 64 * 1024;
+/// And in canonical mode, the most lines, each kept apart; an end of file
+/// is an empty one.
+const MOST_LINES: usize = 4096;
 
 /// Linux's `struct termios`, as `TCGETS` and `TCSETS` pass it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -315,6 +318,15 @@ impl State {
         self.line.clear();
     }
 
+    /// A line to be read, unless as much as is kept is waiting already: a
+    /// program that never reads could fill the heap, with the terminal's
+    /// own answers to it.
+    fn finish(&mut self, line: Vec<u8>) {
+        if self.ready.len() < MOST_LINES && self.available() < MOST_READY {
+            self.ready.push_back(line);
+        }
+    }
+
     /// Take up to `most` bytes into `taken`, if there's enough to read:
     /// whether the read is done.
     fn take(&mut self, most: usize, taken: &mut Vec<u8>) -> bool {
@@ -410,11 +422,11 @@ impl State {
         } else if is(VEOF) {
             // Not echoed, and not part of what's read.
             let line = core::mem::take(&mut self.line);
-            self.ready.push_back(line);
+            self.finish(line);
         } else if byte == b'\n' || is(VEOL) || is(VEOL2) {
             self.line.push(byte);
             let line = core::mem::take(&mut self.line);
-            self.ready.push_back(line);
+            self.finish(line);
             if echoing || (byte == b'\n' && lflag & ECHONL != 0) {
                 echo.push(byte);
             }
@@ -505,6 +517,17 @@ fn raw_mode_hands_over_bytes_as_they_come() {
     assert_eq!(tty.read(2), b"\r\x03");
     assert_eq!(tty.read(2), b"\x7f");
     assert!(screen.lock().is_empty());
+}
+
+#[test_case]
+fn lines_no_one_reads_are_kept_to_a_limit() {
+    let (tty, _) = typed(&[0x04; MOST_LINES + 10]);
+    let mut lines = 0;
+    while tty.readable() {
+        tty.read(1);
+        lines += 1;
+    }
+    assert_eq!(lines, MOST_LINES);
 }
 
 #[test_case]

@@ -5,9 +5,10 @@
 
 use super::clocks;
 use super::files::{self, Result, path_at, ret, string_at};
-use super::{CLOCK_MONOTONIC, CLOCK_REALTIME, EFAULT, EINVAL, ENOMEM, ENOSYS};
+use super::{CLOCK_MONOTONIC, CLOCK_REALTIME, EFAULT, EINVAL, ENOMEM, ENOSYS, EPERM};
 use super::{deadline, timespec_ms, timespec_ns};
 use crate::futex::{self, Error};
+use crate::memory::USER_END;
 use crate::process::{self, Process, Registers, ThreadIds};
 use crate::signal::{ERESTARTNOHAND, ERESTARTSYS};
 use alloc::sync::Arc;
@@ -84,6 +85,11 @@ pub fn clone(
         child: if has(CLONE_CHILD_SETTID) { tids[1] } else { 0 },
         clear: if has(CLONE_CHILD_CLEARTID) { tids[1] } else { 0 },
     };
+    // As `arch_prctl` checks it: `fs` at an address that isn't one would
+    // panic the kernel as the thread is switched to.
+    if has(CLONE_SETTLS) && tls >= USER_END {
+        return -EPERM;
+    }
     let tls = has(CLONE_SETTLS).then_some(tls);
     if thread {
         return ret(process::spawn_thread(process, child, tls, ids).map(|id| id as i64));

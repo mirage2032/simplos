@@ -527,8 +527,99 @@ fn a_held_write_that_fails_is_told_to_sync() {
     failing.store(false, Ordering::SeqCst);
     // As whatever error lwext4 says, which loses why a write fell short.
     assert!(fs.sync().is_err(), "sync says what couldn't be written was");
-    // Told once.
-    assert_eq!(fs.sync(), Ok(()));
+    // And again: the journal couldn't take the write's change to the file's
+    // size either, so nothing more is written.
+    assert_eq!(fs.sync(), Err(Error::Io));
+}
+
+/// A change the journal won't take stops all writing, and every `sync` after
+/// says so, as Linux's errors=remount-ro does: it was lost, though the call
+/// that made it and `sync` both said all was well.
+#[test]
+fn a_change_the_journal_wont_take_is_told_to_sync() {
+    let _serial = serial();
+    let dir = workspace("uncommitted");
+    let root = dir.join("tree");
+    make_tree(&root);
+    let image = image(&dir, &root, &["-t", "ext4"], "64M");
+    let failing = Arc::new(AtomicBool::new(false));
+    let fs = Ext4::mount_writable(Box::new(Failing { image, failing: failing.clone() })).unwrap();
+    failing.store(true, Ordering::SeqCst);
+    let _ = fs.create_dir("made");
+    failing.store(false, Ordering::SeqCst);
+    assert_eq!(fs.sync(), Err(Error::Io));
+    assert_eq!(fs.create_dir("after"), Err(Error::ReadOnly));
+    assert_eq!(fs.sync(), Err(Error::Io));
+}
+
+/// A mount whose last writes fail lets its slot go all the same: lwext4
+/// kept it, on the device that was dropped, and took the next mount there
+/// as made already, on that.
+#[test]
+fn a_failed_unmount_leaves_nothing_behind() {
+    let _serial = serial();
+    let dir = workspace("unmount");
+    let root = dir.join("tree");
+    make_tree(&root);
+    let image = image(&dir, &root, &["-t", "ext4"], "64M");
+    let failing = Arc::new(AtomicBool::new(false));
+    let device = Failing { image: image.clone(), failing: failing.clone() };
+    let fs = Ext4::mount_writable(Box::new(device)).unwrap();
+    fs.create_dir("made").unwrap();
+    failing.store(true, Ordering::SeqCst);
+    drop(fs);
+    let fs = Ext4::mount_writable(Box::new(image)).unwrap();
+    assert_eq!(read_all(&fs, "hello.txt"), b"hello from ext4\n");
+}
+
+/// Without a journal, a change that fails for want of space leaves lwext4
+/// writing what comes after, which it held in memory, out of `sync`'s reach.
+#[test]
+fn changes_after_a_full_disk_are_written_without_a_journal() {
+    let _serial = serial();
+    let dir = workspace("full-ext2");
+    let root = dir.join("tree");
+    std::fs::create_dir_all(&root).unwrap();
+    let image = image(&dir, &root, &["-t", "ext2", "-b", "1024"], "4M");
+    let fs = Ext4::mount_writable(Box::new(image.clone())).unwrap();
+    let fill = fs.create("fill").unwrap();
+    let mut at = 0;
+    while let Ok(written @ 1..) = fill.write_at(at, &[1; 1024]) {
+        at += written as u64;
+    }
+    drop(fill);
+    assert_eq!(fs.symlink(&[b'x'; 200], "long"), Err(Error::NoSpace));
+    fs.remove_file("fill").unwrap();
+    fs.create_dir("after").unwrap();
+    fs.sync().unwrap();
+    // As the power goes: not unmounted.
+    let saved = dir.join("cut.img");
+    image.save(&saved);
+    let names = debugfs_ls(&saved, "/");
+    assert!(names.contains(&"after".into()) && !names.contains(&"fill".into()), "{names:?}");
+}
+
+/// Names as long as ext4 has them, 255 bytes, and none longer.
+#[test]
+fn names_are_up_to_255_bytes() {
+    let _serial = serial();
+    let dir = workspace("long-names");
+    let root = dir.join("tree");
+    make_tree(&root);
+    let image = image(&dir, &root, &["-t", "ext4"], "64M");
+    let fs = Ext4::mount_writable(Box::new(image.clone())).unwrap();
+    let longest = "n".repeat(255);
+    drop(fs.create(&longest).unwrap());
+    fs.create_dir(&format!("dir/{longest}")).unwrap();
+    assert_eq!(fs.metadata(&longest).unwrap().kind, Kind::File);
+    assert_eq!(fs.create(&format!("{longest}n")).map(|_| ()), Err(Error::NameTooLong));
+    assert_eq!(fs.metadata(&format!("dir/{longest}n")).map(|_| ()), Err(Error::NameTooLong));
+    fs.remove_file(&longest).unwrap();
+    drop(fs);
+    let saved = dir.join("written.img");
+    image.save(&saved);
+    fsck(&saved).unwrap();
+    assert_eq!(debugfs_ls(&saved, "/dir"), ["nested".into(), longest]);
 }
 
 /// What's held is written before anything else is, so writes through other

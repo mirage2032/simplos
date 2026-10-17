@@ -199,8 +199,10 @@ fn ls(path: &str) -> String {
 }
 
 /// The file at `path`, as text: a file on the disk, as there's nothing to
-/// read in the devices.
+/// read in the devices. Up to a megabyte: it's held whole, three times
+/// over, in the heap, which a compiler's binary filled.
 fn cat(path: &str) -> String {
+    const MOST: u64 = 1 << 20;
     let at = followed(path);
     let tree = fs::lock();
     let file = match tree.metadata(&at).map(|metadata| metadata.kind) {
@@ -213,6 +215,9 @@ fn cat(path: &str) -> String {
         Ok((size, file)) => (file, size),
         Err(error) => return format!("cat: {path}: {error:?}"),
     };
+    if size > MOST {
+        return format!("cat: {path}: bigger than a megabyte");
+    }
     let mut contents = vec![0; size as usize];
     let mut done = 0;
     while done < contents.len() {
@@ -279,4 +284,11 @@ fn ls_and_cat_show_the_ext4_disk() {
     assert_eq!(shell.execute("cat hello.txt"), "hello from ext4\n");
     assert_eq!(shell.execute("cat dir"), "cat: dir: IsADirectory");
     assert_eq!(shell.execute("ls missing"), "ls: missing: NotFound");
+}
+
+#[test_case]
+fn cat_refuses_what_is_too_big_to_hold() {
+    fs::ROOT.lock().as_ref().unwrap().create("big").unwrap().write_at(1 << 20, b"!").unwrap();
+    assert_eq!(shell().0.execute("cat big"), "cat: big: bigger than a megabyte");
+    fs::ROOT.lock().as_ref().unwrap().remove_file("big").unwrap();
 }

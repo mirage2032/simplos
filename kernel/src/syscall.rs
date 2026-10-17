@@ -16,6 +16,8 @@ mod system;
 
 pub use system::{DEFAULT_LIMITS, LIMITS, RELEASE};
 
+use clocks::{CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_REALTIME};
+
 use crate::fs::Handle;
 use crate::io::interrupts::gdt;
 use crate::io::interrupts::pit::TIMER_HZ;
@@ -688,6 +690,7 @@ fn mmap(
     const MAP_ANONYMOUS: u64 = 0x20;
     const EACCES: i64 = 13;
     const ENODEV: i64 = 19;
+    const EOVERFLOW: i64 = 75;
     let (shared, private) = (flags & MAP_SHARED != 0, flags & 3 == MAP_PRIVATE);
     if !shared && !private {
         return -EINVAL;
@@ -712,6 +715,10 @@ fn mmap(
         _ => None,
     };
     let Some(len) = len.checked_next_multiple_of(4096) else { return -ENOMEM };
+    // Its pages are read from `offset + done` on, which mustn't wrap.
+    if file.is_some() && offset.checked_add(len).is_none() {
+        return -EOVERFLOW;
+    }
     let mut memory = process.memory.lock();
     let start = if flags & MAP_FIXED != 0 {
         addr
@@ -1007,10 +1014,6 @@ fn brk(process: &Process, addr: u64) -> i64 {
     addr as i64
 }
 
-const CLOCK_REALTIME: u64 = 0;
-const CLOCK_MONOTONIC: u64 = 1;
-const CLOCK_BOOTTIME: u64 = 7;
-
 /// Sleep for the `struct timespec` at `request`, or with TIMER_ABSTIME until
 /// `clock` says that time: what `std::thread::sleep` does, through
 /// `clock_nanosleep`, and `nanosleep` too. A signal ends it early, with what
@@ -1075,12 +1078,7 @@ fn timespec_ms(process: &Process, addr: u64) -> Result<u64, i64> {
 fn timespec_ns(process: &Process, addr: u64) -> Result<u64, i64> {
     let mut timespec = [0u8; 16];
     process.memory.lock().space.read(addr, &mut timespec).ok_or(EFAULT)?;
-    let seconds = i64::from_le_bytes(timespec[..8].try_into().unwrap());
-    let nanos = i64::from_le_bytes(timespec[8..].try_into().unwrap());
-    if seconds < 0 || !(0..1_000_000_000).contains(&nanos) {
-        return Err(EINVAL);
-    }
-    Ok((seconds as u64).saturating_mul(1_000_000_000).saturating_add(nanos as u64))
+    clocks::timespec_nanos(&timespec)
 }
 
 /// `fs`, where musl keeps its thread-local storage.

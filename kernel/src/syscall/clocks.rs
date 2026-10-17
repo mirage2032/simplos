@@ -9,14 +9,14 @@ use crate::thread;
 use crate::time::{self, Alarm, MOST_TIMERS, NANOS, TICK, Timer};
 use core::sync::atomic::Ordering::Relaxed;
 
-const CLOCK_REALTIME: u64 = 0;
-const CLOCK_MONOTONIC: u64 = 1;
+pub(super) const CLOCK_REALTIME: u64 = 0;
+pub(super) const CLOCK_MONOTONIC: u64 = 1;
 const CLOCK_PROCESS_CPUTIME_ID: u64 = 2;
 const CLOCK_THREAD_CPUTIME_ID: u64 = 3;
 const CLOCK_MONOTONIC_RAW: u64 = 4;
 const CLOCK_REALTIME_COARSE: u64 = 5;
 const CLOCK_MONOTONIC_COARSE: u64 = 6;
-const CLOCK_BOOTTIME: u64 = 7;
+pub(super) const CLOCK_BOOTTIME: u64 = 7;
 
 /// What `clock` says, in nanoseconds: the time of day, the time since boot
 /// (which simplos never stops counting, so `CLOCK_BOOTTIME` is the same), or
@@ -238,7 +238,7 @@ pub fn alarm(process: &Process, seconds: u64) -> i64 {
 }
 
 /// The `struct timespec` in `bytes`, in nanoseconds.
-fn timespec_nanos(bytes: &[u8]) -> Result<u64> {
+pub(super) fn timespec_nanos(bytes: &[u8]) -> Result<u64> {
     let seconds = i64::from_le_bytes(bytes[..8].try_into().unwrap());
     let nanos = i64::from_le_bytes(bytes[8..16].try_into().unwrap());
     if seconds < 0 || !(0..NANOS as i64).contains(&nanos) {
@@ -271,7 +271,9 @@ pub fn timer_create(process: &Process, clock: u64, event: u64, id: u64) -> i64 {
                 let mut sigevent = [0u8; 64];
                 process.memory.lock().space.read(event, &mut sigevent).ok_or(EFAULT)?;
                 let int = |at: usize| i32::from_le_bytes(sigevent[at..at + 4].try_into().unwrap());
-                let (value, number, notify, tid) = (int(0), int(8), int(12), int(16));
+                // A `union sigval`: an int, or a pointer, all 8 bytes kept.
+                let value = i64::from_le_bytes(sigevent[..8].try_into().unwrap());
+                let (number, notify, tid) = (int(8), int(12), int(16));
                 let number = || match usize::try_from(number) {
                     Ok(number @ 1..=signal::COUNT) => Ok(number),
                     _ => Err(EINVAL),
@@ -300,7 +302,7 @@ pub fn timer_create(process: &Process, clock: u64, event: u64, id: u64) -> i64 {
                 }
                 None => return Err(EAGAIN),
             };
-            let (signal, thread, value) = sent.unwrap_or((signal::SIGALRM, None, index as i32));
+            let (signal, thread, value) = sent.unwrap_or((signal::SIGALRM, None, index as i64));
             let alarm = Alarm::default();
             timers[index] = Some(Timer { alarm, clock, signal, thread, value });
             index

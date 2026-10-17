@@ -15,8 +15,10 @@ inputs:
 runs:
   using: composite
   steps:
-    # Honours rust-toolchain.toml, its components and targets included.
-    - uses: actions-rust-lang/setup-rust-toolchain@v2
+    # Honours rust-toolchain.toml, its components and targets included. By
+    # its commit, v2.0.0's: a tag can be moved to other code, which would run
+    # where promote.yml's release job can push.
+    - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
       with:
         # Its cache, Swatinem/rust-cache, keeps only crates.io's crates of a
         # target directory, and of a cross target's (x86_64-unknown-none, the

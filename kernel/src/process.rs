@@ -309,7 +309,8 @@ impl Process {
         let Some(parent) = self.parent.upgrade() else { return };
         let ended = code != signal::CLD_STOPPED && code != signal::CLD_CONTINUED;
         if ended || !parent.signals.ignores_child_stops() {
-            signal::send(&parent, signal::SIGCHLD, Info { code, pid: self.id, status });
+            let info = Info { code, pid: self.id, status: status.into() };
+            signal::send(&parent, signal::SIGCHLD, info);
         }
         parent.child_exited.wake_all();
     }
@@ -733,10 +734,15 @@ pub fn fork(
     let mut user =
         thread::with_current_user(|user| user.fork(child.clone(), task, pml4, registers))?;
     user.fs_base = tls.unwrap_or(user.fs_base);
-    thread::spawn_user(Box::new(user))?;
-    // Even if it has already ended, it's there to be waited for: the parent
-    // can't wait until this returns.
+    // Before it can run: one that ended at once looked for itself here, to
+    // go if the parent won't wait for it, and then was put here for good.
     interrupts::without_interrupts(|| parent.children.lock().push(child.clone()));
+    if thread::spawn_user(Box::new(user)).is_none() {
+        interrupts::without_interrupts(|| {
+            parent.children.lock().retain(|other| !Arc::ptr_eq(other, &child))
+        });
+        return None;
+    }
     Some(child.id)
 }
 

@@ -81,9 +81,10 @@ fn a_fault_ends_only_the_program() {
 fn bad_system_calls_are_refused() {
     // A pointer into the kernel's half and one into nothing are EFAULT, an
     // unknown call ENOSYS, a sleep for 2e9 nanoseconds EINVAL and one whose
-    // time is in the kernel EFAULT, as on Linux: never the kernel's memory,
-    // never a fault in the kernel.
-    assert_eq!(run(&["bad-calls"]), (0, String::from("-14 -14 -38 -22 -14\n")));
+    // time is in the kernel EFAULT, and a `clone` whose `fs` isn't an address
+    // EPERM, as on Linux: never the kernel's memory, never a fault in the
+    // kernel, which the last was, as the copy was switched to.
+    assert_eq!(run(&["bad-calls"]), (0, String::from("-14 -14 -38 -22 -14 -1\n")));
 }
 
 #[test_case]
