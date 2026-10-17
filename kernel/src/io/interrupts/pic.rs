@@ -36,7 +36,7 @@ static PICS: Lazy<Mutex<ChainedPics>> =
 
 pub fn init_pics() {
     unsafe {
-        // Step 1: Initialize the PICs and unmask IRQ2 (cascade) and IRQ12 (mouse)
+        // Step 1: Initialize the PICs
         PICS.lock().initialize();
     }
 }
@@ -44,8 +44,8 @@ pub fn init_pics() {
 pub fn config_pics() {
     // The lines with handlers, and no others, whatever the firmware left
     // open: an interrupt with none is a fault. IRQ 0 (timer), 1 (keyboard)
-    // and 2 (the slave) on the master, and IRQ 12 (mouse) on the slave.
-    unsafe { PICS.lock().write_masks(!0b0000_0111, !0b0001_0000) };
+    // and 2 (the slave) on the master, and none on the slave.
+    unsafe { PICS.lock().write_masks(!0b0000_0111, !0) };
 }
 
 /// End an interrupt at the master alone, as the slave's spurious one is.

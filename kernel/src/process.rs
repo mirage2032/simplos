@@ -263,13 +263,19 @@ pub struct Memory {
 impl Process {
     /// Block until the program ends, and return its exit status as a shell
     /// reports it: what it passed to `exit`, or 128 plus the signal that
-    /// ended it.
+    /// ended it. One stopped is continued: for the kernel's shell and the
+    /// first program, which have no one else to continue them, as Linux
+    /// doesn't stop its init.
     pub fn wait(&self) -> i32 {
-        self.exited.wait_until(|| self.ended().is_some());
-        let status = self.ended().expect("it ended");
-        match status & 0x7F {
-            0 => status >> 8,
-            signal => 128 + signal,
+        loop {
+            self.exited.wait_until(|| self.ended().is_some() || self.signals.stopped());
+            if let Some(status) = self.ended() {
+                return match status & 0x7F {
+                    0 => status >> 8,
+                    signal => 128 + signal,
+                };
+            }
+            signal::send(self, signal::SIGCONT, Info::kernel());
         }
     }
 
@@ -306,6 +312,8 @@ impl Process {
     /// SIGCHLD, unless the parent asked not to hear of stops, and whoever
     /// waits for it with `wait4`.
     pub fn notify_parent(&self, code: i32, status: i32) {
+        // And whoever waits for it with `wait`, for a stop.
+        self.exited.wake_all();
         let Some(parent) = self.parent.upgrade() else { return };
         let ended = code != signal::CLD_STOPPED && code != signal::CLD_CONTINUED;
         if ended || !parent.signals.ignores_child_stops() {

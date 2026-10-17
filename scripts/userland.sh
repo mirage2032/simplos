@@ -42,6 +42,9 @@ vim_sha256=9e97414b85bdcb2d28d5264c65dd730d86b9a75319b005c63da0bc130c715a2f
 # The tag's source, as GitHub makes it an archive.
 uutils_version=0.12.0
 uutils_sha256=4fb327655cb4ffcbf2f16550cf9234079ffe839692f7aa1a6eda104af684e122
+# The nightly uutils is built with, as rust-toolchain.toml pins it: named
+# here too, so that changing it changes this script, and so what's built.
+rust_toolchain=nightly-2026-09-26
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 work=$root/target/userland
@@ -51,6 +54,11 @@ build=$work/build
 
 if [[ $(uname -sm) != "Linux x86_64" ]]; then
     echo "userland: this builds on x86-64 Linux, not $(uname -sm)" >&2
+    exit 1
+fi
+if ! grep -Fqx "channel = \"$rust_toolchain\"" "$root/rust-toolchain.toml"; then
+    echo "userland: rust-toolchain.toml no longer pins $rust_toolchain, which uutils" \
+        "was built with: name the one it pins here too" >&2
     exit 1
 fi
 
@@ -136,7 +144,8 @@ sed -i -e 's/^# CONFIG_STATIC is not set$/CONFIG_STATIC=y/' \
     -e 's/^CONFIG_INIT=y$/# CONFIG_INIT is not set/' \
     -e 's/^CONFIG_LINUXRC=y$/# CONFIG_LINUXRC is not set/' .config
 step make oldconfig </dev/null
-grep -q '^CONFIG_STATIC=y$' .config && ! grep -qE '^CONFIG_(TC|INIT|LINUXRC)=y$' .config
+grep -q '^CONFIG_STATIC=y$' .config && ! grep -qE '^CONFIG_(TC|INIT|LINUXRC)=y$' .config ||
+    { echo "userland: busybox's .config isn't as asked" >&2; exit 1; }
 step make -j"$jobs" CC="$cc" HOSTCC=cc busybox
 step make CC="$cc" HOSTCC=cc CONFIG_PREFIX="$out" install
 

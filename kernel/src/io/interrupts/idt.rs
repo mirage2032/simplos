@@ -1,6 +1,6 @@
 use crate::io::interrupts::pic::InterruptIndex;
 use crate::io::interrupts::{gdt, pic};
-use crate::io::ps2::{PS2_CONTROLLER, Ps2InterruptCause};
+use crate::io::ps2::PS2_CONTROLLER;
 use crate::process::{self, Registers};
 use crate::signal::{SIGBUS, SIGFPE, SIGILL, SIGSEGV, SIGTRAP};
 use crate::{serial_println, thread};
@@ -35,7 +35,6 @@ pub static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
         idt[InterruptIndex::Timer.as_u8()].set_handler_addr(x86_64::VirtAddr::new(entry));
     }
     idt[InterruptIndex::Keyboard.as_u8()].set_handler_fn(keyboard_interrupt_handler);
-    idt[InterruptIndex::Ps2Mouse.as_u8()].set_handler_fn(mouse_interrupt_handler);
     // What an 8259 sends on its last line, masked or not, when an interrupt
     // went before it was taken. With no handler, a fault: real hardware's
     // halted the kernel, or ended whichever program was running.
@@ -198,7 +197,6 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
 
     if let Some(controller) = PS2_CONTROLLER.lock().as_mut()
         && controller.output_has_data()
-        && controller.interrupt_cause() == Ps2InterruptCause::Keyboard
     {
         let mut keyboard = KEYBOARD.lock();
         if let Ok(scancode) = controller.controller_mut().read_data()
@@ -339,17 +337,4 @@ extern "x86-interrupt" fn spurious_at_master(_stack_frame: InterruptStackFrame) 
 /// done with it.
 extern "x86-interrupt" fn spurious_at_slave(_stack_frame: InterruptStackFrame) {
     pic::end_at_master();
-}
-
-extern "x86-interrupt" fn mouse_interrupt_handler(_stack_frame: InterruptStackFrame) {
-    if let Some(controller) = PS2_CONTROLLER.lock().as_mut()
-        && controller.output_has_data()
-        && controller.interrupt_cause() == Ps2InterruptCause::Mouse
-    {
-        // The packet has to be read whether or not anything wants it: leaving a
-        // byte in the output buffer stops the controller raising further
-        // interrupts. Nothing moves a cursor yet, so it is read and dropped.
-        let _ = controller.controller_mut().mouse().read_data_packet();
-    }
-    pic::notify_end_of_interrupt(&InterruptIndex::Ps2Mouse);
 }

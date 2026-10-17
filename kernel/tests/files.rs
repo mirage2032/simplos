@@ -505,9 +505,15 @@ fn bad_pipe_calls_are_refused() {
 #[test_case]
 fn programs_waiting_to_write_into_a_pipe_leave_the_kernel_room() {
     // Sixteen copies each writing a megabyte into a full pipe that no one
-    // reads: each waits, with what it's writing in the kernel's heap, which
-    // has less room left than sixteen megabytes.
+    // reads: each waits, with a piece of what it's writing in the kernel's
+    // heap, which has less room left than sixteen megabytes.
     assert_eq!(run(&["pipe-writers", "16"]), ok("16\n"));
+}
+
+#[test_case]
+fn a_write_into_a_pipe_goes_in_whole_as_it_is_read() {
+    // 200 KiB, more than the pipe holds, in one write, as on Linux.
+    assert_eq!(run(&["pipe-whole"]), ok("204800 204800\n"));
 }
 
 #[test_case]
@@ -568,8 +574,10 @@ fn symbolic_and_hard_links_lead_where_they_should() {
     // outliving the other name. Then refused: a hard link to a directory
     // (EPERM), a link where there's a file (EEXIST), readlink of a file
     // (EINVAL), a hard link to nothing (ENOENT), and a file on the way, even
-    // with `..` after it (ENOTDIR).
-    let expected = r#""/hello.txt" "hello from ext4\n" true true "deep\n" true "made\n" Err(40) Err(40) "hello from user space\n" 2 "shared\n" [Err(1), Err(17), Err(22), Err(2), Err(20)]"#;
+    // with `..` after it (ENOTDIR). And with a `/` after a name that isn't
+    // there yet, nothing made by it but a directory: a link (ENOENT), a hard
+    // link (ENOENT), a file (EISDIR) or a file renamed (ENOTDIR).
+    let expected = r#""/hello.txt" "hello from ext4\n" true true "deep\n" true "made\n" Err(40) Err(40) "hello from user space\n" 2 "shared\n" [Err(1), Err(17), Err(22), Err(2), Err(20), Err(2), Err(2), Err(21), Err(20), Err(2)]"#;
     assert_eq!(run(&["links"]), ok(&(String::from(expected) + "\n")));
 }
 
@@ -702,8 +710,10 @@ fn files_are_locked_whole_and_in_ranges() {
 fn preadv_and_pwritev_read_and_write_where_asked() {
     // What Linux says, from the same program: three bytes written at 2 and
     // five read from 1, the file's place left at 0; two written there by
-    // pwritev2, and one with RWF_APPEND at the end, the place moved to 9;
-    // and a flag there isn't, EOPNOTSUPP.
-    assert_eq!(run(&["vectors-at", "/at.txt"]), ok("3 5 \"bXY\" \"Zf\" 0 2 9 12XYZfgh! -95\n"));
+    // pwritev2, and one with RWF_APPEND at the end, the place moved to 9,
+    // and another from 0, at the end too, the place left at 9; a flag there
+    // isn't, EOPNOTSUPP; and O_DSYNC, kept.
+    let expected = "3 5 \"bXY\" \"Zf\" 0 2 9 12XYZfgh!? -95 4096\n";
+    assert_eq!(run(&["vectors-at", "/at.txt"]), ok(expected));
     ROOT.lock().as_ref().unwrap().remove_file("at.txt").unwrap();
 }

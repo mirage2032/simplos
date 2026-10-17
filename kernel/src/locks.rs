@@ -108,7 +108,8 @@ pub fn lock(wanted: Lock, wait: bool) -> Result<(), Refused> {
         if LOCKS.lock().iter().any(|held| held.file == wanted.file && same(held)) {
             return Ok(());
         }
-        unlock(wanted.owner, wanted.file, 0, TO_THE_END);
+        // All of it, which splits nothing.
+        let _ = unlock(wanted.owner, wanted.file, 0, TO_THE_END);
     }
     loop {
         let seen = CHANGES.load(Ordering::Acquire);
@@ -135,10 +136,20 @@ pub fn lock(wanted: Lock, wait: bool) -> Result<(), Refused> {
 }
 
 /// Let go of what `owner` holds of `file`'s bytes from `start` to before
-/// `end`.
-pub fn unlock(owner: Owner, file: FileId, start: u64, end: u64) {
-    cut(&mut LOCKS.lock(), owner, file, start, end);
+/// `end`: refused if that's the middle of a lock and as many are held as can
+/// be, as it makes two of it.
+pub fn unlock(owner: Owner, file: FileId, start: u64, end: u64) -> Result<(), Refused> {
+    let mut locks = LOCKS.lock();
+    let splits = |held: &Lock| {
+        held.owner == owner && held.file == file && held.start < start && end < held.end
+    };
+    if locks.len() >= MOST_LOCKS && locks.iter().any(splits) {
+        return Err(Refused::NoLocks);
+    }
+    cut(&mut locks, owner, file, start, end);
+    drop(locks);
     changed();
+    Ok(())
 }
 
 /// The last descriptor of the open file whose handle is at `handle` is
@@ -235,7 +246,7 @@ mod tests {
         assert!(matches!(lock(range(b, 10, 20, false), false), Err(Refused::Held)));
         assert_eq!(conflict(&range(b, 90, TO_THE_END, false)).map(|lock| lock.start), Some(60));
         // Unlocking a hole in the middle; then all of it, as its process ends.
-        unlock(a, FILE, 0, 50);
+        unlock(a, FILE, 0, 50).unwrap();
         assert_eq!(held_by(a), [(50, 60, false), (60, 100, true)]);
         release_process(1001, None);
         assert!(held_by(a).is_empty());
@@ -252,6 +263,16 @@ mod tests {
         }
         assert!(matches!(lock(range(owner, 1, 2, true), false), Err(Refused::NoLocks)));
         release_process(1004, None);
+        assert!(LOCKS.lock().is_empty());
+        // Nor are those that taking the middles out of one would make.
+        lock(range(owner, 0, TO_THE_END, true), false).unwrap();
+        let mut i = 0;
+        while unlock(owner, FILE, 2 * i + 1, 2 * i + 2).is_ok() {
+            i += 1;
+        }
+        assert_eq!(LOCKS.lock().len(), MOST_LOCKS);
+        // What splits nothing still goes.
+        unlock(owner, FILE, 0, TO_THE_END).unwrap();
         assert!(LOCKS.lock().is_empty());
     }
 

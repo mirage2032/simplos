@@ -39,6 +39,8 @@ const O_EXCL: u64 = 0o200;
 const O_TRUNC: u64 = 0o1000;
 const O_APPEND: u64 = 0o2000;
 const O_NONBLOCK: u64 = 0o4000;
+/// O_DSYNC's bit and O_SYNC's, which has O_DSYNC's too.
+const O_SYNC: u64 = 0o4010000;
 const O_DIRECTORY: u64 = 0o200000;
 const O_NOFOLLOW: u64 = 0o400000;
 const O_CLOEXEC: u64 = 0o2000000;
@@ -63,14 +65,15 @@ pub const AT_REMOVEDIR: u64 = 0x200;
 /// as it may, and can't empty the kernel's heap.
 const MOST: usize = 1 << 20;
 
-/// The most a write to `fd` moves: `MOST`, but into a pipe what it holds. A
-/// writer waits there for as long as the reader likes, with what it writes
-/// in the kernel's heap meanwhile, and a few of them at `MOST` would empty
-/// it.
+/// The most a write to `fd` moves at once, with it in the kernel's heap
+/// meanwhile: `PIECE`, but into a pipe or a socket PIPE_BUF, which Linux
+/// keeps whole. A writer waits there for as long as the reader likes, and a
+/// few hundred of them at 64 KiB would empty the heap.
 fn most_written(process: &Process, fd: u64) -> usize {
+    const PIPE_BUF: usize = 4096;
     match handle(process, fd).as_deref() {
-        Ok(Handle::Pipe { .. } | Handle::Socket { .. }) => pipe::CAPACITY,
-        _ => MOST,
+        Ok(Handle::Pipe { .. } | Handle::Socket { .. }) => PIPE_BUF,
+        _ => PIECE,
     }
 }
 
@@ -180,6 +183,13 @@ pub(super) fn lookup_with(
     fs::lookup(&base, path, follow)
 }
 
+/// Whether `path` ends in `/` or `/.`, as the name of what has to be a
+/// directory does: which the path `lookup` finds leaves out, even where
+/// nothing is yet.
+fn names_dir(path: &str) -> bool {
+    path.ends_with('/') || path.ends_with("/.")
+}
+
 pub fn open(process: &Process, dirfd: u64, path: u64, flags: u64, mode: u64) -> i64 {
     ret((|| {
         let access = flags & O_ACCMODE;
@@ -188,7 +198,12 @@ pub fn open(process: &Process, dirfd: u64, path: u64, flags: u64, mode: u64) -> 
         }
         // Not the link itself, unless it's asked for, or to be made new.
         let follow = flags & O_NOFOLLOW == 0 && flags & (O_CREAT | O_EXCL) != O_CREAT | O_EXCL;
-        let path = lookup_with(process, dirfd, &path_at(process, path)?, follow)?;
+        let name = path_at(process, path)?;
+        let path = lookup_with(process, dirfd, &name, follow)?;
+        // Not a file, as a name for a directory, as on Linux.
+        if flags & O_CREAT != 0 && names_dir(&name) {
+            return Err(EISDIR);
+        }
         let cloexec = flags & O_CLOEXEC != 0;
         if let Some(handle) = fs::descriptor(&path) {
             return install_from(process, handle, 0, cloexec);
@@ -257,6 +272,7 @@ fn file_handle(file: ext4::File, access: u64, flags: u64) -> Handle {
         read: access != O_WRONLY,
         write: access != O_RDONLY,
         append: flags & O_APPEND != 0,
+        sync: flags & O_SYNC,
         offset: 0.into(),
     }
 }
@@ -315,7 +331,8 @@ pub fn flock(process: &Process, fd: u64, operation: u64) -> i64 {
         let owner = locks::Owner::Whole(Arc::as_ptr(&handle) as usize);
         let file = file.identity();
         if operation & !LOCK_NB == LOCK_UN {
-            locks::unlock(owner, file, 0, locks::TO_THE_END);
+            // All of it, which splits nothing.
+            let _ = locks::unlock(owner, file, 0, locks::TO_THE_END);
             return Ok(0);
         }
         let lock = locks::Lock { owner, file, start: 0, end: locks::TO_THE_END, exclusive };
@@ -390,8 +407,7 @@ fn record_lock(process: &Process, handle: &Arc<Handle>, command: u64, at: u64) -
         F_RDLCK => false,
         F_WRLCK => true,
         F_UNLCK if command != F_GETLK && command != F_OFD_GETLK => {
-            locks::unlock(owner, file, start, end);
-            return Ok(0);
+            return locks::unlock(owner, file, start, end).map(|()| 0).map_err(refused);
         }
         _ => return Err(EINVAL),
     };
@@ -449,7 +465,7 @@ pub fn preadv(process: &Process, fd: u64, iov: u64, count: u64, offset: u64, fla
 
 /// `writev` at `offset`, as `pwrite` writes: `pwritev`, and `pwritev2`,
 /// which with an offset of -1 writes at the descriptor's place, as `writev`
-/// does; at the end of the file with RWF_APPEND.
+/// does; at the end of the file with RWF_APPEND, whatever the offset.
 pub fn pwritev(process: &Process, fd: u64, iov: u64, count: u64, offset: u64, flags: u64) -> i64 {
     ret((|| {
         let sync = rw_flags(flags, true)?;
@@ -464,6 +480,11 @@ pub fn pwritev(process: &Process, fd: u64, iov: u64, count: u64, offset: u64, fl
                 None
             }
             -1 => None,
+            // At the end too, but the descriptor's place left where it is.
+            _ if flags & RWF_APPEND != 0 => match &*handle(process, fd)? {
+                Handle::File { file, .. } => Some(file.size().map_err(fs::errno)?),
+                _ => Some(at(offset)?),
+            },
             _ => Some(at(offset)?),
         };
         let written = write_vectored(process, fd, iov, count, at)?;
@@ -547,7 +568,8 @@ fn vectored(
 }
 
 /// `writev`, at `at`, or the descriptor's place: into a pipe or a socket as
-/// one write; else each buffer in turn, as `write_at` writes.
+/// one write, if that's whole; else each buffer in turn, as `write_at`
+/// writes.
 fn write_vectored(
     process: &Process,
     fd: u64,
@@ -557,7 +579,8 @@ fn write_vectored(
 ) -> Result<i64> {
     let most = most_written(process, fd);
     let buffers = iovecs(process, iov, count)?;
-    if most == MOST {
+    let total = buffers.iter().fold(0u64, |total, &(_, len)| total.saturating_add(len));
+    if most == PIECE || total > most as u64 {
         return vectored(buffers, at, |base, len, at| write_at(process, fd, base, len, at));
     }
     let mut data = Vec::new();
@@ -715,21 +738,16 @@ fn read_data(process: &Process, fd: u64, count: u64, at: Option<u64>) -> Result<
     }
 }
 
-/// Write at `at`, or else at the descriptor's place, and move it on: into a
-/// pipe or a socket as one write, which it takes whole or not at all, and
-/// otherwise a piece at a time.
+/// Write at `at`, or else at the descriptor's place, and move it on, a
+/// piece at a time: into a pipe or a socket, each piece one write, which it
+/// takes whole or not at all.
 fn write_at(process: &Process, fd: u64, buf: u64, count: u64, at: Option<u64>) -> Result<i64> {
     let most = most_written(process, fd);
-    if most != MOST {
-        let mut data = vec![0; (count as usize).min(most)];
-        process.memory.lock().space.read(buf, &mut data).ok_or(EFAULT)?;
-        return write_data(process, fd, &data, at);
-    }
     let count = (count as usize).min(MOST);
-    let mut piece = vec![0; count.min(PIECE)];
+    let mut piece = vec![0; count.min(most)];
     let mut done = 0;
     while done < count {
-        let piece = &mut piece[..(count - done).min(PIECE)];
+        let piece = &mut piece[..(count - done).min(most)];
         if process.memory.lock().space.read(buf + done as u64, piece).is_none() {
             return if done == 0 { Err(EFAULT) } else { Ok(done as i64) };
         }
@@ -766,8 +784,8 @@ fn write_data(process: &Process, fd: u64, data: &[u8], at: Option<u64>) -> Resul
             write_pipe(process, output, data, !nonblocking.load(Relaxed), true)
         }
         Handle::Dir { .. } | Handle::Proc { .. } | Handle::File { write: false, .. } => Err(EBADF),
-        Handle::File { file, append, offset, .. } => {
-            let _tree = fs::lock();
+        Handle::File { file, append, sync, offset, .. } => {
+            let tree = fs::lock();
             // At the end for a file opened to append, even with `pwrite`, as
             // on Linux.
             let to = match (append, at) {
@@ -778,6 +796,9 @@ fn write_data(process: &Process, fd: u64, data: &[u8], at: Option<u64>) -> Resul
             let written = file.write_at(to, data).map_err(fs::errno)?;
             if at.is_none() {
                 offset.store(to + written as u64, Relaxed);
+            }
+            if *sync != 0 {
+                tree.sync().map_err(fs::errno)?;
             }
             Ok(written as i64)
         }
@@ -842,8 +863,13 @@ pub fn symlinkat(process: &Process, target: u64, dirfd: u64, path: u64) -> i64 {
         if target.is_empty() {
             return Err(ENOENT);
         }
-        let path = lookup_with(process, dirfd, &path_at(process, path)?, false)?;
+        let name = path_at(process, path)?;
+        let path = lookup_with(process, dirfd, &name, false)?;
         let tree = fs::lock();
+        // Nor a link, nor another name for a file, as on Linux.
+        if names_dir(&name) && tree.metadata(&path).is_err() {
+            return Err(ENOENT);
+        }
         tree.disk(&path).and_then(|disk| disk.symlink(&target, &path)).map_err(fs::errno)?;
         Ok(0)
     })())
@@ -866,8 +892,13 @@ pub fn linkat(
         }
         let follow = flags & AT_SYMLINK_FOLLOW != 0;
         let from = lookup_with(process, from_dirfd, &path_at(process, from)?, follow)?;
-        let to = lookup_with(process, to_dirfd, &path_at(process, to)?, false)?;
+        let name = path_at(process, to)?;
+        let to = lookup_with(process, to_dirfd, &name, false)?;
         let tree = fs::lock();
+        // As for `symlinkat`.
+        if names_dir(&name) && tree.metadata(&to).is_err() {
+            return Err(ENOENT);
+        }
         // Both on the disk, as for `rename`.
         tree.disk(&from).map_err(fs::errno)?;
         tree.disk(&to).and_then(|disk| disk.link(&from, &to)).map_err(fs::errno)?;
@@ -1103,13 +1134,13 @@ pub fn fcntl(process: &Process, fd: u64, command: u64, arg: u64) -> i64 {
                 Handle::Socket { nonblocking, .. } => 2 | nonblocking_flag(nonblocking),
                 Handle::Dir { .. } => (O_RDONLY | O_DIRECTORY) as i64,
                 Handle::Proc { .. } => O_RDONLY as i64,
-                Handle::File { read, write, append, .. } => {
+                Handle::File { read, write, append, sync, .. } => {
                     let access = match (read, write) {
                         (true, false) => O_RDONLY,
                         (false, _) => O_WRONLY,
                         (true, true) => 2,
                     };
-                    (access | if *append { O_APPEND } else { 0 }) as i64
+                    (access | if *append { O_APPEND } else { 0 } | sync) as i64
                 }
             }),
             _ => Err(EINVAL),
@@ -1171,8 +1202,13 @@ pub fn renameat2(
             return Err(EINVAL);
         }
         let from = lookup_with(process, from_dirfd, &path_at(process, from)?, false)?;
-        let to = lookup_with(process, to_dirfd, &path_at(process, to)?, false)?;
+        let name = path_at(process, to)?;
+        let to = lookup_with(process, to_dirfd, &name, false)?;
         let tree = fs::lock();
+        // Only a directory goes by a name for one, as on Linux.
+        if names_dir(&name) && tree.metadata(&from).map_err(fs::errno)?.kind != Kind::Directory {
+            return Err(ENOTDIR);
+        }
         if flags & RENAME_NOREPLACE != 0 && tree.metadata(&to).is_ok() {
             return Err(EEXIST);
         }
@@ -1621,8 +1657,7 @@ pub fn sendfile(process: &Process, out_fd: u64, in_fd: u64, offset: u64, count: 
         };
         // A piece at most, as `write` takes: what's read waits here for the
         // file system, and a megabyte each, a few threads filled the heap.
-        let most = most_written(process, out_fd).min(PIECE) as u64;
-        let data = read_data(process, in_fd, count.min(most), at)?;
+        let data = read_data(process, in_fd, count.min(PIECE as u64), at)?;
         let written = write_data(process, out_fd, &data, None);
         let sent = *written.as_ref().unwrap_or(&0) as u64;
         match at {
@@ -1673,8 +1708,8 @@ pub fn splice(process: &Process, input: [u64; 2], output: [u64; 2], len: u64, fl
             Ok(Some(at(u64::from_le_bytes(place))?))
         };
         let (from, to) = (place(off_in)?, place(off_out)?);
-        let most = most_written(process, fd_out) as u64;
-        let data = read_data(process, fd_in, len.min(most), from)?;
+        // A piece at most, as `sendfile` copies, which is all a pipe holds.
+        let data = read_data(process, fd_in, len.min(PIECE as u64), from)?;
         let written = write_data(process, fd_out, &data, to);
         let moved = *written.as_ref().unwrap_or(&0) as u64;
         let put = |addr: u64, place: u64| {

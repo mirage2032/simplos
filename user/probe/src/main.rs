@@ -711,6 +711,21 @@ fn main() {
             let killed = children.iter().filter(|&&child| wait(child).1 == "signal: 9").count();
             println!("{killed}");
         }
+        // One write of more than a pipe holds, all of it, as a thread reads
+        // it out: how much was written, and read.
+        Some("pipe-whole") => {
+            let (mut reader, writer) = or_fail("pipe", io::pipe());
+            let reading = std::thread::spawn(move || {
+                let mut read = Vec::new();
+                or_fail("pipe", reader.read_to_end(&mut read));
+                read.len()
+            });
+            let data = vec![7u8; 200 << 10];
+            let written =
+                syscall(1, writer.as_raw_fd() as usize, data.as_ptr() as usize, data.len());
+            drop(writer);
+            println!("{written} {}", reading.join().unwrap());
+        }
         // O_NONBLOCK: an empty pipe read, a pipe written until it's full,
         // F_GETFL of its writing end; then standard input made not to wait,
         // with FIONBIO, and read.
@@ -1144,6 +1159,12 @@ fn main() {
                 stopped.0, stopped.1, continued.0, continued.1, killed.0, killed.1
             );
         }
+        // Stopped by its own SIGSTOP, with no one to continue it but whoever
+        // waits for it.
+        Some("stop-self") => {
+            kill(getpid(), SIGSTOP);
+            println!("continued");
+        }
         // rt_sigsuspend: what's blocked let through while it waits, and
         // blocked again once the handler's run.
         Some("suspend") => {
@@ -1424,12 +1445,15 @@ fn main() {
         }
         // preadv and pwritev at an offset, the file's place left where it
         // was; then pwritev2 at the place, -1, which it moves, and with
-        // RWF_APPEND at the end; and a flag there isn't, EOPNOTSUPP.
+        // RWF_APPEND at the end, from the place or from 0, which it doesn't
+        // move; and a flag there isn't, EOPNOTSUPP. All through a file
+        // opened O_DSYNC, as F_GETFL says it is.
         Some("vectors-at") => {
-            let file = or_fail(
-                &arg(2),
-                OpenOptions::new().read(true).write(true).create(true).truncate(true).open(arg(2)),
-            );
+            use std::os::unix::fs::OpenOptionsExt;
+            const O_DSYNC: i32 = 0o10000;
+            let mut options = OpenOptions::new();
+            options.read(true).write(true).create(true).truncate(true).custom_flags(O_DSYNC);
+            let file = or_fail(&arg(2), options.open(arg(2)));
             or_fail(&arg(2), (&file).write_all(b"abcdefgh"));
             let fd = file.as_raw_fd() as usize;
             syscall(8, fd, 0, 0);
@@ -1446,13 +1470,16 @@ fn main() {
             let moved = syscall6(328, [fd, at_place.as_ptr() as usize, 1, -1isize as usize, 0], 0);
             let appended = iov(&[b"!"]);
             syscall6(328, [fd, appended.as_ptr() as usize, 1, -1isize as usize, 0], 0x10);
+            let from_0 = iov(&[b"?"]);
+            syscall6(328, [fd, from_0.as_ptr() as usize, 1, 0, 0], 0x10);
             let unknown = syscall6(327, [fd, into.as_ptr() as usize, 2, 0, 0], 0x1000);
             let now = or_fail(&arg(2), fs::read_to_string(arg(2)));
             println!(
-                "{wrote} {read} {:?} {:?} {place} {moved} {} {now} {unknown}",
+                "{wrote} {read} {:?} {:?} {place} {moved} {} {now} {unknown} {}",
                 str_of(&first),
                 str_of(&second),
-                syscall(8, fd, 0, 1)
+                syscall(8, fd, 0, 1),
+                syscall(72, fd, 3, 0) & O_DSYNC as isize
             );
         }
         // Locks on the file PATH: flock's, an open file's, shared with its
@@ -2002,6 +2029,11 @@ fn main() {
                 code(fs::read_link("/hello.txt").map(drop)),
                 code(fs::hard_link("/links/missing", "/links/three")),
                 code(fs::metadata("/hello.txt/../dir").map(drop)),
+                code(symlink("anything", "/links/new/")),
+                code(fs::hard_link("/links/two", "/links/new/")),
+                code(fs::write("/links/new/", "")),
+                code(fs::rename("/links/two", "/links/new/")),
+                code(fs::symlink_metadata("/links/new").map(drop)),
             ];
             println!(
                 "{target:?} {through:?} {itself} {followed} {deep:?} {parent} {made:?} \

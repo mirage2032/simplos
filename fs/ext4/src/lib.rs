@@ -479,19 +479,14 @@ impl Ext4 {
         let file = File { mount: self.mount.clone(), raw, inode, writable, touched: 0.into() };
         // A new file has all its times set; one emptied, when.
         let change = match (made, flags & O_TRUNC != 0) {
-            (true, _) => {
-                self.mount.stamp(inode)?;
-                Some(Change::Gone)
-            }
-            (false, true) => {
-                file.touch()?;
-                Some(Change::Resized { size: 0 })
-            }
-            (false, false) => None,
+            (true, _) => self.mount.stamp(inode).map(|()| Some(Change::Gone)),
+            (false, true) => file.touch().map(|()| Some(Change::Resized { size: 0 })),
+            (false, false) => Ok(None),
         };
-        // Not dropped while the lock is held: closing it takes the lock.
+        // Not dropped while the lock is held, even on an error: closing it
+        // takes the lock.
         drop(_lwext4);
-        if let Some(change) = change {
+        if let Some(change) = change? {
             self.mount.tell(inode, change);
         }
         Ok(file)
@@ -662,8 +657,15 @@ impl Ext4 {
         let lwext4 = self.mount.lock();
         self.mount.forget();
         // Safety: two NUL-terminated strings, the second a path on our mount.
-        check(unsafe { ffi::ext4_fsymlink(target.as_ptr(), at.as_ptr()) })?;
+        let made = check(unsafe { ffi::ext4_fsymlink(target.as_ptr(), at.as_ptr()) });
+        if made.is_err() {
+            // lwext4 makes the link before it fails to fill it in, and
+            // leaves it there: taken out again, if it is.
+            // Safety: as above.
+            unsafe { ffi::ext4_fremove(at.as_ptr()) };
+        }
         drop(lwext4);
+        made?;
         self.stamp(path)
     }
 

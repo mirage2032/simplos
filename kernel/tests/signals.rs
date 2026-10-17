@@ -90,6 +90,13 @@ fn a_program_stops_and_continues() {
 }
 
 #[test_case]
+fn a_program_the_kernel_waits_for_is_continued_as_it_stops() {
+    // As the kernel's shell and init wait for theirs, which nothing else
+    // could continue: as Linux doesn't stop its init.
+    assert_eq!(run(&["stop-self"]), ok("continued\n"));
+}
+
+#[test_case]
 fn sigsuspend_lets_a_blocked_signal_through_and_blocks_it_again() {
     // The handler's frame holds the mask from before sigsuspend, as Linux's.
     assert_eq!(run(&["suspend"]), ok("-4 1 true true\n"));
