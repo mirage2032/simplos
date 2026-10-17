@@ -438,24 +438,47 @@ impl AddressSpace {
         if !region.flags.contains(PageTableFlags::USER_ACCESSIBLE) {
             return Err(Missing::Never);
         }
-        let flags = region.flags;
+        let (flags, end) = (region.flags, region.end);
         let one = Page::range(page, page + 1);
-        let (file, index, data_end) = match &region.backing {
+        let (file, offset, data_end) = match &region.backing {
             Backing::File { file, offset, data_end } if at < *data_end => {
-                (file.clone(), (offset + at - start) / 4096, *data_end)
+                (file.clone(), *offset, *data_end)
             }
             _ => return self.map(one, flags).ok_or(Missing::Never),
         };
+        let index = |at: u64| (offset + at - start) / 4096;
         let frame = match read {
-            Some(read) if Arc::ptr_eq(&read.file, &file) && read.index == index => {
+            Some(read) if Arc::ptr_eq(&read.file, &file) && read.index == index(at) => {
                 FRAMES.lock().as_mut().ok_or(Missing::Never)?.hold(read.frame);
                 read.frame
             }
-            _ => crate::cache::kept(&file, index).ok_or_else(|| Missing::Page(file, index))?,
+            _ => match crate::cache::kept(&file, index(at)) {
+                Some(frame) => frame,
+                None => return Err(Missing::Page(file, index(at))),
+            },
         };
         // The file's own page, if it's read-only, and all of it the file's.
         if !flags.contains(PageTableFlags::WRITABLE) && at + 4096 <= data_end {
-            return self.map_shared(page, frame, flags).ok_or(Missing::Never);
+            self.map_shared(page, frame, flags).ok_or(Missing::Never)?;
+            // And so are those around it the cache has, which the program
+            // will likely touch next, rather than with a fault each.
+            let window = crate::cache::AHEAD * 4096;
+            let first = (at / window * window).max(start);
+            let last = (at / window * window + window).min(end).min(data_end / 4096 * 4096);
+            for near in (first..last).step_by(4096) {
+                let near = Page::containing_address(VirtAddr::new(near));
+                if self.mapped(near).is_some() {
+                    continue;
+                }
+                let Some(frame) = crate::cache::kept(&file, index(near.start_address().as_u64()))
+                else {
+                    continue;
+                };
+                if self.map_shared(near, frame, flags).is_none() {
+                    break;
+                }
+            }
+            return Ok(());
         }
         // Else a copy of its own: zeros past where the file's part ends.
         let mapped = self.map(one, flags);
