@@ -75,6 +75,9 @@ jobs:
         with:
           ref: ${{ needs.target.outputs.sha }}
           fetch-depth: 0 # every branch and tag: to compare with master and past releases
+          # Not left in .git/config for every step to read: the push below
+          # is given it, and only that.
+          persist-credentials: false
 
       - name: Install QEMU
         run: |
@@ -166,6 +169,7 @@ jobs:
       - name: Commit, tag and push
         env:
           NEXT: ${{ steps.version.outputs.next }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -173,7 +177,8 @@ jobs:
           git tag -a "v$NEXT" -m "v$NEXT"
           # Fast-forwards only (no --force), all or nothing: master, develop and
           # the tag end up on the same release commit, or nothing changes.
-          if ! git push --atomic origin \
+          origin="https://x-access-token:$GH_TOKEN@${GITHUB_SERVER_URL#https://}/$GITHUB_REPOSITORY.git"
+          if ! git push --atomic "$origin" \
             HEAD:refs/heads/master HEAD:refs/heads/develop "refs/tags/v$NEXT"; then
             echo "::error::Couldn't push the release. If git rejected it for a branch rule:"
             echo "::error::this commit goes straight to master and develop, and a rule that"

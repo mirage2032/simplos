@@ -270,6 +270,7 @@ int ext4_bcache_alloc(struct ext4_bcache *bc, struct ext4_block *b,
 int ext4_bcache_free(struct ext4_bcache *bc, struct ext4_block *b)
 {
 	struct ext4_buf *buf = b->buf;
+	int r = EOK;
 
 	ext4_assert(bc && b);
 
@@ -296,7 +297,11 @@ int ext4_bcache_free(struct ext4_bcache *bc, struct ext4_block *b)
 			    !ext4_bcache_test_flag(buf, BC_TMP))
 				ext4_bcache_insert_dirty_node(bc, buf);
 			else {
-				ext4_block_flush_buf(bc->bdev, buf);
+				/* LOCAL PATCH: what the write says, returned, not
+				 * dropped: the journal writes its blocks through here,
+				 * and a commit whose blocks never reached the disk was
+				 * taken as made. */
+				r = ext4_block_flush_buf(bc->bdev, buf);
 				ext4_bcache_clear_flag(buf, BC_FLUSH);
 			}
 		}
@@ -311,7 +316,7 @@ int ext4_bcache_free(struct ext4_bcache *bc, struct ext4_block *b)
 	b->lb_id = 0;
 	b->data = 0;
 
-	return EOK;
+	return r;
 }
 
 bool ext4_bcache_is_full(struct ext4_bcache *bc)

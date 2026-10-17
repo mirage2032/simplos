@@ -83,6 +83,21 @@ fn reads_what_linux_wrote() {
 }
 
 #[test_case]
+fn long_paths_looked_up_are_not_kept() {
+    // 4 KiB paths that lead nowhere, each of which was kept, with where it
+    // led: 16 MiB of them, more than the heap had free.
+    let root = ROOT.lock();
+    let fs = root.as_ref().expect("the ext4 disk, mounted");
+    let free = simplos::allocator::free();
+    let long = format!("/{}", "x".repeat(250)).repeat(15);
+    for i in 0..4096 {
+        assert!(fs.metadata(&format!("{i}{long}")).is_err());
+    }
+    let kept = free.saturating_sub(simplos::allocator::free());
+    assert!(kept < 1 << 20, "{kept} bytes kept");
+}
+
+#[test_case]
 fn writes_what_reads_back_after_mounting_again() {
     {
         let root = ROOT.lock();

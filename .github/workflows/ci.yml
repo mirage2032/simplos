@@ -139,7 +139,10 @@ jobs:
         working-directory: kernel
         run: |
           cargo build --release
-          if objdump -d target/x86_64-unknown-none/release/simplos | grep -E '%[xyz]mm'; then
+          # On its own, so that objdump failing fails the step: in the pipe,
+          # it left grep nothing to find, and the check passed.
+          objdump -d target/x86_64-unknown-none/release/simplos > "$RUNNER_TEMP/kernel.asm"
+          if grep -E '%[xyz]mm' "$RUNNER_TEMP/kernel.asm"; then
             exit 1
           fi
 

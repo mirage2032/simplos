@@ -13,6 +13,8 @@ const HPET_COUNTER: usize = 0xF0; // Main counter value (64-bit)
 
 // Configuration register bits
 const HPET_CFG_ENABLE: u64 = 1 << 0; // Enable main counter
+// Capabilities register bits
+const HPET_CAP_COUNT_SIZE: u64 = 1 << 13; // Main counter is 64 bits
 
 /// HPET driver instance
 pub struct Hpet {
@@ -27,7 +29,11 @@ impl Hpet {
     /// # Safety
     /// The caller must ensure that `hpet_phys_addr` is a valid HPET base address
     /// and `phys_mem_offset` correctly maps physical to virtual addresses.
-    pub unsafe fn new(hpet_phys_addr: u64, phys_mem_offset: VirtAddr) -> Self {
+    ///
+    /// None for one whose counter is 32 bits, as many AMD chipsets' are: it
+    /// wraps every five minutes, after which the time since boot jumped by
+    /// centuries. The PIT's ticks are the clock then.
+    pub unsafe fn new(hpet_phys_addr: u64, phys_mem_offset: VirtAddr) -> Option<Self> {
         let base = phys_mem_offset + hpet_phys_addr;
 
         // Safety: these are the HPET's own memory-mapped registers, which the
@@ -36,6 +42,9 @@ impl Hpet {
         unsafe {
             // Read capabilities register to get the period
             let cap = read_volatile((base + HPET_CAP_ID as u64).as_ptr::<u64>());
+            if cap & HPET_CAP_COUNT_SIZE == 0 {
+                return None;
+            }
             let period_fs = cap >> 32; // Upper 32 bits = period in femtoseconds
 
             // Enable the main counter
@@ -46,7 +55,7 @@ impl Hpet {
             // Read initial counter value
             let start_count = read_volatile((base + HPET_COUNTER as u64).as_ptr::<u64>());
 
-            Hpet { base, period_fs, start_count }
+            Some(Hpet { base, period_fs, start_count })
         }
     }
 
@@ -136,7 +145,7 @@ pub fn init_hpet(rsdp_addr: u64, phys_mem_offset: VirtAddr) -> Result<(), &'stat
     let hpet_base = hpet_info.base_address as u64;
 
     // Initialize HPET driver
-    let hpet = unsafe { Hpet::new(hpet_base, phys_mem_offset) };
+    let hpet = unsafe { Hpet::new(hpet_base, phys_mem_offset) }.ok_or("its counter is 32 bits")?;
 
     HPET.call_once(|| hpet);
 

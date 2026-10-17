@@ -206,6 +206,14 @@ int simplos_ext4_read_only(const char *mount_point)
 	return (ext4_get32(sb, features_read_only) & ~CONFIG_SUPPORTED_FRO_COM) != 0;
 }
 
+/* Whether lwext4 has stopped writing the file system on `bd`, mounted to be
+ * written: as a transaction the journal couldn't take, everything after it
+ * would be lost too (see __ext4_trans_stop). */
+int simplos_ext4_stopped(struct ext4_blockdev *bd)
+{
+	return bd->fs && bd->fs->read_only;
+}
+
 /* Whether the file system has a journal, which then holds every change
  * before it's made where it goes. */
 int simplos_ext4_journaled(const char *mount_point)

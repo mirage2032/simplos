@@ -86,6 +86,8 @@ pub enum Error {
     OutOfMemory,
     /// The device failed, or the file system is damaged.
     Io,
+    /// A name in the path is longer than ext4's 255 bytes.
+    NameTooLong,
     /// Any other errno lwext4 returned.
     Other(i32),
 }
@@ -105,6 +107,7 @@ fn check(errno: c_int) -> Result<(), Error> {
         22 => Error::InvalidArgument,
         28 => Error::NoSpace,
         30 => Error::ReadOnly,
+        36 => Error::NameTooLong,
         39 => Error::NotEmpty,
         95 => Error::Unsupported,
         other => Error::Other(other),
@@ -260,6 +263,10 @@ struct Mount {
 /// shortcut: forgotten whole when full; keep the most used instead if a
 /// workload looks up more paths than this, over and over.
 const NAMES: usize = 4096;
+/// The longest path `Mount::names` keeps, so that all it keeps is at most
+/// 4 MiB: a program looking up long paths that aren't there would have
+/// filled the kernel's heap.
+const LONGEST_NAME: usize = 1024;
 
 /// Writes to an open file, one after another from `offset` on, not made
 /// yet: by `Mount::lock`, before anything else is done on the mount, so
@@ -354,6 +361,11 @@ impl Ext4 {
 
     /// lwext4's path for `path`, which is relative to the file system's root.
     fn path(&self, path: &str) -> Result<CString, Error> {
+        // Names longer than ext4 has them: lwext4 says ENOENT, where Linux
+        // says ENAMETOOLONG.
+        if path.split('/').any(|name| name.len() > 255) {
+            return Err(Error::NameTooLong);
+        }
         let mount_point = self.mount.mount_point.to_str().unwrap();
         let full = format!("{mount_point}{}", path.trim_start_matches('/'));
         CString::new(full).map_err(|_| Error::NotFound)
@@ -370,7 +382,7 @@ impl Ext4 {
 
     /// The entries of the directory at `path`, without `.` and `..`.
     pub fn read_dir(&self, path: &str) -> Result<Vec<DirEntry>, Error> {
-        Ok(core::mem::take(&mut self.open_dir(path)?.entries))
+        Ok(self.open_dir(path)?.take_entries())
     }
 
     /// Open the directory at `path`, as it is now.
@@ -664,10 +676,17 @@ impl Ext4 {
     /// Write the small writes held to be made as one: every change made on
     /// it is on the device once this returns. An error if any held since the
     /// last `sync` couldn't be, here or as something else wrote them first,
-    /// as Linux's `fsync` tells what its writing back couldn't write.
+    /// as Linux's `fsync` tells what its writing back couldn't write; and
+    /// every time once a change couldn't go in the journal, after which
+    /// nothing more is written.
     pub fn sync(&self) -> Result<(), Error> {
         let _lwext4 = self.mount.lock();
-        self.mount.failed.lock().take().map_or(Ok(()), Err)
+        self.mount.failed.lock().take().map_or(Ok(()), Err)?;
+        // Safety: the device is this mount's, registered with lwext4.
+        match self.mount.writable && unsafe { ffi::simplos_ext4_stopped(self.mount.device) } != 0 {
+            true => Err(Error::Io),
+            false => Ok(()),
+        }
     }
 
     /// Write the small writes held to be made as one, as `sync` does, but
@@ -786,7 +805,9 @@ impl Mount {
         if names.len() >= NAMES {
             names.clear();
         }
-        names.insert(path.into(), found);
+        if path.to_bytes().len() <= LONGEST_NAME {
+            names.insert(path.into(), found);
+        }
         found.ok_or(Error::NotFound)
     }
 
@@ -970,9 +991,9 @@ impl Drop for Dir {
 }
 
 impl Dir {
-    /// Without `.` and `..`.
-    pub fn entries(&self) -> &[DirEntry] {
-        &self.entries
+    /// Without `.` and `..`: taken, so whoever keeps them has the only copy.
+    pub fn take_entries(&mut self) -> Vec<DirEntry> {
+        core::mem::take(&mut self.entries)
     }
 
     pub fn metadata(&self) -> Result<Metadata, Error> {
@@ -1303,6 +1324,7 @@ mod ffi {
         pub fn simplos_ext4_device_free(device: *mut BlockDev);
         pub fn simplos_ext4_needs_recovery(mount_point: *const c_char) -> c_int;
         pub fn simplos_ext4_read_only(mount_point: *const c_char) -> c_int;
+        pub fn simplos_ext4_stopped(device: *mut BlockDev) -> c_int;
         pub fn simplos_ext4_journaled(mount_point: *const c_char) -> c_int;
         pub fn ext4_cache_write_back(mount_point: *const c_char, on: bool) -> c_int;
         pub fn ext4_cache_flush(mount_point: *const c_char) -> c_int;

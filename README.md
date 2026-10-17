@@ -91,7 +91,8 @@ cleanly, as the root of every path; with no such disk, the root is an empty
 directory that can't be written. Either way, `/dev` holds `null`, `zero` and
 `tty`, `fd` and `stdin`, `stdout` and `stderr`, and `/proc` what the kernel
 knows of the machine and its processes, both over whatever the disk has
-there, as on Linux. The shell's `ls` and `cat` show what's there.
+there, as on Linux. The shell's `ls` and `cat` show what's there: `cat` up
+to a megabyte, which it holds whole.
 
 `cargo run` attaches `fullkernel/disk.img`, which it makes the first time
 with e2fsprogs' `mke2fs` and keeps, so what's written to it is there next
@@ -148,7 +149,8 @@ and `umask`; and for what isn't a file, `pipe`, `pipe2`, `dup`, `dup2` and `dup3
 `/dev/null`, `/dev/zero`, `/dev/tty`, `/dev/random` and `/dev/urandom`. `/dev/fd/N`, and `/proc/PID/fd/N`
 for any process's, is descriptor N, which opening it duplicates, as FreeBSD's
 `/dev/fd` does it, and `/dev/stdin` and the others link to `fd/0` and the
-rest. `statfs` and `fstatfs` say how big a file system is and how much of it
+rest. `readlink` of one says what it's open on, as musl's `ttyname` asks:
+`/dev/tty` for the terminal. `statfs` and `fstatfs` say how big a file system is and how much of it
 is free. `socketpair` makes two connected Unix-domain sockets, each reading
 what the other writes, with `read` and `write` or `send` and `recv`, as
 Rust's `Command` makes to hear whether a program it forked failed to
@@ -176,8 +178,9 @@ Symbolic links (`symlink`, `symlinkat`, `readlink`, `readlinkat`) are
 followed wherever a path goes through one, as Linux follows them
 (`fs::lookup`): at the end too, but for the calls about the link itself, as
 `lstat`, `unlink` and `rename`, or asked not to (`O_NOFOLLOW`,
-`AT_SYMLINK_NOFOLLOW`); `..` after one is the parent of where it led; 40 in a
-row is `ELOOP`. Hard links (`link`, `linkat`) give a file another name, to
+`AT_SYMLINK_NOFOLLOW`); `..` after one is the parent of where it led; a name
+with `/` or `/.` after it has to be a directory, or a link to one, else
+`ENOTDIR`; 40 in a row is `ELOOP`. Hard links (`link`, `linkat`) give a file another name, to
 anything but a directory.
 
 A file's permissions, owner and times are changed with `chmod`, `fchmod`,
@@ -192,7 +195,9 @@ what anyone may. `sendfile` copies from one descriptor to another, and
 - pipes hold their data on the kernel's heap, so all of them together hold
   at most a quarter of it, but for the first 4 KiB of each: past that, a
   pipe counts as full sooner than its 64 KiB, where Linux takes the room
-  from all of memory;
+  from all of memory; so do open directories their entries, opening one
+  past that `ENOMEM`; and there are at most 4096 locks, all processes'
+  together, the next one `ENOLCK`;
 - a file removed or renamed over while it's open stays until it's closed, as
   on Linux, but in `/lost+found`, as `.open-` and its inode, where Linux
   keeps it on ext4's orphan list, which lwext4 doesn't know; the disk's next
@@ -206,8 +211,10 @@ what anyone may. `sendfile` copies from one descriptor to another, and
   else succeeding;
 - the only sockets are the pairs `socketpair` makes, datagram and
   sequenced-packet ones as streams, the messages in them not kept apart;
-- `/dev` holds just those devices, and can't be written; and opening
+- `/dev` holds just those devices, and can't be written; opening
   `/dev/fd/N` shares N's place in the file, where Linux opens the file anew;
+  and `readlink` of one open on a file on the disk is `EINVAL`, as its
+  path isn't kept;
 - `/proc` has none of `maps`, `environ` and the rest, nor load averages, and
   every process's terminal reads as `tty1`;
 - times are kept to the second, as lwext4 sets none of ext4's nanoseconds;
@@ -397,7 +404,8 @@ ended by ^C. For now:
 ## Time
 
 The time of day comes from the CMOS real-time clock, read once at boot, and
-the HPET carries it on from there (`time.rs`). Programs read it, and the
+the HPET carries it on from there (`time.rs`), or the timer's ticks, where
+there's none, or its counter is 32 bits and would wrap in five minutes. Programs read it, and the
 time since boot, with `clock_gettime`, `gettimeofday` and `time`, to the
 nanosecond; `clock_nanosleep` sleeps for a while or until a time. Each timer
 tick is counted to the program it interrupts, as its own time or the
@@ -686,7 +694,7 @@ be added to the others that need it.
 `vendor/lwext4` is upstream [lwext4](https://github.com/gkostka/lwext4) at
 commit `58bcf89` (2022-09-22): its `src/` and `include/` without the mkfs and
 MBR code, which nothing uses. It is GPL-2.0 (its extents and xattr code are
-"GPL-2.0 or later"), like simplos. It has eight local fixes, each marked
+"GPL-2.0 or later"), like simplos. It has twelve local fixes, each marked
 `LOCAL PATCH` in the source, all found by `fs/ext4`'s tests:
 
 - **`metadata_csum_seed`, which e2fsprogs 1.47.4's `mke2fs` turns on for
@@ -721,6 +729,25 @@ MBR code, which nothing uses. It is GPL-2.0 (its extents and xattr code are
   was the oldest in the journal was asked before the transactions older than
   it were finished, which writing it can do: then it stayed, written, and
   the journal's start with it, so a crash replayed everything after.
+- **`src/ext4_bcache.c` and `src/ext4.c`, a write the device refuses** — a
+  block written through had its write's error dropped, the journal's own
+  blocks among them, so a transaction that never reached the disk was taken
+  as made; and nothing that commits one looks at what that says, so the call
+  and `sync` said all was well. Now a commit that fails stops all writing,
+  as Linux's `errors=remount-ro` does, and `Ext4::sync` says so from then on.
+  Its journal is still stopped as it's unmounted, which upstream skipped for
+  a read-only file system, leaving it to the next mount in the same slot.
+- **`src/ext4.c`, unmounting when the superblock can't be written** — the
+  mount's slot stayed taken, by its name and the device, which the caller
+  then frees: the next mount by that name was taken as made, on the freed
+  device.
+- **`src/ext4.c`, write-back mode** — truncating, writing and making a long
+  symbolic link turned it on and, failing, didn't turn it off: without a
+  journal, every block changed after, out of disk space or not, stayed in
+  memory, where `sync` didn't reach it.
+- **`src/ext4.c`, a name of 255 bytes**, ext4's longest — wasn't found;
+  `fs/ext4` says `NameTooLong` for longer ones, which lwext4 said weren't
+  there.
 
 And two additions, also marked: **`src/ext4.c`, renaming onto a file that's
 there** replaces it in the rename's own transaction, as `rename(2)` promises,
@@ -773,7 +800,7 @@ nothing else is being done on it (`Ext4::flush`). Without a journal, it
 writes them through. So `fs/ext4` holds a stream of small writes to a file,
 and makes them in one call. And it keeps where paths led, to an inode or to
 nothing, as lwext4 would read every directory on the way again: forgotten
-whole as any name is made, moved or removed.
+whole as any name is made, moved or removed, and none longer than 1 KiB.
 
 Building and running `fs/ext4`'s tests needs e2fsprogs (`mke2fs`, `e2fsck`,
 `debugfs`) and `gzip`. Every test that writes ends with `e2fsck -fn` on the

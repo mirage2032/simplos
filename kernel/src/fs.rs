@@ -16,7 +16,7 @@ use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use ext4::{BlockDevice, DirEntry, Error, Ext4, Kind, Metadata};
 use x86_64::structures::paging::PhysFrame;
 
@@ -154,15 +154,43 @@ pub enum Handle {
 
 impl Drop for Handle {
     /// The last of an open file's descriptors closed: its `flock` and
-    /// F_OFD_SETLK locks go.
+    /// F_OFD_SETLK locks go; a directory's entries no longer count.
     fn drop(&mut self) {
-        if let Handle::File { .. } = self {
-            crate::locks::release_open(self as *const Handle as usize);
+        match self {
+            Handle::File { .. } => crate::locks::release_open(self as *const Handle as usize),
+            Handle::Dir { entries, .. } => {
+                DIRS_HELD.fetch_sub(held(entries), Ordering::Relaxed);
+            }
+            _ => {}
         }
     }
 }
 
+/// What open directories' entries take of the heap, all together: kept to a
+/// quarter of it, as pipes' is, or a program opening a big directory again
+/// and again, and never closing it, would fill it.
+static DIRS_HELD: AtomicUsize = AtomicUsize::new(0);
+
+fn held(entries: &[DirEntry]) -> usize {
+    entries.iter().map(|entry| size_of::<DirEntry>() + entry.name.len()).sum()
+}
+
 impl Handle {
+    /// The directory at `path`, open on `entries`; ENOMEM once open
+    /// directories hold as much as they may.
+    pub fn dir(
+        dir: Option<ext4::Dir>,
+        entries: Vec<DirEntry>,
+        path: String,
+    ) -> Result<Handle, Error> {
+        let bytes = held(&entries);
+        if DIRS_HELD.fetch_add(bytes, Ordering::Relaxed) + bytes > crate::allocator::size() / 4 {
+            DIRS_HELD.fetch_sub(bytes, Ordering::Relaxed);
+            return Err(Error::OutOfMemory);
+        }
+        Ok(Handle::Dir { dir, entries, path, next: AtomicUsize::new(0) })
+    }
+
     pub fn tty(tty: Arc<Tty>) -> Handle {
         Handle::Tty { tty, nonblocking: AtomicBool::new(false) }
     }
@@ -232,6 +260,28 @@ pub fn descriptor(path: &str) -> Option<Arc<Handle>> {
     let fd: usize = fd.parse().ok()?;
     let files = process.files.lock();
     files.get(fd)?.as_ref().map(|fd| fd.handle.clone())
+}
+
+/// Where the link /dev/fd/N or /proc/PID/fd/N to `handle` leads, as on
+/// Linux: the path it was opened by, or what it is.
+///
+/// shortcut: none for a file on the disk, whose handle doesn't keep the
+/// path; add it there when something reads it.
+pub fn link_to(handle: &Handle) -> Option<String> {
+    let path = match handle {
+        Handle::Tty { .. } => "/dev/tty",
+        Handle::Null => "/dev/null",
+        Handle::Zero => "/dev/zero",
+        Handle::Random { urandom: false } => "/dev/random",
+        Handle::Random { urandom: true } => "/dev/urandom",
+        Handle::Pipe { .. } => "pipe:[0]",
+        Handle::Socket { .. } => "socket:[0]",
+        Handle::Proc { path, .. } | Handle::Dir { path, .. } => {
+            return Some(alloc::format!("/{path}"));
+        }
+        Handle::File { .. } => return None,
+    };
+    Some(path.into())
 }
 
 /// The device at `path`, a path from the root, if it's one.
@@ -403,8 +453,8 @@ impl Tree<'_> {
             },
             On::Disk => match self.disk.as_ref() {
                 Some(disk) => {
-                    let dir = disk.open_dir(path)?;
-                    let entries = dir.entries().to_vec();
+                    let mut dir = disk.open_dir(path)?;
+                    let entries = dir.take_entries();
                     (Some(dir), entries)
                 }
                 None if path.is_empty() => (None, Vec::new()),
@@ -490,9 +540,10 @@ impl Tree<'_> {
 /// Where `path`, from the directory `base` (a path from the root, as
 /// `resolve` makes them), really leads, as a path from the root: with each
 /// symbolic link on the way followed, and the last one too if `follow_last`
-/// or the path ends in `/`, as on Linux. Every part before the last has to be
-/// a directory once followed: ENOENT or ENOTDIR if one isn't. ELOOP after 40
-/// links, where Linux gives up too.
+/// or a `/` or `/.` comes after it, as on Linux. Every part before the last
+/// has to be a directory once followed, and the last too if a `/` or `/.`
+/// comes after it: ENOENT or ENOTDIR if one isn't. ELOOP after 40 links,
+/// where Linux gives up too.
 pub fn lookup(base: &str, path: &str, follow_last: bool) -> Result<String, i64> {
     const ENOTDIR: i64 = 20;
     const ELOOP: i64 = 40;
@@ -501,7 +552,6 @@ pub fn lookup(base: &str, path: &str, follow_last: bool) -> Result<String, i64> 
         true => Vec::new(),
         false => base.split('/').filter(|part| !part.is_empty()).map(String::from).collect(),
     };
-    let follow_last = follow_last || path.ends_with('/');
     let mut rest: VecDeque<String> = path.split('/').map(String::from).collect();
     let mut links = 0;
     while let Some(part) = rest.pop_front() {
@@ -514,7 +564,11 @@ pub fn lookup(base: &str, path: &str, follow_last: bool) -> Result<String, i64> 
             _ => here.push(part),
         }
         let last = rest.iter().all(|part| part.is_empty() || part == ".");
-        if last && !follow_last {
+        // With a `/` or `/.` after it, it's a directory, or a link to one,
+        // followed. `file/` was taken as the file, which a typo then
+        // renamed over, emptied or removed.
+        let must_be_dir = last && !rest.is_empty();
+        if last && !follow_last && !must_be_dir {
             break;
         }
         let at = here.join("/");
@@ -536,7 +590,7 @@ pub fn lookup(base: &str, path: &str, follow_last: bool) -> Result<String, i64> 
                 target.rsplit('/').for_each(|part| rest.push_front(part.into()));
             }
             Ok(Metadata { kind: Kind::Directory, .. }) => {}
-            Ok(_) if last => {}
+            Ok(_) if last && !must_be_dir => {}
             Ok(_) => return Err(ENOTDIR),
         }
     }
@@ -632,6 +686,7 @@ pub fn errno(error: ext4::Error) -> i64 {
         InvalidArgument => 22,
         NoSpace => 28,
         ReadOnly => 30,
+        NameTooLong => 36,
         NotEmpty => 39,
         Unsupported => 95,
         Other(errno) => errno.into(),

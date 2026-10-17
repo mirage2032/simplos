@@ -31,7 +31,8 @@ fn main() {
         }
         // The kernel must refuse these, not fault or hand over its memory: a
         // pointer into its half, one into nothing, a call it hasn't got, a
-        // sleep for an impossible time and one whose time is in the kernel.
+        // sleep for an impossible time and one whose time is in the kernel,
+        // and a copy whose `fs` would be at an address that isn't one.
         Some("bad-calls") => {
             let kernel = syscall(1, 1, 0xFFFF_8000_0000_0000, 8);
             let unmapped = syscall(1, 1, 0x1000, 8);
@@ -39,11 +40,14 @@ fn main() {
             let timespec: [i64; 2] = [0, 2_000_000_000];
             let bad_time = syscall(35, timespec.as_ptr() as usize, 0, 0);
             let kernel_time = syscall(230, 1, 0, 0xFFFF_8000_0000_0000);
-            println!("{kernel} {unmapped} {unknown} {bad_time} {kernel_time}");
+            const CLONE_SETTLS: usize = 0x8_0000;
+            let tls = 0x8000_0000_0000_0000;
+            let bad_tls = syscall5(56, [CLONE_SETTLS | SIGCHLD, 0, 0, 0, tls]);
+            println!("{kernel} {unmapped} {unknown} {bad_time} {kernel_time} {bad_tls}");
         }
         // The same for files: a path and a buffer in the kernel's half, a
-        // directory read too small for one entry and one read as a file, and
-        // a descriptor that isn't open.
+        // directory read too small for one entry and one read as a file, a
+        // descriptor that isn't open, and a mapping past the last offset.
         Some("bad-files") => {
             let kernel = 0xFFFF_8000_0000_0000;
             let bad_path = syscall(2, kernel, 0, 0);
@@ -54,7 +58,10 @@ fn main() {
             let small = syscall(217, dir.as_raw_fd() as usize, buf.as_mut_ptr() as usize, 8);
             let read_dir = syscall(0, dir.as_raw_fd() as usize, buf.as_mut_ptr() as usize, 8);
             let closed = syscall(3, 1000, 0, 0);
-            println!("{bad_path} {bad_buf} {small} {read_dir} {closed}");
+            // From an offset whose second page wraps to the file's first.
+            let fd = file.as_raw_fd() as usize;
+            let wraps = syscall6(9, [0, 8192, 1, 2, fd], 0xFFFF_FFFF_FFFF_F000);
+            println!("{bad_path} {bad_buf} {small} {read_dir} {closed} {wraps}");
         }
         // Memory at the edges: the last page of the lower half, which
         // nothing may map, unmap or protect, and the kernel's half; then a
@@ -893,15 +900,21 @@ fn main() {
             print!("{output}");
             println!("{}", or_fail(&arg(3), child.wait()));
         }
-        // Whether standard input and output are terminals, and a pipe; and
-        // the terminal's size, as TIOCGWINSZ says.
+        // Whether standard input and output are terminals, and a pipe; the
+        // terminal's size, as TIOCGWINSZ says; and its name, as musl's
+        // `ttyname` reads it, from the link /proc/self/fd/0.
         Some("tty") => {
             use std::io::IsTerminal;
             let mut size = [0u16; 4];
             let got = syscall(16, 1, 0x5413, size.as_mut_ptr() as usize);
             let pipe = std::os::fd::OwnedFd::from(or_fail("pipe", io::pipe()).0);
             let (stdin, stdout) = (io::stdin().is_terminal(), io::stdout().is_terminal());
-            println!("{stdin} {stdout} {} {}x{} {got}", pipe.is_terminal(), size[0], size[1]);
+            let mut name = [0u8; 64];
+            let link = c"/proc/self/fd/0".as_ptr() as usize;
+            let len = syscall(89, link, name.as_mut_ptr() as usize, name.len()).max(0) as usize;
+            let name = String::from_utf8_lossy(&name[..len]);
+            let (pipe, rows, cols) = (pipe.is_terminal(), size[0], size[1]);
+            println!("{stdin} {stdout} {pipe} {rows}x{cols} {got} {name}");
         }
         // Standard input in raw mode, as cfmakeraw makes it: COUNT bytes
         // read as they come, each read's shown; then as it was.
@@ -1306,6 +1319,21 @@ fn main() {
                 let contents = or_fail(&path, fs::read(&path));
                 or_fail(&path, io::stdout().write_all(&contents));
             }
+        }
+        // The directory at PATH opened again and again, none closed, until
+        // it can't be, or a thousand times: how many, and the errno.
+        Some("open-dirs") => {
+            let path = std::ffi::CString::new(arg(2)).unwrap();
+            const O_DIRECTORY: usize = 0o200000;
+            let mut opened = 0;
+            let mut error = 0;
+            while opened < 1000 && error == 0 {
+                match syscall(2, path.as_ptr() as usize, O_DIRECTORY, 0) {
+                    fd if fd >= 0 => opened += 1,
+                    errno => error = errno,
+                }
+            }
+            println!("{opened} {error}");
         }
         Some("ls") => {
             let path = arg(2);
@@ -1833,9 +1861,9 @@ fn main() {
                 let set = bit(signal);
                 syscall5(128, [&raw const set as usize, info.as_mut_ptr() as usize, 0, 8, 0])
             };
-            let event = |notify: i32, signal: usize, value: i32, tid: isize| {
+            let event = |notify: i32, signal: usize, value: i64, tid: isize| {
                 let mut event = [0u8; 64];
-                event[..4].copy_from_slice(&value.to_le_bytes());
+                event[..8].copy_from_slice(&value.to_le_bytes());
                 event[8..12].copy_from_slice(&(signal as i32).to_le_bytes());
                 event[12..16].copy_from_slice(&notify.to_le_bytes());
                 event[16..20].copy_from_slice(&(tid as i32).to_le_bytes());
@@ -1878,9 +1906,12 @@ fn main() {
             let (_, plain) = create(1, None);
             set(plain, 0, 0, [0, 10_000_000]);
             let alarmed = take(ALRM, &mut info) == ALRM as isize && int(&info, 24) == plain;
-            let (made_mine, mine) = create(1, Some(event(4, USR1, 5, gettid())));
+            // Its value a pointer, as `sival_ptr` often is: all 8 bytes back.
+            let pointer = 0x7FFF_1234_5678;
+            let (made_mine, mine) = create(1, Some(event(4, USR1, pointer, gettid())));
             set(mine, 0, 0, [0, 10_000_000]);
-            let to_me = take(USR1, &mut info) == USR1 as isize && int(&info, 24) == 5;
+            let to_me = take(USR1, &mut info) == USR1 as isize
+                && i64::from_le_bytes(info[24..32].try_into().unwrap()) == pointer;
             let deleted = [syscall(226, past as usize, 0, 0), syscall(226, past as usize, 0, 0)];
             let refused = [
                 create(99, None).0,

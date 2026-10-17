@@ -342,9 +342,18 @@ impl AddressSpace {
                 // Safety: just allocated, so ours alone.
                 unsafe { phys_ptr(frame.start_address())?.write_bytes(0, 4096) };
                 // Safety: a lower-half page of this address space, unmapped until now.
-                unsafe { mapper.map_to_with_table_flags(page, frame, flags, table_flags, frames) }
-                    .ok()?
-                    .flush();
+                let done = unsafe {
+                    mapper.map_to_with_table_flags(page, frame, flags, table_flags, frames)
+                };
+                match done {
+                    Ok(flush) => flush.flush(),
+                    // No frame for a page table: this one goes back.
+                    Err(_) => {
+                        // Safety: allocated above, and mapped nowhere.
+                        unsafe { frames.deallocate_frame(frame) };
+                        return None;
+                    }
+                }
                 mapped += 1;
             }
             Some(())

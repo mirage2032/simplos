@@ -196,6 +196,24 @@ fn a_program_reads_a_big_file_whole() {
 }
 
 #[test_case]
+fn open_directories_keep_to_a_share_of_the_heap() {
+    // Each open of it keeps its entries, 84 KiB: a thousand would fill the
+    // heap, so some are ENOMEM, and the same number again once those close.
+    {
+        let root = ROOT.lock();
+        let fs = root.as_ref().expect("the ext4 disk, mounted");
+        fs.create_dir("wide").unwrap();
+        for i in 0..300 {
+            fs.create(&alloc::format!("wide/{i:03}{}", "x".repeat(250))).unwrap();
+        }
+    }
+    let (status, first) = run(&["open-dirs", "/wide"]);
+    let opened: usize = first.split(' ').next().unwrap().parse().unwrap();
+    assert!(status == 0 && first.ends_with(" -12\n") && opened > 10, "{first}");
+    assert_eq!(run(&["open-dirs", "/wide"]), (0, first));
+}
+
+#[test_case]
 fn a_program_lists_a_big_directory() {
     // More entries than musl reads in one getdents64.
     {
@@ -214,8 +232,9 @@ fn a_program_lists_a_big_directory() {
 fn bad_file_calls_are_refused() {
     // EFAULT for a path and a buffer in the kernel's half, EINVAL for a
     // directory read too small for one entry, EISDIR for reading one as a
-    // file, EBADF for a descriptor that isn't open.
-    assert_eq!(run(&["bad-files"]), ok("-14 -14 -22 -21 -9\n"));
+    // file, EBADF for a descriptor that isn't open, and EOVERFLOW for a
+    // mapping whose offset wraps past the last, which took the kernel down.
+    assert_eq!(run(&["bad-files"]), ok("-14 -14 -22 -21 -9 -75\n"));
 }
 
 #[test_case]
@@ -280,6 +299,15 @@ fn a_program_moves_files_and_replaces_them() {
     assert_eq!(run(&["mv", "/moves/second.txt", "/moves/moved.txt"]), ok(""));
     assert_eq!(run(&["cat", "/moves/moved.txt"]), ok("second\n"));
     assert_eq!(run(&["ls", "/moves"]), ok("moved.txt\n"));
+    // A file named with a `/` or `/.` after it isn't the file: ENOTDIR, as
+    // on Linux, where it was the file that was replaced, emptied or removed.
+    assert_eq!(run(&["write", "/moves/kept.txt", "kept\n"]), ok(""));
+    let not_a_dir = "Not a directory (os error 20)";
+    let to = "/moves/kept.txt/";
+    assert_eq!(run(&["mv", "/moves/moved.txt", to]), failed("/moves/moved.txt", not_a_dir));
+    assert_eq!(run(&["write", "/moves/kept.txt/.", "x"]), failed("/moves/kept.txt/.", not_a_dir));
+    assert_eq!(run(&["rm", to]), failed(to, not_a_dir));
+    assert_eq!(run(&["cat", "/moves/kept.txt"]), ok("kept\n"));
     // A directory, with what's in it.
     assert_eq!(run(&["mv", "/moves", "/dir/moved"]), ok(""));
     assert_eq!(run(&["cat", "/dir/moved/moved.txt"]), ok("second\n"));

@@ -77,6 +77,10 @@ static LOCKS: Mutex<Vec<Lock>> = Mutex::new(Vec::new());
 static CHANGES: AtomicU64 = AtomicU64::new(0);
 static CHANGED: WaitQueue = WaitQueue::new();
 
+/// The most locks held at once, all processes' together: past them,
+/// ENOLCK, where a program locking byte after byte filled the heap.
+const MOST_LOCKS: usize = 4096;
+
 /// Why a lock wasn't had.
 #[derive(Debug)]
 pub enum Refused {
@@ -84,6 +88,8 @@ pub enum Refused {
     Held,
     /// A signal came while it was waited for.
     Interrupted,
+    /// As many are held as can be.
+    NoLocks,
 }
 
 /// The lock that stands in the way of `wanted`, if one does.
@@ -109,6 +115,9 @@ pub fn lock(wanted: Lock, wait: bool) -> Result<(), Refused> {
         {
             let mut locks = LOCKS.lock();
             if !locks.iter().any(|held| wanted.conflicts(held)) {
+                if locks.len() >= MOST_LOCKS {
+                    return Err(Refused::NoLocks);
+                }
                 cut(&mut locks, wanted.owner, wanted.file, wanted.start, wanted.end);
                 locks.push(wanted);
                 drop(locks);
@@ -233,6 +242,17 @@ mod tests {
         assert!(lock(range(b, 0, TO_THE_END, true), false).is_ok());
         release_process(1002, Some(FILE));
         assert!(held_by(b).is_empty());
+    }
+
+    #[test_case]
+    fn locks_past_the_most_there_can_be_are_refused() {
+        let owner = Owner::Process(1004);
+        for i in 0..MOST_LOCKS as u64 {
+            lock(range(owner, 2 * i, 2 * i + 1, true), false).unwrap();
+        }
+        assert!(matches!(lock(range(owner, 1, 2, true), false), Err(Refused::NoLocks)));
+        release_process(1004, None);
+        assert!(LOCKS.lock().is_empty());
     }
 
     #[test_case]

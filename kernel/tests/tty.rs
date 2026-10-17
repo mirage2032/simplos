@@ -136,7 +136,8 @@ fn a_program_in_raw_mode_gets_bytes_as_they_come() {
 #[test_case]
 fn a_program_knows_its_terminal() {
     let (tty, screen) = terminal();
-    assert_eq!(run(&tty, &screen, &["tty"]), ok("true true false 24x80 0\r\n"));
+    // Named, by the link `ttyname` reads, which wasn't one: EINVAL.
+    assert_eq!(run(&tty, &screen, &["tty"]), ok("true true false 24x80 0 /dev/tty\r\n"));
     // /dev/tty is it, and without one there's none to open: ENXIO.
     let (tty, screen) = terminal();
     assert_eq!(run(&tty, &screen, &["write", "/dev/tty", "x"]), ok("x"));

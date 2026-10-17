@@ -93,8 +93,9 @@ fn timers_send_their_signals_when_they_come() {
     // than set, with SI_TIMER, its id and its value; three more 20 ms apart;
     // off; one by the time of day already past, at once; one that sends
     // nothing, counting down; SIGALRM with its id for none given; one for
-    // the thread alone; deleted, then not there; and EINVAL for a clock, a
-    // timer and a signal there aren't.
+    // the thread alone, with all 8 bytes of its value, a pointer, where 4
+    // came; deleted, then not there; and EINVAL for a clock, a timer and a
+    // signal there aren't.
     assert_eq!(
         run(&["timers"]),
         ok("0 10 true (-2, true, 42) [10, 10, 10] true true true true 0 true [0, -22] \

@@ -211,7 +211,7 @@ pub fn open(process: &Process, dirfd: u64, path: u64, flags: u64, mode: u64) -> 
                     return Err(EISDIR);
                 }
                 let (dir, entries) = tree.open_dir(&path).map_err(fs::errno)?;
-                Handle::Dir { dir, entries, path, next: 0.into() }
+                Handle::dir(dir, entries, path).map_err(fs::errno)?
             }
             Ok(_) if flags & O_CREAT != 0 && flags & O_EXCL != 0 => return Err(EEXIST),
             Ok(Metadata { kind: Kind::Symlink, .. }) => return Err(ELOOP),
@@ -324,11 +324,13 @@ pub fn flock(process: &Process, fd: u64, operation: u64) -> i64 {
 }
 
 /// The errno for a lock that wasn't had: EAGAIN, which is EWOULDBLOCK, for
-/// one in the way; or a signal's.
+/// one in the way; a signal's; or ENOLCK, for none left.
 fn refused(refused: locks::Refused) -> i64 {
+    const ENOLCK: i64 = 37;
     match refused {
         locks::Refused::Held => EAGAIN,
         locks::Refused::Interrupted => ERESTARTSYS,
+        locks::Refused::NoLocks => ENOLCK,
     }
 }
 
@@ -814,12 +816,18 @@ pub fn readlinkat(process: &Process, dirfd: u64, path: u64, buf: u64, size: u64)
             return Err(EINVAL);
         }
         let path = lookup_with(process, dirfd, &path_at(process, path)?, false)?;
-        let tree = fs::lock();
-        let target = match tree.metadata(&path).map_err(fs::errno)?.kind {
-            Kind::Symlink => tree.read_link(&path),
-            _ => return Err(EINVAL),
+        let target = match fs::descriptor(&path) {
+            // /dev/fd/N and /proc/PID/fd/N, which `metadata` takes as what's
+            // open there: links to it, as `ttyname` reads them.
+            Some(handle) => fs::link_to(&handle).ok_or(EINVAL)?.into_bytes(),
+            None => {
+                let tree = fs::lock();
+                match tree.metadata(&path).map_err(fs::errno)?.kind {
+                    Kind::Symlink => tree.read_link(&path).map_err(fs::errno)?,
+                    _ => return Err(EINVAL),
+                }
+            }
         };
-        let target = target.map_err(fs::errno)?;
         let target = &target[..target.len().min(size as usize)];
         process.memory.lock().space.write(buf, target).ok_or(EFAULT)?;
         Ok(target.len() as i64)
@@ -1611,7 +1619,9 @@ pub fn sendfile(process: &Process, out_fd: u64, in_fd: u64, offset: u64, count: 
                 Some(at(u64::from_le_bytes(place))?)
             }
         };
-        let most = most_written(process, out_fd) as u64;
+        // A piece at most, as `write` takes: what's read waits here for the
+        // file system, and a megabyte each, a few threads filled the heap.
+        let most = most_written(process, out_fd).min(PIECE) as u64;
         let data = read_data(process, in_fd, count.min(most), at)?;
         let written = write_data(process, out_fd, &data, None);
         let sent = *written.as_ref().unwrap_or(&0) as u64;
