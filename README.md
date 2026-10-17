@@ -113,10 +113,12 @@ one after another, wait in memory to be written as one, as each write
 costs the disk a handful of its own however little it writes: until
 anything else is done on the disk, the file is closed, a program calls
 `fsync`, `fdatasync`, `syncfs` or `sync`, or a second has passed, so the
-power going loses that second's at most; if the disk won't take them, the
-next `fsync` says so, as Linux's does of what it writes back. The work is
-done by `fs/ext4` (see below), behind a lock that sleeps whoever waits for
-it (`thread::SleepLock`), since a call can wait on the disk for a long time.
+power going loses that second's at most; but for a file opened `O_SYNC` or
+`O_DSYNC`, whose every write is on the disk as it returns; if the disk
+won't take them, the next `fsync` says so, as Linux's does of what it
+writes back. The work is done by `fs/ext4` (see below), behind a lock that
+sleeps whoever waits for it (`thread::SleepLock`), since a call can wait on
+the disk for a long time.
 The disk is trusted: lwext4 is C, parsing it in ring 0, and isn't fuzzed yet.
 
 What's read of a file is kept in memory, a page at a time, in the page cache
@@ -698,7 +700,7 @@ be added to the others that need it.
 `vendor/lwext4` is upstream [lwext4](https://github.com/gkostka/lwext4) at
 commit `58bcf89` (2022-09-22): its `src/` and `include/` without the mkfs and
 MBR code, which nothing uses. It is GPL-2.0 (its extents and xattr code are
-"GPL-2.0 or later"), like simplos. It has twelve local fixes, each marked
+"GPL-2.0 or later"), like simplos. It has thirteen local fixes, each marked
 `LOCAL PATCH` in the source, all found by `fs/ext4`'s tests:
 
 - **`metadata_csum_seed`, which e2fsprogs 1.47.4's `mke2fs` turns on for
@@ -752,6 +754,10 @@ MBR code, which nothing uses. It is GPL-2.0 (its extents and xattr code are
 - **`src/ext4.c`, a name of 255 bytes**, ext4's longest — wasn't found;
   `fs/ext4` says `NameTooLong` for longer ones, which lwext4 said weren't
   there.
+- **`src/ext4.c`, making a directory on a full disk** — its name went into
+  its parent before its index's block was had, and stayed when that couldn't
+  be, naming the inode then freed: e2fsck found it, and the next file made
+  got that inode under both names.
 
 And two additions, also marked: **`src/ext4.c`, renaming onto a file that's
 there** replaces it in the rename's own transaction, as `rename(2)` promises,
