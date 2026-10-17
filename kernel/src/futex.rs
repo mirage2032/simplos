@@ -53,7 +53,7 @@ pub enum Error {
 /// The 32-bit word at `addr` in `process`'s memory.
 fn word(process: &Process, addr: u64) -> Result<u32, Error> {
     let mut word = [0; 4];
-    process.memory.lock().space.read(addr, &mut word).ok_or(Error::Fault)?;
+    process.read(addr, &mut word).ok_or(Error::Fault)?;
     Ok(u32::from_le_bytes(word))
 }
 
@@ -69,6 +69,9 @@ pub fn wait(
 ) -> Result<(), Error> {
     let timed = deadline.is_some();
     let state = Arc::new(State { woken: AtomicBool::new(false), queue: WaitQueue::new(), timed });
+    // Read first without them, so that its page, if the program hasn't
+    // touched it, isn't read in from the disk with them held.
+    word(process, addr)?;
     {
         // Read with the waiters held: whoever changes the word and then
         // wakes it either changes it before this reads it, or wakes this.
@@ -137,6 +140,10 @@ pub fn requeue(
     moved: usize,
     expected: Option<u32>,
 ) -> Result<usize, Error> {
+    // Read in, if it must be, without the waiters held: as in `wait`.
+    if expected.is_some() {
+        word(process, addr)?;
+    }
     let mut waiters = WAITERS.lock();
     if let Some(expected) = expected
         && word(process, addr)? != expected

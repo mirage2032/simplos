@@ -276,7 +276,8 @@ fn fault(frame: &InterruptStackFrame, what: fmt::Arguments, signal: usize) -> ! 
     crate::hlt_loop();
 }
 
-/// A program's stack, reaching a page it hasn't yet, gets it, and goes on.
+/// A program touching memory it has but hasn't touched before gets it, and
+/// goes on: its stack, as it grows, or what it was given (`process::fault_in`).
 /// Any other page fault is fatal: to a user program, or to the kernel.
 extern "x86-interrupt" fn page_fault_handler(
     stack_frame: InterruptStackFrame,
@@ -285,7 +286,7 @@ extern "x86-interrupt" fn page_fault_handler(
     let address = x86_64::registers::control::Cr2::read_raw();
     if stack_frame.code_segment.rpl() == PrivilegeLevel::Ring3
         && !error_code.contains(PageFaultErrorCode::PROTECTION_VIOLATION)
-        && process::grow_stack(address)
+        && process::fault_in(address, error_code.contains(PageFaultErrorCode::CAUSED_BY_WRITE))
     {
         return;
     }

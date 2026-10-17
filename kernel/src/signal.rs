@@ -729,10 +729,8 @@ fn setup_frame(
     bytes[si..].copy_from_slice(&siginfo(signal, info));
 
     let fpu = process::save_fpu();
-    let mut memory = process.memory.lock();
-    memory.space.write(fpstate, &fpu)?;
-    memory.space.write(frame, &bytes)?;
-    drop(memory);
+    process.write(fpstate, &fpu)?;
+    process.write(frame, &bytes)?;
     // The handler starts with the FPU as a new program's, as on Linux.
     process::reset_fpu();
     *registers = Registers {
@@ -756,7 +754,7 @@ fn setup_frame(
 /// Linux ends the program with SIGSEGV.
 pub fn sigreturn(process: &Process, task: &Task, uc: u64) -> Option<Registers> {
     let mut bytes = [0u8; UCONTEXT];
-    process.memory.lock().space.read(uc, &mut bytes)?;
+    process.read(uc, &mut bytes)?;
     let word = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
     let g = |register: usize| word(GREGS + register * 8);
     let registers = Registers {
@@ -783,7 +781,7 @@ pub fn sigreturn(process: &Process, task: &Task, uc: u64) -> Option<Registers> {
         0 => process::reset_fpu(),
         fpstate => {
             let mut fpu = [0u8; 512];
-            process.memory.lock().space.read(fpstate, &mut fpu)?;
+            process.read(fpstate, &mut fpu)?;
             process::load_fpu(&fpu);
         }
     }

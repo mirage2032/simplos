@@ -1,3 +1,5 @@
+use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use bootloader_api::info::{MemoryRegionKind, MemoryRegions};
@@ -211,17 +213,110 @@ pub const SHARED: PageTableFlags = PageTableFlags::BIT_9;
 /// it. Kept with `SHARED` as its protection changes, and by `fork`.
 pub const FILE_SHARED: PageTableFlags = PageTableFlags::BIT_10;
 
+/// What a page of a `Region` holds as it's first touched.
+#[derive(Clone)]
+pub enum Backing {
+    Zero,
+    /// What `file` holds from `offset` on, from the region's start, up to
+    /// `data_end`, an address; zeros from there on, as past the end of a
+    /// segment's part of its file.
+    File {
+        file: Arc<ext4::File>,
+        offset: u64,
+        data_end: u64,
+    },
+}
+
+impl Backing {
+    /// What it holds from `skip` bytes into it, as a region from there on,
+    /// `moved` bytes further up.
+    fn skip(&self, skip: u64, moved: u64) -> Backing {
+        match self {
+            Backing::Zero => Backing::Zero,
+            Backing::File { file, offset, data_end } => Backing::File {
+                file: file.clone(),
+                offset: offset + skip,
+                data_end: data_end.wrapping_add(moved),
+            },
+        }
+    }
+}
+
+impl Drop for Backing {
+    /// Its file, if it's the last of it, is closed as the tree is next let
+    /// go of: closing a file takes the tree, which mustn't be waited for with
+    /// a program's memory held.
+    fn drop(&mut self) {
+        if let Backing::File { file, .. } = self {
+            crate::fs::close_later(file.clone());
+        }
+    }
+}
+
+/// Memory the program has, from its key on to `end`, whose pages aren't
+/// mapped until they're first touched (`fault`): then with `flags`, holding
+/// what `backing` says. A page already mapped keeps what it has. Without
+/// `USER_ACCESSIBLE` among its flags, PROT_NONE's, a page of it is out of
+/// the program's reach.
+#[derive(Clone)]
+struct Region {
+    end: u64,
+    flags: PageTableFlags,
+    backing: Backing,
+}
+
+/// Why a page couldn't be mapped as it was touched.
+pub enum Missing {
+    /// It isn't the program's: EFAULT, or SIGSEGV.
+    Never,
+    /// It's page `index` of `file`, which the page cache doesn't have:
+    /// `read_page` it, and try again.
+    Page(Arc<ext4::File>, u64),
+}
+
+/// A page of a file, read into the page cache for `fault`, and held for it
+/// until this is dropped.
+pub struct Read {
+    file: Arc<ext4::File>,
+    index: u64,
+    frame: PhysFrame,
+}
+
+impl Drop for Read {
+    fn drop(&mut self) {
+        crate::cache::release(self.frame);
+        crate::fs::close_later(self.file.clone());
+    }
+}
+
+/// Page `index` of `file`, read from the disk into the page cache, for
+/// `fault`, after it said it was `Missing`: or `None` if it can't be read.
+/// It takes the tree, so the memory of whoever asks mustn't be held.
+pub fn read_page(file: Arc<ext4::File>, index: u64) -> Option<Read> {
+    let frame = {
+        let _tree = crate::fs::lock();
+        crate::cache::page(&file, index)
+    };
+    match frame {
+        Ok(frame) => Some(Read { file, index, frame }),
+        Err(_) => {
+            crate::fs::close_later(file);
+            None
+        }
+    }
+}
+
 /// A user program's memory: a PML4 of its own, whose upper half is the
 /// kernel's and whose lower half starts empty. Pages are mapped with fresh,
-/// zeroed frames, and dropping it frees every frame and page table in the
-/// lower half.
+/// zeroed frames, or as they're first touched, as `regions` say; and
+/// dropping it frees every frame and page table in the lower half.
 pub struct AddressSpace {
     pml4: PhysFrame,
     /// How many pages the program has mapped, each with a frame.
     pages: u64,
-    /// Where the stack grows to as it's used: a page here is mapped as the
-    /// program reaches it, or the kernel does for it (`grow`).
-    stack: Range<u64>,
+    /// What the program has that isn't mapped until it's touched, by where
+    /// each part starts: none of them overlap.
+    regions: BTreeMap<u64, Region>,
 }
 
 impl AddressSpace {
@@ -229,7 +324,7 @@ impl AddressSpace {
     /// what it can.
     pub fn new() -> Option<AddressSpace> {
         let pml4 = reclaiming(|| FRAMES.lock().as_mut()?.allocate_frame())?;
-        let space = AddressSpace { pml4, pages: 0, stack: 0..0 };
+        let space = AddressSpace { pml4, pages: 0, regions: BTreeMap::new() };
         let table = table(pml4);
         table.zero();
         let kernel = PAGE_TABLE.lock();
@@ -246,7 +341,8 @@ impl AddressSpace {
 
     /// A copy, as `fork` makes for the child: the same mappings, each with a
     /// frame of its own holding what the original's holds, but for `SHARED`
-    /// ones, which share theirs. `None` when memory runs out, even once the
+    /// ones, which share theirs; and the same regions, which a page of either
+    /// is mapped from as it's touched. `None` when memory runs out, even once the
     /// page cache has given back what it can.
     ///
     /// shortcut: every page is copied at once; share them copy-on-write when
@@ -258,7 +354,7 @@ impl AddressSpace {
     fn try_duplicate(&self) -> Option<AddressSpace> {
         let mut copy = AddressSpace::new()?;
         copy.pages = self.pages;
-        copy.stack = self.stack.clone();
+        copy.regions = self.regions.clone();
         // Declared after `copy`, so released before a failed copy's `drop`
         // takes it again.
         let mut frames = FRAMES.lock();
@@ -267,22 +363,140 @@ impl AddressSpace {
         Some(copy)
     }
 
-    /// Let the stack grow down over `stack` as it's used.
-    pub fn grow_stack(&mut self, stack: Range<u64>) {
-        self.stack = stack;
+    /// Give the program `pages`, reachable and with `flags` besides, each
+    /// mapped as it's first touched (`fault`), holding what `backing` says:
+    /// what was reserved there before goes, though what's mapped stays.
+    pub fn reserve(&mut self, pages: PageRange, flags: PageTableFlags, backing: Backing) {
+        let Range { start, end } = bounds(pages);
+        if start >= end {
+            return;
+        }
+        self.carve(start..end);
+        let flags = flags | PageTableFlags::USER_ACCESSIBLE;
+        // Zeros right after the same zeros, as the heap grows: one region.
+        if matches!(backing, Backing::Zero)
+            && let Some((_, before)) = self.regions.range_mut(..start).next_back()
+            && before.end == start
+            && before.flags == flags
+            && matches!(before.backing, Backing::Zero)
+        {
+            before.end = end;
+            return;
+        }
+        self.regions.insert(start, Region { end, flags, backing });
     }
 
-    /// Map the page at `addr`, zeroed, if it's where the stack grows and
-    /// isn't yet: whether it's mapped now. For a page fault there, and for
-    /// the kernel's own reads and writes of the program's memory, which
-    /// Linux grows the stack for too.
-    pub fn grow(&mut self, addr: u64) -> bool {
-        if !self.stack.contains(&addr) {
-            return false;
+    /// Give the pages among `pages` that aren't mapped yet `flags`, besides
+    /// being reachable, as `mprotect` does: what's reserved keeping what it
+    /// holds, and whether its writes reach a file; the rest reserved, as
+    /// zeros.
+    pub fn retag(&mut self, pages: PageRange, flags: PageTableFlags) {
+        let range = bounds(pages);
+        let flags = flags | PageTableFlags::USER_ACCESSIBLE;
+        let mut at = range.start;
+        for start in self.within(&range) {
+            let region = self.regions.get_mut(&start).expect("just found");
+            region.flags = flags | (region.flags & FILE_SHARED);
+            let end = region.end;
+            if at < start {
+                self.regions.insert(at, Region { end: start, flags, backing: Backing::Zero });
+            }
+            at = end;
         }
+        if at < range.end {
+            self.regions.insert(at, Region { end: range.end, flags, backing: Backing::Zero });
+        }
+    }
+
+    /// Map the page at `addr` if it's the program's and isn't mapped yet,
+    /// as a page fault there needs, or the kernel touching it: holding what
+    /// its region says, from the page cache if that's what a file holds. One
+    /// the cache doesn't have is `Missing` (the disk is no place to wait for
+    /// with this held), unless `read` has it, from the last time this said.
+    /// One mapped already is there to be `write`ten, or isn't.
+    pub fn fault(&mut self, addr: u64, write: bool, read: Option<&Read>) -> Result<(), Missing> {
         let page = Page::containing_address(VirtAddr::new(addr));
-        let flags = PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
-        self.map(Page::range(page, page + 1), flags).is_some()
+        let at = page.start_address().as_u64();
+        if let Some(flags) = self.mapped(page) {
+            // As another of its threads touched it first.
+            return match write && !flags.contains(PageTableFlags::WRITABLE) {
+                true => Err(Missing::Never),
+                false => Ok(()),
+            };
+        }
+        let (start, region) = self.region(at).ok_or(Missing::Never)?;
+        if !region.flags.contains(PageTableFlags::USER_ACCESSIBLE) {
+            return Err(Missing::Never);
+        }
+        let flags = region.flags;
+        let one = Page::range(page, page + 1);
+        let (file, index, data_end) = match &region.backing {
+            Backing::File { file, offset, data_end } if at < *data_end => {
+                (file.clone(), (offset + at - start) / 4096, *data_end)
+            }
+            _ => return self.map(one, flags).ok_or(Missing::Never),
+        };
+        let frame = match read {
+            Some(read) if Arc::ptr_eq(&read.file, &file) && read.index == index => {
+                FRAMES.lock().as_mut().ok_or(Missing::Never)?.hold(read.frame);
+                read.frame
+            }
+            _ => crate::cache::kept(&file, index).ok_or_else(|| Missing::Page(file, index))?,
+        };
+        // The file's own page, if it's read-only, and all of it the file's.
+        if !flags.contains(PageTableFlags::WRITABLE) && at + 4096 <= data_end {
+            return self.map_shared(page, frame, flags).ok_or(Missing::Never);
+        }
+        // Else a copy of its own: zeros past where the file's part ends.
+        let mapped = self.map(one, flags);
+        if mapped.is_some()
+            && let TranslateResult::Mapped { frame: own, .. } =
+                self.mapper().translate(page.start_address())
+            && let (Some(from), Some(to)) =
+                (phys_ptr(frame.start_address()), phys_ptr(own.start_address()))
+        {
+            let len = (data_end - at).min(4096) as usize;
+            // Safety: the cache's frame, held, and the page's own, just mapped.
+            unsafe { core::ptr::copy_nonoverlapping(from, to, len) };
+        }
+        crate::cache::release(frame);
+        mapped.ok_or(Missing::Never)
+    }
+
+    /// The region `at` is in, and where it starts, if it's in one.
+    fn region(&self, at: u64) -> Option<(u64, &Region)> {
+        let (&start, region) = self.regions.range(..=at).next_back()?;
+        (region.end > at).then_some((start, region))
+    }
+
+    /// Split the region `at` is in, if it's in one, at `at`.
+    fn split(&mut self, at: u64) {
+        let Some((&start, region)) = self.regions.range_mut(..at).next_back() else { return };
+        if region.end <= at {
+            return;
+        }
+        let backing = region.backing.skip(at - start, 0);
+        let tail = Region { end: region.end, flags: region.flags, backing };
+        region.end = at;
+        self.regions.insert(at, tail);
+    }
+
+    /// Where the regions in `range` start, once those reaching past either
+    /// end of it are split there.
+    fn within(&mut self, range: &Range<u64>) -> Vec<u64> {
+        if range.is_empty() {
+            return Vec::new();
+        }
+        self.split(range.start);
+        self.split(range.end);
+        self.regions.range(range.clone()).map(|(&start, _)| start).collect()
+    }
+
+    /// Take what's reserved in `range` out.
+    fn carve(&mut self, range: Range<u64>) {
+        for start in self.within(&range) {
+            self.regions.remove(&start);
+        }
     }
 
     /// How many pages the program has mapped, each with a frame of its own.
@@ -362,17 +576,16 @@ impl AddressSpace {
         done
     }
 
-    /// Map `frame`, a shared one, at `page`, as `SHARED`, and never
-    /// writable, whatever `flags` say: the hold on it the caller had is this
-    /// mapping's now. What `page` mapped before goes. `None` when memory for
-    /// a page table runs out; then the hold is let go.
+    /// Map `frame`, a shared one, at `page`, which isn't mapped, as
+    /// `SHARED`, and never writable, whatever `flags` say: the hold on it the
+    /// caller had is this mapping's now. `None` when memory for a page table
+    /// runs out, or `page` is mapped; then the hold is let go.
     pub fn map_shared(
         &mut self,
         page: Page,
         frame: PhysFrame,
         flags: PageTableFlags,
     ) -> Option<()> {
-        self.unmap(Page::range(page, page + 1));
         let flags = (flags - PageTableFlags::WRITABLE)
             | SHARED
             | PageTableFlags::PRESENT
@@ -399,15 +612,17 @@ impl AddressSpace {
     }
 
     /// Unmap `pages` and free their frames, or let go of them if they're
-    /// `SHARED`, and the page tables that leaves empty. What isn't mapped is
-    /// skipped, a whole table's worth at a time where there's no table.
+    /// `SHARED`, and the page tables that leaves empty; and take what's
+    /// reserved there out. What isn't mapped is skipped, a whole table's
+    /// worth at a time where there's no table.
     pub fn unmap(&mut self, pages: PageRange) {
-        let mut frames = FRAMES.lock();
-        let Some(frames) = frames.as_mut() else { return };
-        let range = pages.start.start_address().as_u64()..pages.end.start_address().as_u64();
+        let range = bounds(pages);
         if range.is_empty() {
             return;
         }
+        self.carve(range.clone());
+        let mut frames = FRAMES.lock();
+        let Some(frames) = frames.as_mut() else { return };
         let mut emptied = false;
         self.pages -= unmap_tables(self.pml4, 4, 0, &range, frames, &mut emptied);
         if emptied {
@@ -466,10 +681,14 @@ impl AddressSpace {
         Some(())
     }
 
-    /// Put the mapped pages among `pages` out of the program's reach, as
-    /// PROT_NONE does, their frames and what's in them kept: until `protect`
-    /// or `map` gives them back.
+    /// Put the pages among `pages` out of the program's reach, as PROT_NONE
+    /// does, their frames and what's in them kept, and what's reserved and
+    /// not yet mapped too: until `protect`, `map` or `retag` gives them back.
     pub fn hide(&mut self, pages: PageRange) {
+        for start in self.within(&bounds(pages)) {
+            let region = self.regions.get_mut(&start).expect("just found");
+            region.flags -= PageTableFlags::USER_ACCESSIBLE;
+        }
         let mut mapper = self.mapper();
         for page in pages {
             let TranslateResult::Mapped { flags: old, .. } = mapper.translate(page.start_address())
@@ -485,31 +704,48 @@ impl AddressSpace {
         }
     }
 
-    /// The flags of `page`, if it's mapped.
+    /// The flags of `page`, if it's the program's: as it's mapped, or as
+    /// its region says it will be once it's touched.
     pub fn flags(&mut self, page: Page) -> Option<PageTableFlags> {
+        let at = page.start_address().as_u64();
+        self.mapped(page).or_else(|| self.region(at).map(|(_, region)| region.flags))
+    }
+
+    /// The flags of `page`, if it's mapped.
+    fn mapped(&mut self, page: Page) -> Option<PageTableFlags> {
         match self.mapper().translate(page.start_address()) {
             TranslateResult::Mapped { flags, .. } => Some(flags),
             _ => None,
         }
     }
 
-    /// Move the `count` pages from `from` on, every one of them mapped, to
-    /// as many from `to` on, none of them mapped, as `mremap` does: each
-    /// with its frame and flags, so what's in them goes along, copied by
-    /// none. `None`, with nothing moved, when memory for a page table runs
-    /// out.
+    /// Move the `count` pages from `from` on, every one of them the
+    /// program's, to as many from `to` on, none of them, as `mremap` does:
+    /// each with its frame and flags, so what's in them goes along, copied
+    /// by none, and what's reserved of those not yet mapped. `None`, with
+    /// nothing moved, when memory for a page table runs out.
     pub fn move_pages(&mut self, from: Page, to: Page, count: u64) -> Option<()> {
-        let mut frames = FRAMES.lock();
-        let frames = frames.as_mut()?;
-        let mut mapper = self.mapper();
-        for moved in 0..count {
-            if !move_page(&mut mapper, from + moved, to + moved, frames) {
-                // Back where they were, whose tables are all still there.
-                for back in 0..moved {
-                    move_page(&mut mapper, to + back, from + back, frames);
+        {
+            let mut frames = FRAMES.lock();
+            let frames = frames.as_mut()?;
+            let mut mapper = self.mapper();
+            for moved in 0..count {
+                if !move_page(&mut mapper, from + moved, to + moved, frames) {
+                    // Back where they were, whose tables are all still there.
+                    for back in 0..moved {
+                        move_page(&mut mapper, to + back, from + back, frames);
+                    }
+                    return None;
                 }
-                return None;
             }
+        }
+        let (from, to) = (from.start_address().as_u64(), to.start_address().as_u64());
+        let moved = to.wrapping_sub(from);
+        for start in self.within(&(from..from + count * 4096)) {
+            let region = self.regions.remove(&start).expect("just found");
+            let end = region.end.wrapping_add(moved);
+            let backing = region.backing.skip(0, moved);
+            self.regions.insert(start.wrapping_add(moved), Region { end, backing, ..region });
         }
         Some(())
     }
@@ -517,17 +753,19 @@ impl AddressSpace {
     /// Copy `bytes` to `addr`, whatever the pages' protection, but never
     /// into a `SHARED` one: for the loader.
     pub fn load(&mut self, addr: u64, bytes: &[u8]) -> Option<()> {
-        self.copy(addr, bytes.len(), PageTableFlags::PRESENT, SHARED, |at, range| {
+        let done = self.copy(addr, bytes.len(), PageTableFlags::PRESENT, SHARED, |at, range| {
             // Safety: `copy` hands out mapped frames, `range.len()` long.
             unsafe {
                 core::ptr::copy_nonoverlapping(bytes[range.clone()].as_ptr(), at, range.len())
             }
-        })
+        });
+        done.ok()
     }
 
-    /// Copy `bytes` to the program's memory at `addr`, which must be mapped
-    /// writable for it. `None` if any of it isn't: the system call's EFAULT.
-    pub fn write(&mut self, addr: u64, bytes: &[u8]) -> Option<()> {
+    /// Copy `bytes` to the program's memory at `addr`, which must be the
+    /// program's, writable. `Missing::Never` if any of it isn't: the system
+    /// call's EFAULT. `Process::write` reads in what's `Missing` from a file.
+    pub fn write(&mut self, addr: u64, bytes: &[u8]) -> Result<(), Missing> {
         let need =
             PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::WRITABLE;
         self.copy(addr, bytes.len(), need, SHARED, |at, range| {
@@ -538,9 +776,10 @@ impl AddressSpace {
         })
     }
 
-    /// Fill `buf` from the program's memory at `addr`, which must be mapped
-    /// for it. `None` if any of it isn't: the system call's EFAULT.
-    pub fn read(&mut self, addr: u64, buf: &mut [u8]) -> Option<()> {
+    /// Fill `buf` from the program's memory at `addr`, which must be the
+    /// program's. `Missing::Never` if any of it isn't: the system call's
+    /// EFAULT. `Process::read` reads in what's `Missing` from a file.
+    pub fn read(&mut self, addr: u64, buf: &mut [u8]) -> Result<(), Missing> {
         let need = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
         let anything = PageTableFlags::empty();
         self.copy(addr, buf.len(), need, anything, |at, range| {
@@ -553,8 +792,9 @@ impl AddressSpace {
 
     /// Walk `len` bytes from `addr` a page at a time, through the page tables
     /// rather than the addresses themselves, so it works from any address
-    /// space and an unmapped page is an error instead of a page fault: as
-    /// is one without all of `need`, or with any of `forbid`.
+    /// space and a page that isn't the program's is an error instead of a
+    /// page fault: as is one without all of `need`, or with any of `forbid`.
+    /// One not touched yet is mapped first (`fault`).
     fn copy(
         &mut self,
         addr: u64,
@@ -562,29 +802,27 @@ impl AddressSpace {
         need: PageTableFlags,
         forbid: PageTableFlags,
         mut each: impl FnMut(*mut u8, Range<usize>),
-    ) -> Option<()> {
-        if addr.checked_add(len as u64)? > USER_END {
-            return None;
+    ) -> Result<(), Missing> {
+        if addr.checked_add(len as u64).is_none_or(|end| end > USER_END) {
+            return Err(Missing::Never);
         }
         let mut done = 0;
         while done < len {
             let at = addr + done as u64;
             let translated = self.mapper().translate(VirtAddr::new(at));
             let TranslateResult::Mapped { frame, offset, flags } = translated else {
-                // Where the stack hasn't reached yet, it does now.
-                if self.grow(at) {
-                    continue;
-                }
-                return None;
+                self.fault(at, need.contains(PageTableFlags::WRITABLE), None)?;
+                continue;
             };
             if !flags.contains(need) || flags.intersects(forbid) {
-                return None;
+                return Err(Missing::Never);
             }
             let chunk = (len - done).min(4096 - (at % 4096) as usize);
-            each(phys_ptr(frame.start_address() + offset)?, done..done + chunk);
+            let at = phys_ptr(frame.start_address() + offset).ok_or(Missing::Never)?;
+            each(at, done..done + chunk);
             done += chunk;
         }
-        Some(())
+        Ok(())
     }
 }
 
@@ -738,9 +976,10 @@ fn unshare(
     Some(())
 }
 
-/// Move the page at `from`, which is mapped, to `to`, which isn't, with its
-/// frame and flags: whether it went, which only a page table for `to` that
-/// couldn't be had stops. Then it's still at `from`.
+/// Move the page at `from`, if it's mapped, to `to`, which isn't, with its
+/// frame and flags: whether it went, or there was nothing to move, which
+/// only a page table for `to` that couldn't be had stops. Then it's still
+/// at `from`.
 fn move_page(
     mapper: &mut OffsetPageTable,
     from: Page,
@@ -750,7 +989,7 @@ fn move_page(
     let table_flags =
         PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
     let TranslateResult::Mapped { flags, .. } = mapper.translate(from.start_address()) else {
-        return false;
+        return true;
     };
     let Ok((frame, flush)) = mapper.unmap(from) else { return false };
     flush.flush();
@@ -767,6 +1006,11 @@ fn move_page(
         .expect("a page's tables stay as it's unmapped")
         .flush();
     false
+}
+
+/// The addresses `pages` cover.
+fn bounds(pages: PageRange) -> Range<u64> {
+    pages.start.start_address().as_u64()..pages.end.start_address().as_u64()
 }
 
 /// The page table in `frame`, through the physical-memory map.
@@ -994,14 +1238,54 @@ fn a_shared_page_made_writable_is_copied_first() {
         assert!(flags.contains(writable) && !flags.contains(SHARED), "{flags:?}");
         assert_eq!(holders(), 1, "the shared frame is still held");
         let mut read = [0; 2];
-        space.write(0x1000_0000, &[0x22]).unwrap();
-        space.read(0x1000_0000, &mut read).unwrap();
+        assert!(space.write(0x1000_0000, &[0x22]).is_ok());
+        assert!(space.read(0x1000_0000, &mut read).is_ok());
         assert_eq!(read, [0x22, 0x11]);
         // Safety: as above.
         assert_eq!(unsafe { bytes().read() }, 0x11, "written through the shared frame");
     }
     FRAMES.lock().as_mut().unwrap().release(frame);
     assert_eq!(holders(), 0);
+}
+
+#[test_case]
+fn reserved_memory_is_mapped_as_it_s_touched() {
+    let page = |n: u64| Page::containing_address(VirtAddr::new(0x2000_0000 + n * 4096));
+    let at = |n: u64| page(n).start_address().as_u64();
+    let mut space = AddressSpace::new().unwrap();
+    let writable = PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
+    space.reserve(Page::range(page(0), page(4)), writable, Backing::Zero);
+    space.reserve(Page::range(page(4), page(6)), writable, Backing::Zero);
+    assert_eq!(space.regions.len(), 1, "zeros after the same zeros aren't one region");
+    assert_eq!(space.pages(), 0, "mapped before it's touched");
+    // Touched by the kernel, as a system call would: mapped then, zeros.
+    let mut byte = [1];
+    assert!(space.read(at(1), &mut byte).is_ok());
+    assert_eq!((byte, space.pages()), ([0], 1));
+    assert!(space.write(at(2) + 5, &[7]).is_ok());
+    // Made read-only in the middle, the page written keeping what it has.
+    let read_only = PageTableFlags::NO_EXECUTE;
+    space.retag(Page::range(page(2), page(4)), read_only);
+    space.protect(Page::range(page(2), page(4)), read_only).unwrap();
+    assert_eq!(space.regions.len(), 3);
+    assert!(space.write(at(3), &[1]).is_err(), "written though read-only");
+    assert!(space.read(at(2) + 5, &mut byte).is_ok());
+    assert_eq!(byte, [7]);
+    // Hidden, unmapped, or never reserved: none of them the program's.
+    space.hide(Page::range(page(5), page(6)));
+    space.unmap(Page::range(page(1), page(2)));
+    for n in [1, 5, 6] {
+        assert!(matches!(space.fault(at(n), false, None), Err(Missing::Never)), "page {n}");
+    }
+    assert!(space.fault(at(0), true, None).is_ok());
+    // Moved, as `mremap` does: what's mapped and what's reserved go along.
+    space.move_pages(page(2), page(10), 2).unwrap();
+    assert!(space.read(at(10) + 5, &mut byte).is_ok());
+    assert_eq!(byte, [7]);
+    assert!(space.flags(page(11)).is_some() && space.flags(page(3)).is_none());
+    // A hole given flags, as `mprotect` gives it: zeros, as it's touched.
+    space.retag(Page::range(page(20), page(21)), writable);
+    assert!(space.write(at(20), &[1]).is_ok());
 }
 
 #[test_case]

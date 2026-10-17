@@ -48,7 +48,7 @@ fn split(nanos: u64, micros: bool) -> [u8; 16] {
 }
 
 fn put(process: &Process, addr: u64, bytes: &[u8]) -> Result<()> {
-    process.memory.lock().space.write(addr, bytes).ok_or(EFAULT)
+    process.write(addr, bytes).ok_or(EFAULT)
 }
 
 pub fn clock_gettime(process: &Process, clock: u64, timespec: u64) -> i64 {
@@ -193,7 +193,7 @@ pub fn setitimer(process: &Process, which: u64, new: u64, old: u64) -> i64 {
         }
         let mut value = [0u8; 32];
         if new != 0 {
-            process.memory.lock().space.read(new, &mut value).ok_or(EFAULT)?;
+            process.read(new, &mut value).ok_or(EFAULT)?;
         }
         let (every, after) = (timeval_nanos(&value[..16])?, timeval_nanos(&value[16..])?);
         let mut alarm = process.alarm.lock();
@@ -269,7 +269,7 @@ pub fn timer_create(process: &Process, clock: u64, event: u64, id: u64) -> i64 {
             0 => None,
             event => {
                 let mut sigevent = [0u8; 64];
-                process.memory.lock().space.read(event, &mut sigevent).ok_or(EFAULT)?;
+                process.read(event, &mut sigevent).ok_or(EFAULT)?;
                 let int = |at: usize| i32::from_le_bytes(sigevent[at..at + 4].try_into().unwrap());
                 // A `union sigval`: an int, or a pointer, all 8 bytes kept.
                 let value = i64::from_le_bytes(sigevent[..8].try_into().unwrap());
@@ -330,7 +330,7 @@ pub fn timer_settime(process: &Process, id: u64, flags: u64, new: u64, old: u64)
     const TIMER_ABSTIME: u64 = 1;
     ret((|| {
         let mut value = [0u8; 32];
-        process.memory.lock().space.read(new, &mut value).ok_or(EFAULT)?;
+        process.read(new, &mut value).ok_or(EFAULT)?;
         let (every, at) = (timespec_nanos(&value[..16])?, timespec_nanos(&value[16..])?);
         let clock = with_timer(process, id, |timer| timer.clock)?;
         // How long until then, by the clock the alarm thread goes by.

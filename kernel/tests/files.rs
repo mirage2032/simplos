@@ -608,7 +608,8 @@ fn a_file_removed_or_replaced_while_open_stays_until_closed() {
 
 #[test_case]
 fn a_program_reads_of_itself_in_proc() {
-    // Its pages, 256 more as it maps a megabyte and none once it unmaps it;
+    // Its pages, 256 more as it maps a megabyte and touches it, and none
+    // once it unmaps it;
     // ext4's type and block size by path and by descriptor, alike; its name.
     assert_eq!(run(&["proc"]), ok("256 0 0xef53 true 4096 probe\n"));
 }

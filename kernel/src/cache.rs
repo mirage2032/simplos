@@ -81,6 +81,20 @@ pub fn page(file: &File, index: u64) -> Result<PhysFrame, Error> {
     })
 }
 
+/// Page `index` of `file`, in a frame held for the caller, if it's kept:
+/// never read in, so the tree needn't be held, as it can't be with a
+/// program's memory held (`AddressSpace::fault`).
+pub fn kept(file: &File, index: u64) -> Option<PhysFrame> {
+    let key = (file.inode(), u32::try_from(index).ok()?);
+    let mut cache = CACHE.lock();
+    cache.clock += 1;
+    let now = cache.clock;
+    let page = cache.pages.get_mut(&key)?;
+    page.used = now;
+    FRAMES.lock().as_mut()?.hold(page.frame);
+    Some(page.frame)
+}
+
 /// Run `f` on the frame of page `index` of `file`, read in first if it
 /// isn't kept: with the cache held, so it's kept until `f` is done.
 fn with_frame<R>(file: &File, index: u64, f: impl FnOnce(PhysFrame) -> R) -> Result<R, Error> {

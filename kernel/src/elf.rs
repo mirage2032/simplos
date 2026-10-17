@@ -2,9 +2,9 @@
 //! headers, read from wherever the program is (`Source`). Every offset and
 //! size is checked before it is used: the file comes from outside the kernel.
 
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use x86_64::structures::paging::PhysFrame;
 
 pub const PT_LOAD: u32 = 1;
 pub const PT_INTERP: u32 = 3;
@@ -34,11 +34,9 @@ pub trait Source {
     /// can't be read.
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Option<()>;
 
-    /// Page `index` of it, from `index * 4096` on, in a frame to map as it
-    /// is (`AddressSpace::map_shared`), held for the caller: the page
-    /// cache's, for a file on the disk. `None` for what isn't in it, or
-    /// past the end.
-    fn page(&self, _index: u64) -> Option<PhysFrame> {
+    /// Its file on the disk, if it's one's, for its pages to be mapped from
+    /// as they're touched (`memory::Backing::File`).
+    fn file(&self) -> Option<Arc<ext4::File>> {
         None
     }
 }

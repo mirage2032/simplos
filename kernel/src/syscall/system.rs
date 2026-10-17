@@ -33,7 +33,7 @@ pub fn uname(process: &Process, buf: u64) -> i64 {
     for (field, value) in utsname.chunks_mut(65).zip(fields) {
         field[..value.len()].copy_from_slice(value.as_bytes());
     }
-    ret(process.memory.lock().space.write(buf, &utsname).ok_or(EFAULT).map(|()| 0))
+    ret(process.write(buf, &utsname).ok_or(EFAULT).map(|()| 0))
 }
 
 /// shortcut: there are no users but root, so every id is 0 and can only be
@@ -64,7 +64,7 @@ pub fn getrandom(process: &Process, buf: u64, len: u64, flags: u64) -> i64 {
     }
     let mut bytes = vec![0; len.min(1 << 20) as usize];
     crate::random::fill(&mut bytes);
-    match process.memory.lock().space.write(buf, &bytes) {
+    match process.write(buf, &bytes) {
         Some(()) => bytes.len() as i64,
         None => -EFAULT,
     }
@@ -81,7 +81,7 @@ pub fn sysinfo(process: &Process, info: u64) -> i64 {
     sysinfo[80..82].copy_from_slice(&(process::all().len() as u16).to_le_bytes());
     // mem_unit: the sizes are in bytes.
     sysinfo[104..108].copy_from_slice(&1u32.to_le_bytes());
-    ret(process.memory.lock().space.write(info, &sysinfo).ok_or(EFAULT).map(|()| 0))
+    ret(process.write(info, &sysinfo).ok_or(EFAULT).map(|()| 0))
 }
 
 /// The processes `which` and `who` name for `getpriority` and
@@ -133,7 +133,7 @@ pub fn sched_getaffinity(process: &Process, pid: u64, len: u64, mask: u64) -> i6
             return Err(EINVAL);
         }
         other(pid)?;
-        process.memory.lock().space.write(mask, &1u64.to_le_bytes()).ok_or(EFAULT)?;
+        process.write(mask, &1u64.to_le_bytes()).ok_or(EFAULT)?;
         Ok(8)
     })())
 }
@@ -176,7 +176,7 @@ pub fn prlimit(process: &Process, pid: u64, resource: u64, new: u64, old: u64) -
         let resource = usize::try_from(resource).ok().filter(|&r| r < LIMITS).ok_or(EINVAL)?;
         let mut pair = [0u8; 16];
         let limit = if new != 0 {
-            process.memory.lock().space.read(new, &mut pair).ok_or(EFAULT)?;
+            process.read(new, &mut pair).ok_or(EFAULT)?;
             let soft = u64::from_le_bytes(pair[..8].try_into().unwrap());
             let hard = u64::from_le_bytes(pair[8..].try_into().unwrap());
             if soft > hard {
@@ -194,7 +194,7 @@ pub fn prlimit(process: &Process, pid: u64, resource: u64, new: u64, old: u64) -
             let (soft, hard) = limits[resource];
             pair[..8].copy_from_slice(&soft.to_le_bytes());
             pair[8..].copy_from_slice(&hard.to_le_bytes());
-            process.memory.lock().space.write(old, &pair).ok_or(EFAULT)?;
+            process.write(old, &pair).ok_or(EFAULT)?;
         }
         if let Some(limit) = limit {
             limits[resource] = limit;
@@ -232,7 +232,7 @@ pub fn prctl(process: &Process, task: &Task, option: u64, arg: u64) -> i64 {
                 name[..len].copy_from_slice(&program.as_bytes()[..len]);
                 name
             });
-            process.memory.lock().space.write(arg, &name).ok_or(EFAULT)?;
+            process.write(arg, &name).ok_or(EFAULT)?;
             Ok(0)
         }
         _ => {
