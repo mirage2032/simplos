@@ -790,8 +790,10 @@ fn madvise(process: &Process, addr: u64, len: u64, advice: u64) -> i64 {
     if pages(start, end).any(|page| memory.space.flags(page).is_none()) {
         return -ENOMEM;
     }
-    if advice == MADV_DONTNEED || advice == MADV_FREE {
-        memory.space.zero(pages(start, end));
+    if (advice == MADV_DONTNEED || advice == MADV_FREE)
+        && memory.space.zero(pages(start, end)).is_none()
+    {
+        return -ENOMEM;
     }
     0
 }

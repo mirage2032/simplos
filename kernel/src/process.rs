@@ -752,7 +752,7 @@ pub fn fork(
     ids: ThreadIds,
 ) -> Option<u64> {
     let mut memory = {
-        let memory = parent.memory.lock();
+        let mut memory = parent.memory.lock();
         Memory { space: memory.space.duplicate()?, ..*memory }
     };
     let pml4 = memory.space.pml4();
@@ -893,10 +893,11 @@ pub fn exec(
     Ok(start)
 }
 
-/// From a page fault in ring 3 at `addr`, not mapped, as a `write` or not:
-/// map it if it's the current thread's program's, and isn't yet, as with
-/// memory it's been given but hasn't touched, or where its stack grows to.
-/// Whether it did, and the instruction can run again.
+/// From a page fault in ring 3 at `addr`, as a `write` or not: map it if
+/// it's the current thread's program's, and isn't yet, as with memory it's
+/// been given but hasn't touched, or where its stack grows to; or, written,
+/// give it a page `fork` shared of its own. Whether it did, and the
+/// instruction can run again.
 pub fn fault_in(addr: u64, write: bool) -> bool {
     // As a system call runs: the locks this takes are taken with them on.
     interrupts::enable();
