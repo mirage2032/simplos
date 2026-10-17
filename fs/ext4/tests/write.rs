@@ -552,6 +552,26 @@ fn a_change_the_journal_wont_take_is_told_to_sync() {
     assert_eq!(fs.sync(), Err(Error::Io));
 }
 
+/// A file made or emptied as the journal won't take it says so, rather than
+/// closing it with the lock that closing takes held.
+#[test]
+fn a_file_made_as_the_journal_fails_says_so() {
+    let _serial = serial();
+    // So that making or emptying it sets its times, which is what fails.
+    ext4::set_clock(|| 1_000_000_000);
+    for name in ["made", "hello.txt"] {
+        let dir = workspace("uncommitted-file");
+        let root = dir.join("tree");
+        make_tree(&root);
+        let image = image(&dir, &root, &["-t", "ext4"], "64M");
+        let failing = Arc::new(AtomicBool::new(false));
+        let device = Failing { image, failing: failing.clone() };
+        let fs = Ext4::mount_writable(Box::new(device)).unwrap();
+        failing.store(true, Ordering::SeqCst);
+        assert!(fs.create(name).is_err(), "{name}");
+    }
+}
+
 /// A mount whose last writes fail lets its slot go all the same: lwext4
 /// kept it, on the device that was dropped, and took the next mount there
 /// as made already, on that.
@@ -588,7 +608,11 @@ fn changes_after_a_full_disk_are_written_without_a_journal() {
         at += written as u64;
     }
     drop(fill);
+    // Neither is left behind, naming an inode that's free again.
     assert_eq!(fs.symlink(&[b'x'; 200], "long"), Err(Error::NoSpace));
+    assert_eq!(fs.create_dir("dir"), Err(Error::NoSpace));
+    assert_eq!(fs.metadata("long").err(), Some(Error::NotFound));
+    assert_eq!(fs.metadata("dir").err(), Some(Error::NotFound));
     fs.remove_file("fill").unwrap();
     fs.create_dir("after").unwrap();
     fs.sync().unwrap();
@@ -597,6 +621,8 @@ fn changes_after_a_full_disk_are_written_without_a_journal() {
     image.save(&saved);
     let names = debugfs_ls(&saved, "/");
     assert!(names.contains(&"after".into()) && !names.contains(&"fill".into()), "{names:?}");
+    assert!(!names.contains(&"long".into()) && !names.contains(&"dir".into()), "{names:?}");
+    fsck(&saved).unwrap();
 }
 
 /// Names as long as ext4 has them, 255 bytes, and none longer.

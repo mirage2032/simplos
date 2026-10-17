@@ -392,7 +392,12 @@ impl State {
         }
         if lflag & ICANON == 0 {
             if self.available() < MOST_READY {
-                self.ready.push_back(vec![byte]);
+                // Onto what's ready, which a read takes across pieces: a
+                // piece each, counting them for each byte took long.
+                match self.ready.back_mut() {
+                    Some(last) if !last.is_empty() => last.push(byte),
+                    _ => self.ready.push_back(vec![byte]),
+                }
             }
             if echoing {
                 self.echo(byte, echo);
@@ -517,6 +522,9 @@ fn raw_mode_hands_over_bytes_as_they_come() {
     assert_eq!(tty.read(2), b"\r\x03");
     assert_eq!(tty.read(2), b"\x7f");
     assert!(screen.lock().is_empty());
+    // Kept to a limit, as a program that never reads asks no more of.
+    tty.input(&vec![b'x'; MOST_READY + 10]);
+    assert_eq!(tty.available(), MOST_READY);
 }
 
 #[test_case]

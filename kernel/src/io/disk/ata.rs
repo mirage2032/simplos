@@ -92,7 +92,9 @@ impl Drive {
     /// Select the drive and send an LBA48 command.
     fn command(&self, command: u8, lba: u64, count: u16) -> Result<(), DiskError> {
         self.select();
-        self.wait_ready()?;
+        // Idle. An error bit still set is the last command's, which the
+        // drive keeps until the next one, this one, is written.
+        super::poll(|| self.read_reg(STATUS_COMMAND) & (BSY | DRQ) == 0)?;
         // Each register holds two bytes in turn: the high halves go first.
         let [c0, c1] = count.to_le_bytes();
         let [l0, l1, l2, l3, l4, l5, ..] = lba.to_le_bytes();

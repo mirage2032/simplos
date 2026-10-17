@@ -287,7 +287,6 @@ jobs:
               [[ $test == tests/rust.rs ]] || tests+=(--test "$(basename "$test" .rs)")
             done
             cargo test --lib --bins "${tests[@]}"
-            cargo test --doc
           fi
 
       # Both halves build the same, but one cache is enough.

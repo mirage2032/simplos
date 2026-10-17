@@ -4,12 +4,6 @@ use ps2::error::ControllerError;
 use ps2::flags::ControllerConfigFlags;
 use spin::{Lazy, Mutex};
 
-#[derive(Copy, Clone, PartialEq, Eq)]
-pub enum Ps2InterruptCause {
-    Mouse,
-    Keyboard,
-}
-
 pub struct Ps2Controller {
     controller: Controller,
 }
@@ -42,23 +36,15 @@ impl Ps2Controller {
         // Write config again in case of controller reset
         controller.write_config(config)?;
 
-        // Step 7: Determine if there are 2 devices
-        let has_mouse = if config.contains(ControllerConfigFlags::DISABLE_MOUSE) {
-            controller.enable_mouse()?;
-            config = controller.read_config()?;
-            // If mouse is working, this should now be unset
-            !config.contains(ControllerConfigFlags::DISABLE_MOUSE)
-        } else {
-            false
-        };
-        // Disable mouse. If there's no mouse, this is ignored
+        // Step 7: The mouse, if there is one, stays off: nothing reads it,
+        // and its bytes would come in among the keyboard's. If there's no
+        // mouse, this is ignored.
         controller.disable_mouse()?;
 
-        // Step 8: Interface tests
+        // Step 8: Interface test
         let keyboard_works = controller.test_keyboard().is_ok();
-        let mouse_works = has_mouse && controller.test_mouse().is_ok();
 
-        // Step 9 - 10: Enable and reset devices
+        // Step 9 - 10: Enable and reset the keyboard
         config = controller.read_config()?;
         if keyboard_works {
             controller.enable_keyboard()?;
@@ -70,19 +56,8 @@ impl Ps2Controller {
                 serial_println!("PS/2 keyboard reset failed: {:?}", e);
             }
         }
-        if mouse_works {
-            controller.enable_mouse()?;
-            config.set(ControllerConfigFlags::DISABLE_MOUSE, false);
-            config.set(ControllerConfigFlags::ENABLE_MOUSE_INTERRUPT, true);
-            let mut mouse = controller.mouse();
-            // Enabling data reporting starts streaming events from the mouse
-            if let Err(e) = mouse.reset_and_self_test().and_then(|()| mouse.enable_data_reporting())
-            {
-                serial_println!("PS/2 mouse setup failed: {:?}", e);
-            }
-        }
 
-        // Write last configuration to enable devices and interrupts
+        // Write last configuration to enable the keyboard and its interrupt
         controller.write_config(config)?;
 
         Ok(Ps2Controller { controller })
@@ -90,15 +65,6 @@ impl Ps2Controller {
 
     pub fn controller_mut(&mut self) -> &mut Controller {
         &mut self.controller
-    }
-
-    pub fn interrupt_cause(&mut self) -> Ps2InterruptCause {
-        let status = self.controller.read_status();
-        if (status.bits() & (1 << 5)) != 0 {
-            Ps2InterruptCause::Mouse
-        } else {
-            Ps2InterruptCause::Keyboard
-        }
     }
 
     pub fn output_has_data(&mut self) -> bool {

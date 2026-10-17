@@ -46,7 +46,7 @@ status=0
 readonly DEADLINE=120
 # What the kernel's panic and fault handlers print. They halt rather than exit,
 # so without looking for these a crash would wait out the whole deadline.
-readonly FAULTS="KERNEL PANIC\|EXCEPTION: DOUBLE FAULT\|EXCEPTION: PAGE FAULT"
+readonly FAULTS='KERNEL PANIC\|\*\*\* EXCEPTION:'
 # A line a boot must also print after its banner, when set.
 also=""
 
@@ -124,7 +124,7 @@ boot() {
     # A panic prints a banner first, so the banner alone isn't enough.
     if grep -qa "$FAULTS" "$log"; then
         echo "::error::$mode: the kernel faulted after booting."
-        grep -a -A6 "KERNEL PANIC\|EXCEPTION:" "$log" | sed 's/^/    /'
+        grep -a -A6 "$FAULTS" "$log" | sed 's/^/    /'
         status=1
     fi
 }

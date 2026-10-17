@@ -47,7 +47,8 @@ pub fn init() {
 /// sends it again, where Linux counts the overrun (`timer_getoverrun`).
 fn alarms() {
     loop {
-        thread::sleep(1000 / TIMER_HZ as u64);
+        // Until the next tick: `sleep` takes the one under way as begun.
+        thread::sleep(0);
         let now = since_boot();
         for program in process::all() {
             let due = come(&mut program.alarm.lock(), now);

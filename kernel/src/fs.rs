@@ -131,6 +131,9 @@ pub enum Handle {
         write: bool,
         /// Every write goes at the end.
         append: bool,
+        /// O_SYNC's or O_DSYNC's bits, as it was opened with them: every
+        /// write is on the disk before it returns.
+        sync: u64,
         offset: AtomicU64,
     },
     /// A file in /proc, as it was when it was opened.

@@ -301,6 +301,10 @@ its hash maps' keys, and `/dev/random` and `/dev/urandom` give random bytes
   as they're used: those it can't write, the page cache's pages, read in if
   they aren't there, and the rest copied; and `mmap` all it maps of a
   file;
+- `execve` takes 128 KiB of arguments and environment, their strings and
+  pointers together, which it holds in the kernel's heap as it starts the
+  program, where Linux takes a quarter of the stack's limit: more is
+  `E2BIG`;
 - an interpreter must be position-independent, as loaders are, rather than
   at addresses of its own;
 - random bytes come from RDRAND when the CPU has it, which QEMU's default

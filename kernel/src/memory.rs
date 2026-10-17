@@ -399,26 +399,22 @@ impl AddressSpace {
     }
 
     /// Unmap `pages` and free their frames, or let go of them if they're
-    /// `SHARED`. Pages that aren't mapped are skipped.
+    /// `SHARED`, and the page tables that leaves empty. What isn't mapped is
+    /// skipped, a whole table's worth at a time where there's no table.
     pub fn unmap(&mut self, pages: PageRange) {
         let mut frames = FRAMES.lock();
         let Some(frames) = frames.as_mut() else { return };
-        let mut mapper = self.mapper();
-        let mut unmapped = 0;
-        for page in pages {
-            let shared = matches!(mapper.translate(page.start_address()),
-                TranslateResult::Mapped { flags, .. } if flags.contains(SHARED));
-            if let Ok((frame, flush)) = mapper.unmap(page) {
-                flush.flush();
-                match shared {
-                    true => frames.release(frame),
-                    // Safety: unmapped from the only address space that had it.
-                    false => unsafe { frames.deallocate_frame(frame) },
-                }
-                unmapped += 1;
-            }
+        let range = pages.start.start_address().as_u64()..pages.end.start_address().as_u64();
+        if range.is_empty() {
+            return;
         }
-        self.pages -= unmapped;
+        let mut emptied = false;
+        self.pages -= unmap_tables(self.pml4, 4, 0, &range, frames, &mut emptied);
+        if emptied {
+            // The CPU may still hold what the tables freed said: before
+            // anyone else has their frames, which `FRAMES` held keeps.
+            x86_64::instructions::tlb::flush_all();
+        }
     }
 
     /// Zero what's in the mapped pages among `pages`, which stay mapped:
@@ -621,6 +617,53 @@ fn free_tables(frame: PhysFrame, level: u8, entries: usize, frames: &mut BootInf
     }
     // Safety: a table only the dropped address space used.
     unsafe { frames.deallocate_frame(frame) };
+}
+
+/// Unmap what `frame`, a page table of `level` mapping from `base` on, maps
+/// of `range`, freeing the frames or letting go of `SHARED` ones, and free
+/// the tables below it that leaves empty, setting `emptied` if any: how many
+/// pages it unmapped. Only lower-half ranges that reach into what `frame`
+/// maps are passed here.
+fn unmap_tables(
+    frame: PhysFrame,
+    level: u8,
+    base: u64,
+    range: &Range<u64>,
+    frames: &mut BootInfoFrameAllocator,
+    emptied: &mut bool,
+) -> u64 {
+    let span = 4096u64 << (9 * (level - 1));
+    let first = range.start.saturating_sub(base) / span;
+    let last = ((range.end - 1 - base) / span).min(511);
+    let entries = table(frame);
+    let mut unmapped = 0;
+    for i in first..=last {
+        let (entry, start) = (&mut entries[i as usize], base + i * span);
+        if !entry.flags().contains(PageTableFlags::PRESENT) {
+            continue;
+        }
+        let below = PhysFrame::containing_address(entry.addr());
+        if level == 1 {
+            let shared = entry.flags().contains(SHARED);
+            entry.set_unused();
+            x86_64::instructions::tlb::flush(VirtAddr::new(start));
+            match shared {
+                true => frames.release(below),
+                // Safety: unmapped from the only address space that had it.
+                false => unsafe { frames.deallocate_frame(below) },
+            }
+            unmapped += 1;
+            continue;
+        }
+        unmapped += unmap_tables(below, level - 1, start, range, frames, emptied);
+        if table(below).iter().all(|entry| entry.is_unused()) {
+            entry.set_unused();
+            // Safety: a table of this address space's alone, now unlinked.
+            unsafe { frames.deallocate_frame(below) };
+            *emptied = true;
+        }
+    }
+    unmapped
 }
 
 /// Copy what's mapped below `from`, a page table of `level`, through its
@@ -959,6 +1002,24 @@ fn a_shared_page_made_writable_is_copied_first() {
     }
     FRAMES.lock().as_mut().unwrap().release(frame);
     assert_eq!(holders(), 0);
+}
+
+#[test_case]
+fn unmapping_frees_the_tables_it_empties_and_skips_those_not_there() {
+    let free = || FRAMES.lock().as_ref().unwrap().memory().1;
+    let mut space = AddressSpace::new().unwrap();
+    let before = free();
+    // Pages 2 MiB apart, each in a table of its own.
+    let at = |i: u64| Page::containing_address(VirtAddr::new(0x1000_0000_0000 + (i << 21)));
+    for i in 0..64 {
+        space.map(Page::range(at(i), at(i) + 1), PageTableFlags::WRITABLE).unwrap();
+    }
+    assert!(free() < before);
+    // All of the lower half: a page at a time, hours.
+    let end = Page::containing_address(VirtAddr::new(USER_END - 4096));
+    space.unmap(Page::range(Page::containing_address(VirtAddr::new(0x1000)), end));
+    assert_eq!(space.pages(), 0);
+    assert_eq!(free(), before, "the tables are still there");
 }
 
 #[test_case]

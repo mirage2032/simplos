@@ -239,8 +239,12 @@ static int ext4_link(struct ext4_mountpoint *mp, struct ext4_inode_ref *parent,
 		/* Initialize directory index if supported */
 		if (ext4_sb_feature_com(&mp->fs.sb, EXT4_FCOM_DIR_INDEX)) {
 			r = ext4_dir_dx_init(ch, parent);
-			if (r != EOK)
+			/* LOCAL PATCH: the name taken out again, as below: the
+			 * caller frees the inode, which it would be left naming. */
+			if (r != EOK) {
+				ext4_dir_remove_entry(parent, n, len);
 				return r;
+			}
 
 			ext4_inode_set_flag(ch->inode, EXT4_INODE_FLAG_INDEX);
 			ch->dirty = true;
