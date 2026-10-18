@@ -4,17 +4,17 @@
 # x86-64 Linux with musl, and the standard library for the same target,
 # under /usr. They're dynamically linked: they run in musl's loader,
 # /lib/ld-musl-x86_64.so.1, with libgcc_s.so.1, both of which
-# scripts/toolchain.sh's tree has. What rustc makes it links with cc, that
+# user/ports/toolchain.sh's tree has. What rustc makes it links with cc, that
 # tree's gcc, and is static, as Rust's musl target links by default.
 #
-# Usage: scripts/rust.sh
+# Usage: user/ports/rust.sh
 #
 # What it unpacked is kept until this script changes. The download, 300 MB,
 # is kept in target/rust/downloads.
 #
 # It runs on x86-64 Linux, which can run what it unpacks, as it checks
 # rustc and cargo by building with them there, in musl's loader from
-# scripts/toolchain.sh's tree, which it builds first if it isn't yet; with
+# user/ports/toolchain.sh's tree, which it builds first if it isn't yet; with
 # curl, tar, xz, sha256sum and strip.
 #
 # Rust is MIT or Apache-2.0.
@@ -24,7 +24,7 @@ version=1.99.1
 target=x86_64-unknown-linux-musl
 sha256=da398394254c8ffd29d1e397dfc00941dfb6a631bc7254cf797481fec8df6f5a
 
-root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 work=$root/target/rust
 out=$work/root
 downloads=$work/downloads
@@ -46,7 +46,7 @@ if [[ -d $out && $(cat "$work/built" 2>/dev/null) == "$stamp" ]]; then
     exit 0
 fi
 # The loader, libgcc_s and the linker it's checked with.
-"$root/scripts/toolchain.sh"
+"$root/user/ports/toolchain.sh"
 echo "rust: unpacking rust $version into $out" >&2
 
 archive=rust-$version-$target.tar.xz

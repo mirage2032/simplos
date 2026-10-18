@@ -7,10 +7,10 @@
 # functions of its own (Rust's has _cargo), by the userland's own zsh, with
 # fpath as zsh has it on simplos. Nothing to do without that zsh.
 #
-# Usage: scripts/completions.sh TREE
+# Usage: user/ports/completions.sh TREE
 set -euo pipefail
 
-tree=${1:?usage: scripts/completions.sh TREE}
+tree=${1:?usage: user/ports/completions.sh TREE}
 [[ -x $tree/bin/zsh ]] || exit 0
 mkdir -p "$tree/root"
 # Afresh: one the userland had would be kept if only its count were right.

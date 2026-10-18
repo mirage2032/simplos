@@ -7,12 +7,12 @@
 # All static, for x86-64 Linux with musl: the C compiled by zig cc, uutils by
 # the Rust toolchain rust-toolchain.toml pins, from the sources pinned below,
 # which have to match their checksums, and for uutils the crates its
-# Cargo.lock pins. Then over them, the files of simplos's own in userland/:
+# Cargo.lock pins. Then over them, the files of simplos's own in user/rootfs/:
 # /sbin/init, and what's in /etc.
 #
-# Usage: scripts/userland.sh
+# Usage: user/ports/userland.sh
 #
-# What it built is kept: run again, it only copies userland/ again, unless
+# What it built is kept: run again, it only copies user/rootfs/ again, unless
 # this script has changed since. The downloads are kept in
 # target/userland/downloads.
 #
@@ -46,7 +46,7 @@ uutils_sha256=4fb327655cb4ffcbf2f16550cf9234079ffe839692f7aa1a6eda104af684e122
 # here too, so that changing it changes this script, and so what's built.
 rust_toolchain=nightly-2026-09-26
 
-root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 work=$root/target/userland
 out=$work/root
 downloads=$work/downloads
@@ -67,11 +67,11 @@ mkdir -p "$downloads"
 exec 9>"$work/lock"
 flock 9
 
-# userland/, over what's built: copied every time, as it's quick, so that
+# user/rootfs/, over what's built: copied every time, as it's quick, so that
 # changing it needs no new build. git keeps neither /tmp nor modes of
 # directories.
 overlay() {
-    cp -a "$root/userland/." "$out/"
+    cp -a "$root/user/rootfs/." "$out/"
     mkdir -p "$out/tmp"
     chmod 700 "$out/root"
     chmod 1777 "$out/tmp"
@@ -171,7 +171,7 @@ step make -j"$jobs"
 install -m 755 Src/zsh "$out/bin/zsh"
 step make DESTDIR="$out" install.fns
 # compinit's record of them isn't made here but once the disk's trees are
-# all in, by scripts/completions.sh: the others bring functions too.
+# all in, by user/ports/completions.sh: the others bring functions too.
 
 echo "userland: vim" >&2
 cd "$build/vim-$vim_version"

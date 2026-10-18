@@ -459,7 +459,7 @@ its `/sbin/init`, a script that logs root in to zsh.
 
 ## Userland
 
-`scripts/userland.sh` builds the programs that make a disk a system to use:
+`user/ports/userland.sh` builds the programs that make a disk a system to use:
 uutils' coreutils 0.12.0, GNU's commands rewritten in Rust, one program,
 `/usr/bin/coreutils`, for its 104 (`ls`, `cp`, `sort`, `du`, `dd`, `timeout`
 and the rest); busybox 1.38.0 for what they aren't, with a link for each of
@@ -483,7 +483,7 @@ copies with; a socket pair, which Rust's `Command` hears of a failed `exec`
 by; and `AT_FDCWD` as rustix passes it. Its 13 MB are read from the disk
 once, and each program running it after shares them, in the page cache.
 
-Over them go the files in `userland/`, copied every time, so changing them
+Over them go the files in `user/rootfs/`, copied every time, so changing them
 needs no new build:
 
 - `/sbin/init`, which the kernel runs first: it logs root in to zsh, as
@@ -496,7 +496,7 @@ needs no new build:
 
 What the completion system knows of its functions, zsh's 998 and Rust's
 `_cargo`, it keeps in `~/.zcompdump`, which the build makes for root once
-the disk's trees are all in (`scripts/completions.sh`), by running the same
+the disk's trees are all in (`user/ports/completions.sh`), by running the same
 zsh. compinit uses it only if it counts as many functions as there are, and
 otherwise makes it again as root's zsh starts, which takes seconds under
 emulation, ten thousand lookups on the disk.
@@ -524,7 +524,7 @@ names (vim's and uutils', from their tags), unchanged, configured as it says.
 
 ## GCC
 
-`scripts/toolchain.sh` builds a compiler for the disk, so programs can be
+`user/ports/toolchain.sh` builds a compiler for the disk, so programs can be
 compiled on simplos and run there: gcc and g++ 14.3.0, binutils 2.44, and
 musl 1.2.6, with `cc` for gcc, all under `/usr`; and musl's loader,
 `/lib/ld-musl-x86_64.so.1`, and `ldd`.
@@ -574,7 +574,7 @@ unchanged, configured as the script says.
 
 ## Rust
 
-`scripts/rust.sh` puts Rust on the disk too, so Rust programs can be built
+`user/ports/rust.sh` puts Rust on the disk too, so Rust programs can be built
 on simplos and run there: rustc, rustdoc and cargo 1.99.1, with the standard
 library for `x86_64-unknown-linux-musl`, all under `/usr`.
 
@@ -595,7 +595,7 @@ as Rust's musl target does. Before it's done, the script builds a program
 with rustc and a package with cargo on the host, in that loader, and runs
 them. It takes 20 s and leaves 420 MB in `target/rust/root`, the download,
 300 MB, kept in `target/rust/downloads`; it unpacks on x86-64 Linux only,
-after `scripts/toolchain.sh` has built GCC.
+after `user/ports/toolchain.sh` has built GCC.
 
 `cargo run`'s disk gets it over the userland and GCC, which makes it 2
 GiB, and rustc needs `cargo run`'s 1 GiB of memory. cargo locks what it
@@ -634,14 +634,14 @@ copies of and run again; `tests/tty.rs` types into a terminal for it to read;
 `tests/time.rs` has it read the clocks, count CPU time and set alarms.
 `tests/shells.rs` runs busybox's sh and zsh, as commands and typed at on a
 terminal: its disk is 128 MiB and holds the userland too, which the runner
-builds with `scripts/userland.sh` the first time. `tests/toolchain.rs`
+builds with `user/ports/userland.sh` the first time. `tests/toolchain.rs`
 compiles C and C++ with gcc and g++, linked dynamically and statically, a
 shared library and a program that loads one with `dlopen`, and runs what
 they made: its disk is
-1 GiB, with GCC from `scripts/toolchain.sh` as well, and it gets as long as
+1 GiB, with GCC from `user/ports/toolchain.sh` as well, and it gets as long as
 compiling takes. `tests/rust.rs` builds a program with rustc and a package
 with cargo, and runs them: its disk is 2 GiB, with Rust from
-`scripts/rust.sh` too, and it gets 1 GiB of memory, and half an hour. After a run that passes, e2fsck must find nothing wrong with it, and it must have been
+`user/ports/rust.sh` too, and it gets 1 GiB of memory, and half an hour. After a run that passes, e2fsck must find nothing wrong with it, and it must have been
 unmounted, so the tests need e2fsprogs installed.
 
 Each test boots twice, under BIOS and UEFI at once, and passes only if it

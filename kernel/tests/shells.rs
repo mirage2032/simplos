@@ -1,5 +1,5 @@
 //! Shells: busybox's and zsh, and the commands they run, uutils' coreutils
-//! and busybox's others, as `scripts/userland.sh` builds them and
+//! and busybox's others, as `user/ports/userland.sh` builds them and
 //! `tools/boot-test` puts them on this kernel's disk, as it does for a
 //! kernel whose name starts with `shells`. Each runs on a terminal of its
 //! own: as a command, its output kept; or as people use them, typed at.

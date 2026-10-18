@@ -1,4 +1,4 @@
-//! Rust: rustc and cargo, as `scripts/rust.sh` unpacks them and
+//! Rust: rustc and cargo, as `user/ports/rust.sh` unpacks them and
 //! `tools/boot-test` puts them on this kernel's disk, with GCC to link with,
 //! as it does for a kernel whose name starts with `rust`: compiling programs
 //! on simplos that then run on it. Each start of rustc reads its 230 MB

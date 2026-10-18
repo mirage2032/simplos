@@ -14,11 +14,11 @@
 //! it at the end of a passing run.
 //!
 //! A kernel whose file name starts with `shells` (`tests/shells.rs`) gets the
-//! userland on its ext4 disk too, busybox, uutils and zsh, which `scripts/userland.sh`
+//! userland on its ext4 disk too, busybox, uutils and zsh, which `user/ports/userland.sh`
 //! builds the first time; one whose name starts with `toolchain`
-//! (`tests/toolchain.rs`), GCC as well, from `scripts/toolchain.sh`, and the
+//! (`tests/toolchain.rs`), GCC as well, from `user/ports/toolchain.sh`, and the
 //! time compiling takes; one whose name starts with `rust` (`tests/rust.rs`),
-//! Rust's rustc and cargo too, from `scripts/rust.sh`, and the memory and
+//! Rust's rustc and cargo too, from `user/ports/rust.sh`, and the memory and
 //! the disk they take. The others' tests list that disk and expect only
 //! what's theirs.
 
@@ -166,12 +166,12 @@ fn main() -> ExitCode {
 /// Rust's, built if it isn't yet.
 fn build(what: &str) -> Result<PathBuf, String> {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let status = Command::new(repository.join(format!("scripts/{what}.sh")))
+    let status = Command::new(repository.join(format!("user/ports/{what}.sh")))
         .status()
-        .map_err(|error| format!("couldn't run scripts/{what}.sh: {error}"))?;
+        .map_err(|error| format!("couldn't run user/ports/{what}.sh: {error}"))?;
     match status.success() {
         true => Ok(repository.join(format!("target/{what}/root"))),
-        false => Err(format!("scripts/{what}.sh failed ({status})")),
+        false => Err(format!("user/ports/{what}.sh failed ({status})")),
     }
 }
 
@@ -342,9 +342,9 @@ fn make_ext4(image: &Path, setup: &Setup) -> Result<(), Box<dyn Error + Send + S
     }
     // compinit's record of their completions, once they're all in.
     let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let recorded = Command::new(repository.join("scripts/completions.sh")).arg(&tree).status()?;
+    let recorded = Command::new(repository.join("user/ports/completions.sh")).arg(&tree).status()?;
     if !recorded.success() {
-        return Err(format!("scripts/completions.sh failed ({recorded})").into());
+        return Err(format!("user/ports/completions.sh failed ({recorded})").into());
     }
     // 4 KiB blocks, which the tests count in: for a disk this small, some
     // mke2fs.conf say 1 KiB. Inode tables zeroed now, as the images' are.

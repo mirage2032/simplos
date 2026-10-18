@@ -84,9 +84,9 @@ jobs:
           # none), and the paths its result depends on besides those.
           JOBS: |
             lint        lint   rustfmt.toml Makefile kernel fullkernel tools user lib vendor
-            test-kernel test   kernel tools user lib vendor userland scripts/boot-test.sh scripts/userland.sh scripts/toolchain.sh scripts/completions.sh
-            test-rust   -      kernel tools user lib vendor userland scripts/boot-test.sh scripts/userland.sh scripts/toolchain.sh scripts/rust.sh scripts/completions.sh
-            images      images kernel fullkernel user lib vendor userland scripts/build-images.sh scripts/smoke-test.sh scripts/userland.sh scripts/toolchain.sh scripts/rust.sh scripts/completions.sh
+            test-kernel test   kernel tools user lib vendor user/rootfs scripts/boot-test.sh user/ports/userland.sh user/ports/toolchain.sh user/ports/completions.sh
+            test-rust   -      kernel tools user lib vendor user/rootfs scripts/boot-test.sh user/ports/userland.sh user/ports/toolchain.sh user/ports/rust.sh user/ports/completions.sh
+            images      images kernel fullkernel user lib vendor user/rootfs scripts/build-images.sh scripts/smoke-test.sh user/ports/userland.sh user/ports/toolchain.sh user/ports/rust.sh user/ports/completions.sh
         run: .github/scripts/plan.sh
 
   lint:

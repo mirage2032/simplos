@@ -9,7 +9,7 @@
 # libstdc++.so and libgcc_s.so, which musl's loader,
 # /lib/ld-musl-x86_64.so.1, loads; or with `-static`, not.
 #
-# Usage: scripts/toolchain.sh
+# Usage: user/ports/toolchain.sh
 #
 # What it built is kept until this script changes, as it takes a while:
 # a quarter of an hour on 32 cores, most of an hour on CI's 4. The downloads
@@ -42,7 +42,7 @@ mpfr_sha256=b67ba0383ef7e8a8563734e2e889ef5ec3c3b898a01d00fa0a6869ad81c6ce01
 linux_headers_version=4.19.88-2
 linux_headers_sha256=dc7abf734487553644258a3822cfd429d74656749e309f2b25f09f4282e05588
 
-root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 work=$root/target/toolchain
 out=$work/root
 downloads=$work/downloads

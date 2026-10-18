@@ -9,10 +9,10 @@
 //! An ext4 disk goes with it, `disk.img` here, made the first time and kept,
 //! so what's written to it is there next time; delete it to start afresh. It
 //! starts with `hello.txt`, user/probe as `/bin/probe`, the userland that
-//! `scripts/userland.sh` builds, busybox, uutils, zsh and vim, GCC, which
-//! `scripts/toolchain.sh` builds, and Rust's rustc and cargo, which
-//! `scripts/rust.sh` unpacks, if they can be, and compinit's record of their
-//! completions, which `scripts/completions.sh` makes.
+//! `user/ports/userland.sh` builds, busybox, uutils, zsh and vim, GCC, which
+//! `user/ports/toolchain.sh` builds, and Rust's rustc and cargo, which
+//! `user/ports/rust.sh` unpacks, if they can be, and compinit's record of their
+//! completions, which `user/ports/completions.sh` makes.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -113,7 +113,7 @@ fn disk() -> Option<PathBuf> {
     let trees =
         [("userland", "busybox, uutils, zsh or vim"), ("toolchain", "gcc"), ("rust", "cargo")];
     for (what, has) in trees {
-        let built = Command::new(repository.join(format!("scripts/{what}.sh"))).status();
+        let built = Command::new(repository.join(format!("user/ports/{what}.sh"))).status();
         let copied = built.is_ok_and(|status| status.success())
             && Command::new("cp")
                 .args(["-a", "--remove-destination"])
@@ -126,7 +126,7 @@ fn disk() -> Option<PathBuf> {
         }
     }
     // Once they're all in, as each may bring completions of its own.
-    let recorded = Command::new(repository.join("scripts/completions.sh")).arg(&tree).status();
+    let recorded = Command::new(repository.join("user/ports/completions.sh")).arg(&tree).status();
     if !recorded.is_ok_and(|status| status.success()) {
         eprintln!("note: zsh will make its completions' record as it starts, slowly");
     }
