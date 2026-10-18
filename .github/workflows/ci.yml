@@ -21,10 +21,10 @@ name: CI
 # the repository's paths, and when a run has passed a job with all of those
 # as they are now (and on the same runner image), it isn't run again. A pull
 # request that changes only the userland's script doesn't lint again; one
-# that changes only the README runs nothing but plan, trees and check; and
-# develop, after merging a pull request that passed, runs only what the merge
-# changed. See .github/scripts/plan.sh. check is the one check that's all of
-# them, for a branch rule to require.
+# that changes only the README or docs/ runs nothing but plan, trees and
+# check; and develop, after merging a pull request that passed, runs only
+# what the merge changed. See .github/scripts/plan.sh. check is the one check
+# that's all of them, for a branch rule to require.
 #
 # What runs share is in caches and artifacts. A pull request's caches are its
 # own, no one else's to read, but every run can read develop's: so runs on
