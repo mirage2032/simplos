@@ -1,5 +1,6 @@
-/target
-vendor/bootloader/target
+# Each crate's cargo target directory, and the repository's own, which
+# holds the trees built for the disk.
+target/
 
 # Written by fullkernel/build.rs on every build, pointing at the kernel ELF
 # inside an OUT_DIR whose cargo hash is not stable. Machine-specific by
@@ -12,3 +13,5 @@ vendor/bootloader/target
 
 # The ext4 disk `cargo run` makes and keeps, which is the user's.
 /fullkernel/disk.img
+
+.idea/
