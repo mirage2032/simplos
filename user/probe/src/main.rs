@@ -530,6 +530,9 @@ fn main() {
             let wrong = bytes.iter().enumerate().position(|(i, &b)| b != (i % 251) as u8);
             println!("{}", wrong.map_or(String::from("ok"), |at| format!("wrong at {at}")));
         }
+        // How many pages of its memory are in memory, as /proc/self/stat
+        // says: as /bin/big, none of the 24 MiB segment it never touches.
+        Some("rss") => println!("{}", rss()),
         // How the kernel says it loaded the program (the auxiliary vector):
         // whether AT_BASE is where this code is, as when this is another
         // program's interpreter (PT_INTERP), it being 0 otherwise; whether
@@ -2223,6 +2226,11 @@ fn main() {
         Some("proc") => {
             let before = rss();
             let addr = syscall5(9, [0, 1 << 20, 3, 0x22, 0]);
+            // In memory as it's touched, as on Linux: every page of it.
+            for page in (0..1 << 20).step_by(4096) {
+                // Safety: the megabyte just mapped, writable.
+                unsafe { ((addr as usize + page) as *mut u8).write_volatile(1) };
+            }
             let mapped = rss() - before;
             syscall(11, addr as usize, 1 << 20, 0);
             let unmapped = rss() - before;

@@ -22,7 +22,7 @@ use crate::elf::{self, Elf, Source};
 use crate::fs;
 use crate::futex;
 use crate::io::interrupts::gdt;
-use crate::memory::{AddressSpace, USER_END};
+use crate::memory::{self, AddressSpace, Backing, Missing, USER_END};
 use crate::signal::{self, AltStack, Info, Signals, ThreadSignals};
 use crate::syscall;
 use crate::thread::{self, WaitQueue};
@@ -261,6 +261,55 @@ pub struct Memory {
 }
 
 impl Process {
+    /// Fill `buf` from the program's memory at `addr`, what it hasn't touched
+    /// of it read in first: `None` if any of it isn't the program's, the
+    /// system call's EFAULT.
+    pub fn read(&self, addr: u64, buf: &mut [u8]) -> Option<()> {
+        self.touching(|space| space.read(addr, buf))
+    }
+
+    /// Copy `bytes` to the program's memory at `addr`, what it hasn't
+    /// touched of it read in first: `None` if any of it isn't the program's,
+    /// writable, the system call's EFAULT.
+    pub fn write(&self, addr: u64, bytes: &[u8]) -> Option<()> {
+        self.touching(|space| space.write(addr, bytes))
+    }
+
+    /// `copy` the program's memory, with it held, reading in from the disk,
+    /// without it, a page of a file it says is `Missing`, and again.
+    fn touching(
+        &self,
+        mut copy: impl FnMut(&mut AddressSpace) -> Result<(), Missing>,
+    ) -> Option<()> {
+        // Held until it's been copied from, so the cache keeps it.
+        let mut _read = None;
+        loop {
+            let copied = copy(&mut self.memory.lock().space);
+            match copied {
+                Ok(()) => return Some(()),
+                Err(Missing::Never) => return None,
+                Err(Missing::Page(file, index)) => _read = Some(memory::read_page(file, index)?),
+            }
+        }
+    }
+
+    /// Map the page at `addr` if it's the program's and isn't mapped yet,
+    /// reading it from its file first if it must be: whether it's mapped now.
+    fn fault(&self, addr: u64, write: bool) -> bool {
+        let mut read = None;
+        loop {
+            let faulted = self.memory.lock().space.fault(addr, write, read.as_ref());
+            match faulted {
+                Ok(()) => return true,
+                Err(Missing::Never) => return false,
+                Err(Missing::Page(file, index)) => match memory::read_page(file, index) {
+                    Some(page) => read = Some(page),
+                    None => return false,
+                },
+            }
+        }
+    }
+
     /// Block until the program ends, and return its exit status as a shell
     /// reports it: what it passed to `exit`, or 128 plus the signal that
     /// ended it. One stopped is continued: for the kernel's shell and the
@@ -630,7 +679,8 @@ fn program(
     cwd: &str,
 ) -> Result<(Memory, Registers), i64> {
     let mut space = AddressSpace::new().ok_or(ENOMEM)?;
-    space.grow_stack(STACK_TOP - STACK_MOST..STACK_TOP);
+    let stack = PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
+    space.reserve(pages(STACK_TOP - STACK_MOST, STACK_TOP), stack, Backing::Zero);
     let parsed = Elf::parse(elf).map_err(load_errno)?;
     let image = load(&mut space, &parsed, elf, PIE_BASE, MMAP_START).map_err(load_errno)?;
     let interpreter = match parsed.interpreter(elf).map_err(load_errno)? {
@@ -683,11 +733,11 @@ pub struct ThreadIds {
     pub clear: u64,
 }
 
-/// Write `id` at `at` in `memory`, if `at` isn't 0, as `clone` writes a new
-/// thread's: or not, if it can't be, as Linux doesn't say.
-fn write_id(memory: &mut Memory, at: u64, id: u64) {
+/// Write `id` at `at` in `process`'s memory, if `at` isn't 0, as `clone`
+/// writes a new thread's: or not, if it can't be, as Linux doesn't say.
+fn write_id(process: &Process, at: u64, id: u64) {
     if at != 0 {
-        let _ = memory.space.write(at, &(id as u32).to_le_bytes());
+        let _ = process.write(at, &(id as u32).to_le_bytes());
     }
 }
 
@@ -702,13 +752,17 @@ pub fn fork(
     ids: ThreadIds,
 ) -> Option<u64> {
     let mut memory = {
-        let memory = parent.memory.lock();
+        let mut memory = parent.memory.lock();
         Memory { space: memory.space.duplicate()?, ..*memory }
     };
     let pml4 = memory.space.pml4();
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    write_id(&mut memory, ids.child, id);
-    write_id(&mut parent.memory.lock(), ids.parent, id);
+    if ids.child != 0 {
+        // Its own, no one's yet: or not, as for `write_id`, if it's a page
+        // of a file the cache would have to read in.
+        let _ = memory.space.write(ids.child, &(id as u32).to_le_bytes());
+    }
+    write_id(parent, ids.parent, id);
     // Blocking what the thread that made it blocks, its alternate stack too.
     let task = thread::with_current_user(|user| Task::new(id, user.task.signals.fork()))?;
     task.clear_tid.store(ids.clear, Ordering::Relaxed);
@@ -782,11 +836,8 @@ pub fn spawn_thread(
         new
     })
     .ok_or(ENOMEM)?;
-    {
-        let mut memory = process.memory.lock();
-        write_id(&mut memory, ids.parent, id);
-        write_id(&mut memory, ids.child, id);
-    }
+    write_id(process, ids.parent, id);
+    write_id(process, ids.child, id);
     // One of its threads, unless it's ending, which then has none to end.
     let task = user.task.clone();
     let joined = interrupts::without_interrupts(|| {
@@ -842,14 +893,16 @@ pub fn exec(
     Ok(start)
 }
 
-/// From a page fault in ring 3 at `addr`, not mapped: map it if it's where
-/// the current thread's program's stack grows to. Whether it did, and the
+/// From a page fault in ring 3 at `addr`, as a `write` or not: map it if
+/// it's the current thread's program's, and isn't yet, as with memory it's
+/// been given but hasn't touched, or where its stack grows to; or, written,
+/// give it a page `fork` shared of its own. Whether it did, and the
 /// instruction can run again.
-pub fn grow_stack(addr: u64) -> bool {
+pub fn fault_in(addr: u64, write: bool) -> bool {
     // As a system call runs: the locks this takes are taken with them on.
     interrupts::enable();
     let Some(process) = thread::current_process() else { return false };
-    process.memory.lock().space.grow(addr)
+    process.fault(addr, write)
 }
 
 /// End the current thread as `exit` does, with `code`, from one of its
@@ -893,7 +946,7 @@ fn leave(status: i32) -> ! {
     // interrupts off.
     interrupts::enable();
     let clear = task.clear_tid.swap(0, Ordering::Relaxed);
-    if clear != 0 && process.memory.lock().space.write(clear, &0u32.to_le_bytes()).is_some() {
+    if clear != 0 && process.write(clear, &0u32.to_le_bytes()).is_some() {
         futex::wake(process.id, clear, 1, futex::ANY);
     }
     // Interrupts off from here until the thread is switched away from for
@@ -1273,24 +1326,28 @@ fn load(
                 if segment.flags & elf::PF_X == 0 {
                     flags |= PageTableFlags::NO_EXECUTE;
                 }
-                // A read-only segment's pages are the file's own, from the
-                // page cache, shared with whatever else maps them: those
-                // wholly its, with nothing past what's in the file, which
-                // are zeros. The rest are copies.
-                let shareable =
-                    segment.flags & elf::PF_W == 0 && segment.vaddr % 4096 == segment.offset % 4096;
                 let in_file = start + segment.filesz;
+                // A segment of a file on the disk is mapped from it as it's
+                // touched (`AddressSpace::fault`), where it starts as far
+                // into a page in both: a read-only one's pages the file's
+                // own, from the page cache, shared with whatever else maps
+                // them; the rest copies. Past what's in the file, zeros,
+                // but for the rest of its last page if there are none.
+                let lazy = file.file().filter(|_| segment.vaddr % 4096 == segment.offset % 4096);
+                if let Some(file) = &lazy {
+                    let data_end = match segment.memsz == segment.filesz {
+                        true => stop.next_multiple_of(4096),
+                        false => in_file,
+                    };
+                    let offset = segment.offset - start % 4096;
+                    let backing = Backing::File { file: file.clone(), offset, data_end };
+                    space.reserve(pages(start, stop), flags, backing);
+                }
                 for page in pages(start, stop) {
                     let at = page.start_address().as_u64();
-                    let whole = at + 4096 <= in_file || segment.memsz == segment.filesz;
-                    // Where it is in the file, a whole page there, as the
-                    // segment starts as far into a page in both.
-                    if shareable
-                        && whole
-                        && in_one(at / 4096)
-                        && let Some(frame) = file.page((segment.offset + at - start) / 4096)
-                    {
-                        space.map_shared(page, frame, flags).ok_or(NO_MEMORY)?;
+                    // But for a page two segments share, which holds what
+                    // each has of it, copied now.
+                    if lazy.is_some() && in_one(at / 4096) {
                         continue;
                     }
                     space.map(Page::range(page, page + 1), flags).ok_or(NO_MEMORY)?;

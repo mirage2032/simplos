@@ -18,7 +18,6 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use ext4::{BlockDevice, DirEntry, Error, Ext4, Kind, Metadata};
-use x86_64::structures::paging::PhysFrame;
 
 /// The mounted file system, if a disk had one. Calls into it can wait on the
 /// disk for a long time, so whoever waits for them sleeps.
@@ -92,7 +91,11 @@ fn is_ext4(index: usize) -> bool {
 
 /// Unmount it, leaving the disk clean: before the machine goes off.
 pub fn unmount() {
-    ROOT.lock().take();
+    let mut root = ROOT.lock();
+    // What waits to be closed first: each holds on to the mount.
+    drop(core::mem::take(&mut *CLOSING.lock()));
+    root.take();
+    drop(root);
     crate::cache::clear();
 }
 
@@ -126,7 +129,8 @@ pub enum Handle {
     /// one at a time from them here, as Rust's `Command` doesn't.
     Socket { input: crate::pipe::PipeEnd, output: crate::pipe::PipeEnd, nonblocking: AtomicBool },
     File {
-        file: ext4::File,
+        /// Shared with the parts of programs' memory it's mapped into.
+        file: Arc<ext4::File>,
         read: bool,
         write: bool,
         /// Every write goes at the end.
@@ -377,6 +381,26 @@ pub fn lock() -> Tree<'static> {
 
 pub struct Tree<'a> {
     disk: SleepLockGuard<'a, Option<Ext4>>,
+}
+
+impl Drop for Tree<'_> {
+    /// Close what `close_later` was given, while the tree is still held.
+    fn drop(&mut self) {
+        let files = core::mem::take(&mut *CLOSING.lock());
+        drop(files);
+    }
+}
+
+/// Files let go of where the tree couldn't be taken: by a program's memory,
+/// as the parts of it a file is mapped into go (`memory::Backing`).
+static CLOSING: spin::Mutex<Vec<Arc<ext4::File>>> = spin::Mutex::new(Vec::new());
+
+/// Let go of `file` the next time the tree is: closing it, if no one else
+/// holds it, as a call into the file system is made, with the tree held.
+/// For where it can't be taken, as it mustn't be waited for with a
+/// program's memory held; the disk's writer takes it every second.
+pub fn close_later(file: Arc<ext4::File>) {
+    CLOSING.lock().push(file);
 }
 
 impl Tree<'_> {
@@ -635,14 +659,14 @@ pub fn open_program(path: &str) -> Result<Program, i64> {
     let file = tree.disk(path).map_err(errno)?.open(path).map_err(errno)?;
     // Before the program is made: dropping that takes the tree.
     drop(tree);
-    Ok(Program { file: Some(file), size: metadata.size })
+    Ok(Program { file: Some(Arc::new(file)), size: metadata.size })
 }
 
 /// A program's file, open, for its segments to be read from as it's
-/// loaded, through the page cache, or mapped from it.
+/// loaded, through the page cache, or mapped from it as they're touched.
 pub struct Program {
     /// Always there but as it's dropped, which takes the tree.
-    file: Option<ext4::File>,
+    file: Option<Arc<ext4::File>>,
     size: u64,
 }
 
@@ -657,12 +681,8 @@ impl elf::Source for Program {
         (read == buf.len()).then_some(())
     }
 
-    fn page(&self, index: u64) -> Option<PhysFrame> {
-        if index * 4096 >= self.size {
-            return None;
-        }
-        let _tree = lock();
-        crate::cache::page(self.file.as_ref()?, index).ok()
+    fn file(&self) -> Option<Arc<ext4::File>> {
+        self.file.clone()
     }
 }
 

@@ -126,6 +126,15 @@ fn copies_of_a_program_share_its_code() {
 }
 
 #[test_case]
+fn a_program_s_pages_are_read_in_as_they_re_touched() {
+    // /bin/big, its 24 MiB segment, 6144 pages, never touched: none of it
+    // read in, nor in the program's memory.
+    let (status, out) = run(&["exec", "/bin/big", "rss"]);
+    let pages: u64 = out.trim().parse().unwrap_or(u64::MAX);
+    assert!(status == 0 && pages < 1024, "{status}: {out:?} pages in memory");
+}
+
+#[test_case]
 fn a_program_bigger_than_the_kernel_s_heap_runs() {
     // /bin/big, which tools/boot-test makes: user/probe with a segment of
     // 24 MiB more, each byte where it should be, from the PIE's base on.

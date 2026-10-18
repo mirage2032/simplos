@@ -15,6 +15,7 @@
 
 use crate::memory::{self, FRAMES};
 use alloc::collections::BTreeMap;
+use alloc::vec;
 use ext4::{Change, Error, File};
 use spin::Mutex;
 use x86_64::structures::paging::PhysFrame;
@@ -26,6 +27,16 @@ const MOST: usize = 65536;
 
 /// Bytes in a page.
 const PAGE: u64 = 4096;
+
+/// Pages of a file read in together, from where they line up, as one is
+/// wanted that isn't kept (`page`): 64 KiB, one read from the disk where
+/// it would be sixteen, as a program touching a page of a file goes on to
+/// those around it. And as many mapped around a page a program touches
+/// (`AddressSpace::fault`), those that are kept, rather than one fault each.
+///
+/// shortcut: always as many, whatever the program does; read ahead as far
+/// as it's been reading, as Linux does, if one that jumps about is slowed.
+pub const AHEAD: u64 = 16;
 
 struct Page {
     /// A shared frame, which the cache holds once.
@@ -72,13 +83,33 @@ pub fn read(file: &File, offset: u64, buf: &mut [u8]) -> Result<usize, Error> {
 }
 
 /// Page `index` of `file`, in a frame held for the caller, who maps it
-/// (`AddressSpace::map_shared`) or lets go of it (`release`). The tree is
+/// (`AddressSpace::map_shared`) or lets go of it (`release`): read in, if it
+/// isn't kept, with the pages `AHEAD` of it that aren't either. The tree is
 /// held.
 pub fn page(file: &File, index: u64) -> Result<PhysFrame, Error> {
+    if let Some(frame) = kept(file, index) {
+        return Ok(frame);
+    }
+    // Or else read alone, below, which says why it can't be.
+    let _ = read_ahead(file, index);
     with_frame(file, index, |frame| {
         FRAMES.lock().as_mut().expect("memory is set up").hold(frame);
         frame
     })
+}
+
+/// Page `index` of `file`, in a frame held for the caller, if it's kept:
+/// never read in, so the tree needn't be held, as it can't be with a
+/// program's memory held (`AddressSpace::fault`).
+pub fn kept(file: &File, index: u64) -> Option<PhysFrame> {
+    let key = (file.inode(), u32::try_from(index).ok()?);
+    let mut cache = CACHE.lock();
+    cache.clock += 1;
+    let now = cache.clock;
+    let page = cache.pages.get_mut(&key)?;
+    page.used = now;
+    FRAMES.lock().as_mut()?.hold(page.frame);
+    Some(page.frame)
 }
 
 /// Run `f` on the frame of page `index` of `file`, read in first if it
@@ -105,6 +136,46 @@ fn with_frame<R>(file: &File, index: u64, f: impl FnOnce(PhysFrame) -> R) -> Res
         release(frame);
     }
     Ok(f(kept))
+}
+
+/// Keep the `AHEAD` pages of `file` that page `index` is among, as many as
+/// it has, but those kept already: read in one go, through the kernel's
+/// heap, as their frames needn't be next to each other. Those there's no
+/// memory for aren't. The tree is held.
+fn read_ahead(file: &File, index: u64) -> Result<(), Error> {
+    let first = index / AHEAD * AHEAD;
+    let end = (first + AHEAD).min(file.size()?.div_ceil(PAGE));
+    if first >= end {
+        return Ok(());
+    }
+    let mut window = vec![0; ((end - first) * PAGE) as usize];
+    let mut done = 0;
+    while done < window.len() {
+        match file.read_at(first * PAGE + done as u64, &mut window[done..])? {
+            0 => break,
+            read => done += read,
+        }
+    }
+    for (number, page) in (first..end).zip(window.chunks(PAGE as usize)) {
+        let key = (file.inode(), u32::try_from(number).map_err(|_| Error::InvalidArgument)?);
+        if CACHE.lock().pages.contains_key(&key) {
+            continue;
+        }
+        make_room();
+        let Some(frame) = FRAMES.lock().as_mut().and_then(|frames| frames.allocate_shared()) else {
+            break;
+        };
+        // Safety: just allocated, so the cache's alone.
+        unsafe { (*bytes(frame)).copy_from_slice(page) };
+        let mut cache = CACHE.lock();
+        cache.clock += 1;
+        let used = cache.clock;
+        // Read in meanwhile by someone else, whose it keeps, as `with_frame`.
+        if cache.pages.entry(key).or_insert(Page { frame, used }).frame != frame {
+            release(frame);
+        }
+    }
+    Ok(())
 }
 
 /// A frame holding page `index` of `file`, as much of it as there is, the

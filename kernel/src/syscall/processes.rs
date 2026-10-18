@@ -236,7 +236,7 @@ fn strings_at(process: &Process, addr: u64, room: &mut usize) -> Result<Vec<Vec<
     let mut at = addr;
     while at != 0 {
         let mut pointer = [0; 8];
-        process.memory.lock().space.read(at, &mut pointer).ok_or(EFAULT)?;
+        process.read(at, &mut pointer).ok_or(EFAULT)?;
         let pointer = u64::from_le_bytes(pointer);
         if pointer == 0 {
             break;
@@ -300,13 +300,12 @@ pub fn wait4(process: &Process, pid: u64, wstatus: u64, options: u64, rusage: u6
         process.times.add_child(&child.times);
     }
     ret((|| {
-        let mut memory = process.memory.lock();
         if wstatus != 0 {
-            memory.space.write(wstatus, &status.to_le_bytes()).ok_or(EFAULT)?;
+            process.write(wstatus, &status.to_le_bytes()).ok_or(EFAULT)?;
         }
         if rusage != 0 {
             let (user, system) = clocks::total(&child.times);
-            memory.space.write(rusage, &clocks::rusage(user, system)).ok_or(EFAULT)?;
+            process.write(rusage, &clocks::rusage(user, system)).ok_or(EFAULT)?;
         }
         Ok(child.id as i64)
     })())

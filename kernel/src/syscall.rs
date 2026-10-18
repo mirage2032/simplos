@@ -21,7 +21,7 @@ use clocks::{CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_REALTIME};
 use crate::fs::Handle;
 use crate::io::interrupts::gdt;
 use crate::io::interrupts::pit::TIMER_HZ;
-use crate::memory::{FILE_SHARED, USER_END};
+use crate::memory::{Backing, FILE_SHARED, FRAMES, USER_END};
 use crate::process::{self, LOWEST, MMAP_END, MMAP_START, Process, Registers, Task, pages};
 use crate::signal::{self, ERESTARTNOHAND, Syscall};
 use crate::{serial_println, thread};
@@ -475,7 +475,7 @@ fn poll(process: &Process, fds: u64, count: u64, timeout: Option<u64>) -> i64 {
     }
     // `struct pollfd`: an int fd, then two shorts, events and revents.
     let mut table = vec![0u8; count as usize * 8];
-    if process.memory.lock().space.read(fds, &mut table).is_none() {
+    if process.read(fds, &mut table).is_none() {
         return -EFAULT;
     }
     let entry = |entry: &[u8; 8]| {
@@ -507,7 +507,7 @@ fn poll(process: &Process, fds: u64, count: u64, timeout: Option<u64>) -> i64 {
         entry[6..].copy_from_slice(&revents.to_le_bytes());
         ready += i64::from(*revents != 0);
     }
-    if process.memory.lock().space.write(fds, &table).is_none() {
+    if process.write(fds, &table).is_none() {
         return -EFAULT;
     }
     ready
@@ -548,7 +548,7 @@ fn masked(process: &Process, task: &Task, mask: u64, size: u64, wait: impl FnOnc
         return -EINVAL;
     }
     let mut set = [0u8; 8];
-    if process.memory.lock().space.read(mask, &mut set).is_none() {
+    if process.read(mask, &mut set).is_none() {
         return -EFAULT;
     }
     task.signals.suspend_with(u64::from_le_bytes(set));
@@ -578,7 +578,7 @@ fn select(process: &Process, count: u64, sets: [u64; 3], timeout: Option<u64>) -
     let bytes = count.div_ceil(64) as usize * 8;
     let mut asked = [vec![0u8; bytes], vec![0u8; bytes], vec![0u8; bytes]];
     for (set, &addr) in asked.iter_mut().zip(&sets) {
-        if addr != 0 && process.memory.lock().space.read(addr, set).is_none() {
+        if addr != 0 && process.read(addr, set).is_none() {
             return -EFAULT;
         }
     }
@@ -607,7 +607,7 @@ fn select(process: &Process, count: u64, sets: [u64; 3], timeout: Option<u64>) -
         return -ERESTARTNOHAND;
     }
     for (set, &addr) in ready.iter().zip(&sets) {
-        if addr != 0 && process.memory.lock().space.write(addr, set).is_none() {
+        if addr != 0 && process.write(addr, set).is_none() {
             return -EFAULT;
         }
     }
@@ -633,7 +633,7 @@ fn pselect6(
         },
     };
     let mut pair = [0u8; 16];
-    if mask != 0 && process.memory.lock().space.read(mask, &mut pair).is_none() {
+    if mask != 0 && process.read(mask, &mut pair).is_none() {
         return -EFAULT;
     }
     let word = |at: usize| u64::from_le_bytes(pair[at..at + 8].try_into().unwrap());
@@ -667,14 +667,17 @@ fn user_range(start: u64, len: u64) -> Option<(u64, u64)> {
 }
 
 /// Memory for the program: zeros, anonymous; or from `offset` on in the file
-/// `fd` is open on. Read-only, private or shared, that's the page cache's
-/// own pages, so what's written to the file then shows, as on Linux;
-/// writable and private, a copy of the program's own.
+/// `fd` is open on. None of it is mapped until it's touched
+/// (`AddressSpace::fault`): then a file's pages, read-only, private or
+/// shared, are the page cache's own, so what's written to the file shows, as
+/// on Linux; writable and private, copies of the program's own. Past the
+/// file's end, zeros. Anonymous memory there wouldn't be enough of, if it
+/// were all touched, is refused, as on Linux.
 ///
-/// shortcut: a file is read in whole as it's mapped, rather than as it's
-/// used. MAP_SHARED is refused (ENODEV) when it's writable, and can't be
+/// shortcut: MAP_SHARED is refused (ENODEV) when it's writable, and can't be
 /// made writable later (`mprotect`), as nothing would write it to the file;
-/// and there's no MAP_SHARED anonymous memory.
+/// and there's no MAP_SHARED anonymous memory. A page past the file's end
+/// is zeros, where Linux sends SIGBUS.
 fn mmap(
     process: &Process,
     addr: u64,
@@ -707,7 +710,7 @@ fn mmap(
                 Handle::File { write, .. } if shared && prot & PROT_WRITE != 0 => {
                     return if *write { -ENODEV } else { -EACCES };
                 }
-                Handle::File { .. } => Some(handle),
+                Handle::File { file, .. } => Some(file.clone()),
                 _ => return -ENODEV,
             }
         }
@@ -718,6 +721,9 @@ fn mmap(
     // Its pages are read from `offset + done` on, which mustn't wrap.
     if file.is_some() && offset.checked_add(len).is_none() {
         return -EOVERFLOW;
+    }
+    if file.is_none() && !affordable(len) {
+        return -ENOMEM;
     }
     let mut memory = process.memory.lock();
     let start = if flags & MAP_FIXED != 0 {
@@ -739,95 +745,24 @@ fn mmap(
     if prot == 0 {
         return start as i64;
     }
-    // Reading the file takes the tree, which mustn't wait with this held:
-    // /proc takes the two the other way round.
-    if let Some(handle) = &file
-        && prot & PROT_WRITE == 0
-    {
-        drop(memory);
-        let flags = match shared {
-            true => page_flags(prot) | FILE_SHARED,
-            false => page_flags(prot),
-        };
-        if let Err(errno) = map_file(process, handle, offset, start, len, flags) {
-            process.memory.lock().space.unmap(pages(start, end));
-            return -errno;
+    let (flags, backing) = match file {
+        Some(file) if shared => {
+            (page_flags(prot) | FILE_SHARED, Backing::File { file, offset, data_end: end })
         }
-        return start as i64;
-    }
-    if memory.space.map(pages(start, end), page_flags(prot)).is_none() {
-        // What memory there was goes back: the program, told it got none,
-        // has no address to unmap it by.
-        memory.space.unmap(pages(start, end));
-        return -ENOMEM;
-    }
-    drop(memory);
-    if let Some(handle) = file
-        && let Err(errno) = fill(process, &handle, offset, start, len)
-    {
-        process.memory.lock().space.unmap(pages(start, end));
-        return -errno;
-    }
+        Some(file) => (page_flags(prot), Backing::File { file, offset, data_end: end }),
+        None => (page_flags(prot), Backing::Zero),
+    };
+    memory.space.reserve(pages(start, end), flags, backing);
     start as i64
 }
 
-/// Map the `len` bytes of the file `handle` is open on from `offset` on at
-/// `start`, never writable, with `flags`: its own pages, from the page
-/// cache, shared with whatever else maps them, so that what's written to
-/// the file shows, as on Linux; zeros past its end.
-fn map_file(
-    process: &Process,
-    handle: &Handle,
-    offset: u64,
-    start: u64,
-    len: u64,
-    flags: PageTableFlags,
-) -> Result<(), i64> {
-    let Handle::File { file, .. } = handle else { return Ok(()) };
-    let size = {
-        let _tree = crate::fs::lock();
-        file.size().map_err(crate::fs::errno)?
-    };
-    for done in (0..len).step_by(4096) {
-        let page = page(start + done);
-        let frame = match offset + done < size {
-            true => {
-                let _tree = crate::fs::lock();
-                Some(crate::cache::page(file, (offset + done) / 4096).map_err(crate::fs::errno)?)
-            }
-            false => None,
-        };
-        let mut memory = process.memory.lock();
-        let mapped = match frame {
-            Some(frame) => memory.space.map_shared(page, frame, flags),
-            None => memory.space.map(Page::range(page, page + 1), flags),
-        };
-        mapped.ok_or(ENOMEM)?;
-    }
-    Ok(())
-}
-
-/// Copy `len` bytes of the file `handle` is open on, from `offset` on, into
-/// the program's memory at `start`, already mapped: as many as there are,
-/// zeros past its end.
-fn fill(process: &Process, handle: &Handle, offset: u64, start: u64, len: u64) -> Result<(), i64> {
-    const EIO: i64 = 5;
-    let Handle::File { file, .. } = handle else { return Ok(()) };
-    let mut piece = vec![0; 64 << 10];
-    let mut done = 0;
-    while done < len {
-        let want = (len - done).min(piece.len() as u64) as usize;
-        let read = {
-            let _tree = crate::fs::lock();
-            crate::cache::read(file, offset + done, &mut piece[..want]).map_err(|_| EIO)?
-        };
-        if read == 0 {
-            break;
-        }
-        process.memory.lock().space.load(start + done, &piece[..read]).ok_or(EIO)?;
-        done += read as u64;
-    }
-    Ok(())
+/// Whether `len` bytes of memory could be had, if they were all touched:
+/// from what's free, and what the page cache would give back. As Linux
+/// refuses to reserve what's plainly more than there is, so that a program
+/// asking for too much is told so, rather than ending as it touches it.
+fn affordable(len: u64) -> bool {
+    let free = FRAMES.lock().as_ref().map_or(0, |frames| frames.memory().1);
+    len <= free + crate::cache::pages() as u64 * 4096
 }
 
 /// Advice on how the program will use the memory at `addr`: taken, and of
@@ -855,8 +790,10 @@ fn madvise(process: &Process, addr: u64, len: u64, advice: u64) -> i64 {
     if pages(start, end).any(|page| memory.space.flags(page).is_none()) {
         return -ENOMEM;
     }
-    if advice == MADV_DONTNEED || advice == MADV_FREE {
-        memory.space.zero(pages(start, end));
+    if (advice == MADV_DONTNEED || advice == MADV_FREE)
+        && memory.space.zero(pages(start, end)).is_none()
+    {
+        return -ENOMEM;
     }
     0
 }
@@ -915,10 +852,10 @@ fn mremap(process: &Process, old: u64, old_len: u64, new_len: u64, flags: u64, t
         let Some(end) = old.checked_add(new_len).filter(|&end| end <= MMAP_END) else {
             return -ENOMEM;
         };
-        if memory.space.map(pages(old_end, end), prot).is_none() {
-            memory.space.unmap(pages(old_end, end));
+        if !affordable(end - old_end) {
             return -ENOMEM;
         }
+        memory.space.reserve(pages(old_end, end), prot, Backing::Zero);
         memory.mmap_next = end;
         return old as i64;
     } else if !may_move {
@@ -935,10 +872,10 @@ fn mremap(process: &Process, old: u64, old_len: u64, new_len: u64, flags: u64, t
     // after them, if it's grown.
     let taken = old_len.min(new_len);
     let new = pages(to + taken, to + new_len);
-    if new_len > taken && memory.space.map(new, prot).is_none() {
-        memory.space.unmap(new);
+    if new_len > taken && !affordable(new_len - taken) {
         return -ENOMEM;
     }
+    memory.space.reserve(new, prot, Backing::Zero);
     if memory.space.move_pages(page(old), page(to), taken / 4096).is_none() {
         memory.space.unmap(new);
         return -ENOMEM;
@@ -955,8 +892,9 @@ fn page(addr: u64) -> Page {
 /// What the program may do with the pages at `addr`: with PROT_NONE,
 /// nothing, but what's in them is kept for when it may again, as Linux
 /// keeps it. Otherwise what `prot` says, of pages that `mmap` reserved with
-/// PROT_NONE, which here aren't mapped, too: mapped now, zeroed, as musl
-/// does with a thread's stack, and its guard page kept out of reach.
+/// PROT_NONE, which here aren't mapped, too: given to it now, as zeros as
+/// they're touched, as musl does with a thread's stack, and its guard page
+/// kept out of reach.
 ///
 /// shortcut: a page nothing reserved is mapped as well, where Linux says
 /// ENOMEM; keep track of what's reserved when something needs telling. And
@@ -976,10 +914,8 @@ fn mprotect(process: &Process, addr: u64, len: u64, prot: u64) -> i64 {
         memory.space.hide(pages(start, end));
         return 0;
     }
-    // Those mapped get these flags and more; then just these.
-    if memory.space.map(pages(start, end), page_flags(prot)).is_none() {
-        return -ENOMEM;
-    }
+    // Those not touched yet get them as they are; those mapped now.
+    memory.space.retag(pages(start, end), page_flags(prot));
     if memory.space.protect(pages(start, end), page_flags(prot)).is_none() {
         return -ENOMEM;
     }
@@ -1001,12 +937,12 @@ fn brk(process: &Process, addr: u64) -> i64 {
     }
     let (old_end, new_end) = (memory.brk.next_multiple_of(4096), addr.next_multiple_of(4096));
     if new_end > old_end {
-        let flags = PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
-        if memory.space.map(pages(old_end, new_end), flags).is_none() {
-            // As for `mmap`: the heap stays where it was, and so does memory.
-            memory.space.unmap(pages(old_end, new_end));
+        // As for `mmap`: more than there is stays where it was.
+        if !affordable(new_end - old_end) {
             return memory.brk as i64;
         }
+        let flags = PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
+        memory.space.reserve(pages(old_end, new_end), flags, Backing::Zero);
     } else {
         memory.space.unmap(pages(new_end, old_end));
     }
@@ -1049,7 +985,7 @@ fn clock_nanosleep(process: &Process, clock: u64, flags: u64, request: u64, rema
         let mut timespec = [0u8; 16];
         timespec[..8].copy_from_slice(&(left / 1000).to_le_bytes());
         timespec[8..].copy_from_slice(&(left % 1000 * 1_000_000).to_le_bytes());
-        if process.memory.lock().space.write(remain, &timespec).is_none() {
+        if process.write(remain, &timespec).is_none() {
             return -EFAULT;
         }
     }
@@ -1060,7 +996,7 @@ fn clock_nanosleep(process: &Process, clock: u64, flags: u64, request: u64, rema
 /// microseconds and more are seconds, as Linux's `select` takes them.
 fn timeval_ms(process: &Process, addr: u64) -> Result<u64, i64> {
     let mut timeval = [0u8; 16];
-    process.memory.lock().space.read(addr, &mut timeval).ok_or(EFAULT)?;
+    process.read(addr, &mut timeval).ok_or(EFAULT)?;
     let seconds = i64::from_le_bytes(timeval[..8].try_into().unwrap());
     let micros = i64::from_le_bytes(timeval[8..].try_into().unwrap());
     if seconds < 0 || micros < 0 {
@@ -1077,7 +1013,7 @@ fn timespec_ms(process: &Process, addr: u64) -> Result<u64, i64> {
 /// The `struct timespec` at `addr`, in nanoseconds.
 fn timespec_ns(process: &Process, addr: u64) -> Result<u64, i64> {
     let mut timespec = [0u8; 16];
-    process.memory.lock().space.read(addr, &mut timespec).ok_or(EFAULT)?;
+    process.read(addr, &mut timespec).ok_or(EFAULT)?;
     clocks::timespec_nanos(&timespec)
 }
 
@@ -1093,7 +1029,7 @@ fn arch_prctl(process: &Process, code: u64, addr: u64) -> i64 {
         ARCH_SET_FS => -EPERM,
         ARCH_GET_FS => {
             let base = thread::with_current_user(|user| user.fs_base()).unwrap_or(0);
-            match process.memory.lock().space.write(addr, &base.to_le_bytes()) {
+            match process.write(addr, &base.to_le_bytes()) {
                 Some(()) => 0,
                 None => -EFAULT,
             }

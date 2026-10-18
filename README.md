@@ -134,13 +134,24 @@ longest ago first, as free memory runs low, and all of them when it runs
 out; and
 `/proc/meminfo` counts them as `Cached`. Under emulation, ten runs of
 uutils' 14 MB `coreutils true` took 10 s before it and take 1 s; a second
-`gcc -O2` of a hello world, 10 s before and 0.7 s now. For now:
+`gcc -O2` of a hello world, 10 s before and 0.7 s now.
+
+A program's memory is mapped as it's touched (`memory.rs`). `execve`,
+`mmap` and `brk` only note what each part of it holds, its code and data
+what part of which file, the rest zeros; a page is mapped the first time
+the program, or a system call for it, touches it, so a program reads in
+only as much of itself as it runs. A page the cache doesn't have is read
+in with the fifteen around it, in one read from the disk, and the cached
+pages around one a program touches are mapped with it. `fork` shares a
+program's pages with its copy until either writes one, which then gets a
+copy of its own, unless the other has let go of it by then, as a shell's
+copy does as it execs. For now:
 
 - a page a program can write, of its data or of a file it maps writable,
-  is a copy, made as it starts or maps it rather than as it's first
+  is a copy, made as it's first touched rather than as it's first
   written;
 - what's cut off the end of a file stays in the pages programs map of it,
-  where Linux sends SIGBUS for a page past the end.
+  and a page past the end reads as zeros, where Linux sends SIGBUS.
 
 Programs use it through Linux's system calls, so Rust's `std::fs` (or C's
 stdio) works as it does on Linux: `open`, `openat`, `close`, `read`, `write`,
@@ -284,9 +295,6 @@ its hash maps' keys, and `/dev/random` and `/dev/urandom` give random bytes
   stack mapped a page at a time as it's used, and the same turns at the CPU
   as any other;
 
-- `fork` copies a program's memory at once, but for the page cache's pages
-  it maps, its code's among them, which it shares; rather than sharing all
-  of it until either side writes to it;
 - `clone` without `CLONE_THREAD` copies the program even when asked to share
   its memory (`CLONE_VM`), which is all `posix_spawn` needs, and
   `CLONE_VFORK` doesn't hold the parent back; a thread shares its
@@ -299,10 +307,6 @@ its hash maps' keys, and `/dev/random` and `/dev/urandom` give random bytes
 - there's no `/proc/PID/task`, and a thread's CPU time is its program's;
 - a program that ended keeps its memory until it's waited for, and those
   never waited for go with their parent rather than to an init;
-- `execve` maps all of a program's segments as it starts it, rather than
-  as they're used: those it can't write, the page cache's pages, read in if
-  they aren't there, and the rest copied; and `mmap` all it maps of a
-  file;
 - `execve` takes 128 KiB of arguments and environment, their strings and
   pointers together, which it holds in the kernel's heap as it starts the
   program, where Linux takes a quarter of the stack's limit: more is

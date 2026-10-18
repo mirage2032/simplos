@@ -387,6 +387,26 @@ fn a_file_read_again_is_read_from_memory() {
 }
 
 #[test_case]
+fn a_page_read_in_brings_those_around_it() {
+    // Twenty pages of a file, none kept: one wanted, the sixteen it's among
+    // are read in with it, holding what the file does, and none past them.
+    let contents: Vec<u8> = (0..20 * 4096).map(|i| (i % 251) as u8).collect();
+    write("ahead.bin", &contents);
+    let file = ROOT.lock().as_ref().unwrap().open("ahead.bin").unwrap();
+    let tree = fs::lock();
+    let kept = |index| simplos::cache::kept(&file, index).map(simplos::cache::release).is_some();
+    assert!(!kept(3));
+    simplos::cache::release(simplos::cache::page(&file, 3).unwrap());
+    assert!((0..16).all(kept) && !kept(16), "not read ahead as far as it should be");
+    let mut read = vec![0; 16 * 4096];
+    assert_eq!(simplos::cache::read(&file, 0, &mut read), Ok(read.len()));
+    assert!(read == contents[..read.len()], "read ahead wrong");
+    drop(file);
+    drop(tree);
+    ROOT.lock().as_ref().unwrap().remove_file("ahead.bin").unwrap();
+}
+
+#[test_case]
 fn what_s_read_again_is_what_was_written_since() {
     // Each read first, so the page cache keeps it: then rewritten shorter,
     // emptied as it's opened; cut short and made longer, with zeros, by the
@@ -608,7 +628,8 @@ fn a_file_removed_or_replaced_while_open_stays_until_closed() {
 
 #[test_case]
 fn a_program_reads_of_itself_in_proc() {
-    // Its pages, 256 more as it maps a megabyte and none once it unmaps it;
+    // Its pages, 256 more as it maps a megabyte and touches it, and none
+    // once it unmaps it;
     // ext4's type and block size by path and by descriptor, alike; its name.
     assert_eq!(run(&["proc"]), ok("256 0 0xef53 true 4096 probe\n"));
 }

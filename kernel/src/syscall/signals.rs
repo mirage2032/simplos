@@ -25,12 +25,12 @@ fn signal_number(signal: u64) -> Result<usize> {
 
 fn read_set(process: &Process, addr: u64) -> Result<u64> {
     let mut set = [0u8; 8];
-    process.memory.lock().space.read(addr, &mut set).ok_or(EFAULT)?;
+    process.read(addr, &mut set).ok_or(EFAULT)?;
     Ok(u64::from_le_bytes(set))
 }
 
 fn write_set(process: &Process, addr: u64, set: u64) -> Result<()> {
-    process.memory.lock().space.write(addr, &set.to_le_bytes()).ok_or(EFAULT)
+    process.write(addr, &set.to_le_bytes()).ok_or(EFAULT)
 }
 
 /// What `signal` does, and what it did before.
@@ -46,11 +46,11 @@ pub fn rt_sigaction(process: &Process, signal: u64, new: u64, old: u64, size: u6
         }
         let mut action = [0u8; Action::SIZE];
         if new != 0 {
-            process.memory.lock().space.read(new, &mut action).ok_or(EFAULT)?;
+            process.read(new, &mut action).ok_or(EFAULT)?;
         }
         if old != 0 {
             let bytes = process.signals.action(signal).to_bytes();
-            process.memory.lock().space.write(old, &bytes).ok_or(EFAULT)?;
+            process.write(old, &bytes).ok_or(EFAULT)?;
         }
         if new != 0 {
             signal::set_action(process, signal, Action::from_bytes(&action));
@@ -177,7 +177,7 @@ pub fn rt_sigtimedwait(
     let Some((signal, sent)) = taken else { return -EAGAIN };
     if info != 0 {
         let siginfo = signal::siginfo(signal, sent);
-        if process.memory.lock().space.write(info, &siginfo).is_none() {
+        if process.write(info, &siginfo).is_none() {
             return -EFAULT;
         }
     }
@@ -205,7 +205,7 @@ pub fn sigaltstack(process: &Process, task: &Task, new: u64, old: u64, rsp: u64)
         let on_it = current.holds(rsp);
         let mut stack = [0u8; 24];
         if new != 0 {
-            process.memory.lock().space.read(new, &mut stack).ok_or(EFAULT)?;
+            process.read(new, &mut stack).ok_or(EFAULT)?;
         }
         if old != 0 {
             let flags = match (on_it, current.enabled) {
@@ -217,7 +217,7 @@ pub fn sigaltstack(process: &Process, task: &Task, new: u64, old: u64, rsp: u64)
             stack[..8].copy_from_slice(&current.sp.to_le_bytes());
             stack[8..16].copy_from_slice(&flags.to_le_bytes());
             stack[16..].copy_from_slice(&current.size.to_le_bytes());
-            process.memory.lock().space.write(old, &stack).ok_or(EFAULT)?;
+            process.write(old, &stack).ok_or(EFAULT)?;
         }
         if new != 0 {
             if on_it {

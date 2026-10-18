@@ -138,7 +138,7 @@ pub(super) fn string_at(
     loop {
         // No further than the end of the page: the next may not be mapped.
         let mut chunk = vec![0; 4096 - (at % 4096) as usize];
-        process.memory.lock().space.read(at, &mut chunk).ok_or(EFAULT)?;
+        process.read(at, &mut chunk).ok_or(EFAULT)?;
         let end = chunk.iter().position(|&byte| byte == 0);
         string.extend_from_slice(&chunk[..end.unwrap_or(chunk.len())]);
         if string.len() >= most {
@@ -268,7 +268,7 @@ fn permissions(process: &Process, mode: u64) -> u32 {
 
 fn file_handle(file: ext4::File, access: u64, flags: u64) -> Handle {
     Handle::File {
-        file,
+        file: Arc::new(file),
         read: access != O_WRONLY,
         write: access != O_RDONLY,
         append: flags & O_APPEND != 0,
@@ -372,7 +372,7 @@ fn record_lock(process: &Process, handle: &Arc<Handle>, command: u64, at: u64) -
     let Handle::File { file, read, write, offset, .. } = &**handle else { return Err(EINVAL) };
     // l_type and l_whence, shorts; l_start and l_len, at 8 and 16; l_pid.
     let mut flock = [0u8; 32];
-    process.memory.lock().space.read(at, &mut flock).ok_or(EFAULT)?;
+    process.read(at, &mut flock).ok_or(EFAULT)?;
     let short = |at: usize| i16::from_le_bytes([flock[at], flock[at + 1]]);
     let long = |at: usize| i64::from_le_bytes(flock[at..at + 8].try_into().unwrap());
     let (kind, whence, start, len) = (short(0), short(2), long(8), long(16));
@@ -430,7 +430,7 @@ fn record_lock(process: &Process, handle: &Arc<Handle>, command: u64, at: u64) -
                 told[24..28].copy_from_slice(&pid.to_le_bytes());
             }
         }
-        process.memory.lock().space.write(at, &told).ok_or(EFAULT)?;
+        process.write(at, &told).ok_or(EFAULT)?;
         return Ok(0);
     }
     // To read-lock is to have it open for reading, and to write-lock, for
@@ -527,11 +527,10 @@ fn read_vectored(process: &Process, fd: u64, iov: u64, count: u64, at: Option<u6
     {
         let total = buffers.iter().map(|&(_, len)| len).sum::<u64>();
         let data = read_data(process, fd, total, at)?;
-        let mut memory = process.memory.lock();
         let mut rest = &data[..];
         for (base, len) in buffers {
             let (now, later) = rest.split_at((len as usize).min(rest.len()));
-            memory.space.write(base, now).ok_or(EFAULT)?;
+            process.write(base, now).ok_or(EFAULT)?;
             rest = later;
         }
         Ok(data.len() as i64)
@@ -588,7 +587,7 @@ fn write_vectored(
         let len = (len as usize).min(most - data.len());
         let start = data.len();
         data.resize(start + len, 0);
-        process.memory.lock().space.read(base, &mut data[start..]).ok_or(EFAULT)?;
+        process.read(base, &mut data[start..]).ok_or(EFAULT)?;
     }
     write_data(process, fd, &data, at)
 }
@@ -600,7 +599,7 @@ fn iovecs(process: &Process, iov: u64, count: u64) -> Result<Vec<(u64, u64)>> {
         return Err(EINVAL);
     }
     let mut table = vec![0u8; count as usize * 16];
-    process.memory.lock().space.read(iov, &mut table).ok_or(EFAULT)?;
+    process.read(iov, &mut table).ok_or(EFAULT)?;
     let word = |bytes: &[u8]| u64::from_le_bytes(bytes.try_into().unwrap());
     let buffers: Vec<_> = table
         .as_chunks::<16>()
@@ -663,7 +662,7 @@ fn in_pieces(handle: &Handle) -> bool {
 fn read_at(process: &Process, fd: u64, buf: u64, count: u64, at: Option<u64>) -> Result<i64> {
     if !in_pieces(&*handle(process, fd)?) {
         let data = read_data(process, fd, count, at)?;
-        process.memory.lock().space.write(buf, &data).ok_or(EFAULT)?;
+        process.write(buf, &data).ok_or(EFAULT)?;
         return Ok(data.len() as i64);
     }
     let count = (count as usize).min(MOST);
@@ -675,7 +674,7 @@ fn read_at(process: &Process, fd: u64, buf: u64, count: u64, at: Option<u64>) ->
             Err(errno) if done == 0 => return Err(errno),
             Err(_) => break,
         };
-        if process.memory.lock().space.write(buf + done as u64, &data).is_none() {
+        if process.write(buf + done as u64, &data).is_none() {
             return if done == 0 { Err(EFAULT) } else { Ok(done as i64) };
         }
         done += data.len();
@@ -748,7 +747,7 @@ fn write_at(process: &Process, fd: u64, buf: u64, count: u64, at: Option<u64>) -
     let mut done = 0;
     while done < count {
         let piece = &mut piece[..(count - done).min(most)];
-        if process.memory.lock().space.read(buf + done as u64, piece).is_none() {
+        if process.read(buf + done as u64, piece).is_none() {
             return if done == 0 { Err(EFAULT) } else { Ok(done as i64) };
         }
         let written = match write_data(process, fd, piece, at.map(|at| at + done as u64)) {
@@ -850,7 +849,7 @@ pub fn readlinkat(process: &Process, dirfd: u64, path: u64, buf: u64, size: u64)
             }
         };
         let target = &target[..target.len().min(size as usize)];
-        process.memory.lock().space.write(buf, target).ok_or(EFAULT)?;
+        process.write(buf, target).ok_or(EFAULT)?;
         Ok(target.len() as i64)
     })())
 }
@@ -977,7 +976,7 @@ fn stat_bytes(metadata: &Metadata) -> [u8; 144] {
 }
 
 fn put_stat(process: &Process, metadata: &Metadata, buf: u64) -> Result<i64> {
-    process.memory.lock().space.write(buf, &stat_bytes(metadata)).ok_or(EFAULT)?;
+    process.write(buf, &stat_bytes(metadata)).ok_or(EFAULT)?;
     Ok(0)
 }
 
@@ -1008,9 +1007,13 @@ pub fn newfstatat(process: &Process, dirfd: u64, path: u64, buf: u64, flags: u64
 pub fn statfs(process: &Process, path: u64, buf: u64) -> i64 {
     ret((|| {
         let path = lookup(process, AT_FDCWD, &path_at(process, path)?)?;
-        let tree = fs::lock();
-        tree.metadata(&path).map_err(fs::errno)?;
-        put_statfs(process, tree.statfs(&path).map_err(fs::errno)?, buf)
+        let statfs = {
+            let tree = fs::lock();
+            tree.metadata(&path).map_err(fs::errno)?;
+            tree.statfs(&path).map_err(fs::errno)?
+        };
+        // Without the tree, which the program's memory may need, to be read in.
+        put_statfs(process, statfs, buf)
     })())
 }
 
@@ -1023,7 +1026,8 @@ pub fn fstatfs(process: &Process, fd: u64, buf: u64) -> i64 {
             Handle::Dir { path, .. } | Handle::Proc { path, .. } => path.clone(),
             _ => String::from("dev"),
         };
-        put_statfs(process, fs::lock().statfs(&path).map_err(fs::errno)?, buf)
+        let statfs = fs::lock().statfs(&path).map_err(fs::errno)?;
+        put_statfs(process, statfs, buf)
     })())
 }
 
@@ -1050,7 +1054,7 @@ fn put_statfs(process: &Process, (kind, usage): (u64, ext4::Usage), buf: u64) ->
         0,
     ];
     let statfs: Vec<u8> = fields.iter().flat_map(|field| field.to_le_bytes()).collect();
-    process.memory.lock().space.write(buf, &statfs).ok_or(EFAULT)?;
+    process.write(buf, &statfs).ok_or(EFAULT)?;
     Ok(0)
 }
 
@@ -1088,7 +1092,7 @@ pub fn getdents64(process: &Process, fd: u64, buf: u64, count: u64) -> i64 {
             // Not even one fits.
             return Err(EINVAL);
         }
-        process.memory.lock().space.write(buf, &out).ok_or(EFAULT)?;
+        process.write(buf, &out).ok_or(EFAULT)?;
         next.store(at, Relaxed);
         Ok(out.len() as i64)
     })())
@@ -1248,7 +1252,7 @@ pub fn getcwd(process: &Process, buf: u64, size: u64) -> i64 {
         if cwd.len() as u64 > size {
             return Err(ERANGE);
         }
-        process.memory.lock().space.write(buf, cwd.as_bytes()).ok_or(EFAULT)?;
+        process.write(buf, cwd.as_bytes()).ok_or(EFAULT)?;
         Ok(cwd.len() as i64)
     })())
 }
@@ -1283,7 +1287,7 @@ fn install_pair(process: &Process, pair: [Handle; 2], flags: u64, fds: u64) -> R
         let mut ends = [0u8; 8];
         ends[..4].copy_from_slice(&(first as i32).to_le_bytes());
         ends[4..].copy_from_slice(&(second as i32).to_le_bytes());
-        if process.memory.lock().space.write(fds, &ends).is_none() {
+        if process.write(fds, &ends).is_none() {
             let gone = process.files.lock()[second as usize].take();
             drop(gone);
             return Err(EFAULT);
@@ -1355,7 +1359,7 @@ pub fn sendto(process: &Process, fd: u64, buf: u64, len: u64, flags: u64, to: [u
             return Err(EISCONN);
         }
         let mut data = vec![0; (len as usize).min(pipe::CAPACITY)];
-        process.memory.lock().space.read(buf, &mut data).ok_or(EFAULT)?;
+        process.read(buf, &mut data).ok_or(EFAULT)?;
         let wait = !nonblocking.load(Relaxed) && flags & MSG_DONTWAIT == 0;
         write_pipe(process, output, &data, wait, flags & MSG_NOSIGNAL == 0)
     })())
@@ -1379,10 +1383,9 @@ pub fn recvfrom(process: &Process, fd: u64, buf: u64, len: u64, flags: u64, from
             0 => Vec::new(),
             len => input.read((len as usize).min(MOST), wait).map_err(read_errno)?,
         };
-        let mut memory = process.memory.lock();
-        memory.space.write(buf, &data).ok_or(EFAULT)?;
+        process.write(buf, &data).ok_or(EFAULT)?;
         if from[0] != 0 && from[1] != 0 {
-            memory.space.write(from[1], &0u32.to_le_bytes()).ok_or(EFAULT)?;
+            process.write(from[1], &0u32.to_le_bytes()).ok_or(EFAULT)?;
         }
         Ok(data.len() as i64)
     })())
@@ -1553,7 +1556,7 @@ pub fn utimensat(process: &Process, dirfd: u64, path: u64, times: u64, flags: u6
         let now = (crate::time::now() / crate::time::NANOS) as u32;
         let mut given = [0u8; 32];
         if times != 0 {
-            process.memory.lock().space.read(times, &mut given).ok_or(EFAULT)?;
+            process.read(times, &mut given).ok_or(EFAULT)?;
         }
         let time = |at: usize| {
             let seconds = i64::from_le_bytes(given[at..at + 8].try_into().unwrap());
@@ -1651,7 +1654,7 @@ pub fn sendfile(process: &Process, out_fd: u64, in_fd: u64, offset: u64, count: 
         let at = match offset {
             0 => None,
             offset => {
-                process.memory.lock().space.read(offset, &mut place).ok_or(EFAULT)?;
+                process.read(offset, &mut place).ok_or(EFAULT)?;
                 Some(at(u64::from_le_bytes(place))?)
             }
         };
@@ -1663,7 +1666,7 @@ pub fn sendfile(process: &Process, out_fd: u64, in_fd: u64, offset: u64, count: 
         match at {
             Some(at) => {
                 let moved = (at + sent).to_le_bytes();
-                process.memory.lock().space.write(offset, &moved).ok_or(EFAULT)?;
+                process.write(offset, &moved).ok_or(EFAULT)?;
             }
             None => {
                 if let Handle::File { offset, .. } = &*handle(process, in_fd)? {
@@ -1704,7 +1707,7 @@ pub fn splice(process: &Process, input: [u64; 2], output: [u64; 2], len: u64, fl
                 return Ok(None);
             }
             let mut place = [0u8; 8];
-            process.memory.lock().space.read(addr, &mut place).ok_or(EFAULT)?;
+            process.read(addr, &mut place).ok_or(EFAULT)?;
             Ok(Some(at(u64::from_le_bytes(place))?))
         };
         let (from, to) = (place(off_in)?, place(off_out)?);
@@ -1712,9 +1715,7 @@ pub fn splice(process: &Process, input: [u64; 2], output: [u64; 2], len: u64, fl
         let data = read_data(process, fd_in, len.min(PIECE as u64), from)?;
         let written = write_data(process, fd_out, &data, to);
         let moved = *written.as_ref().unwrap_or(&0) as u64;
-        let put = |addr: u64, place: u64| {
-            process.memory.lock().space.write(addr, &place.to_le_bytes()).ok_or(EFAULT)
-        };
+        let put = |addr: u64, place: u64| process.write(addr, &place.to_le_bytes()).ok_or(EFAULT);
         match from {
             Some(from) => put(off_in, from + moved)?,
             None => {
@@ -1756,10 +1757,9 @@ pub fn ioctl(process: &Process, fd: u64, request: u64, arg: u64) -> i64 {
     const FIONBIO: u64 = 0x5421;
     ret((|| {
         let handle = handle(process, fd)?;
-        let mut memory = process.memory.lock();
         if request == FIONBIO {
             let mut on = [0; 4];
-            memory.space.read(arg, &mut on).ok_or(EFAULT)?;
+            process.read(arg, &mut on).ok_or(EFAULT)?;
             let on = i32::from_le_bytes(on) != 0;
             set_nonblocking(&handle, if on { O_NONBLOCK } else { 0 });
             return Ok(0);
@@ -1767,14 +1767,14 @@ pub fn ioctl(process: &Process, fd: u64, request: u64, arg: u64) -> i64 {
         let Handle::Tty { tty, .. } = &*handle else { return Err(ENOTTY) };
         // Whether it's the caller's session's terminal.
         let controlling = process.tty.lock().as_ref().is_some_and(|own| Arc::ptr_eq(own, tty));
-        let mut put = |bytes: &[u8]| memory.space.write(arg, bytes).ok_or(EFAULT).map(|()| 0);
+        let put = |bytes: &[u8]| process.write(arg, bytes).ok_or(EFAULT).map(|()| 0);
         match request {
             TIOCGPGRP | TIOCSPGRP | TIOCGSID | TIOCNOTTY if !controlling => Err(ENOTTY),
             TIOCGPGRP => put(&(tty.foreground() as i32).to_le_bytes()),
             TIOCGSID => put(&(tty.session() as i32).to_le_bytes()),
             TIOCSPGRP => {
                 let mut group = [0u8; 4];
-                memory.space.read(arg, &mut group).ok_or(EFAULT)?;
+                process.read(arg, &mut group).ok_or(EFAULT)?;
                 let group = i32::from_le_bytes(group);
                 if group < 0 {
                     return Err(EINVAL);
@@ -1822,13 +1822,13 @@ pub fn ioctl(process: &Process, fd: u64, request: u64, arg: u64) -> i64 {
             TCSETS | TCSETSW | TCSETSF => {
                 // Output is written as it comes, so there's none to wait for.
                 let mut termios = [0; Termios::SIZE];
-                memory.space.read(arg, &mut termios).ok_or(EFAULT)?;
+                process.read(arg, &mut termios).ok_or(EFAULT)?;
                 tty.set_termios(Termios::from_bytes(&termios), request == TCSETSF);
                 Ok(0)
             }
             TIOCSWINSZ => {
                 let mut winsize = [0u8; 8];
-                memory.space.read(arg, &mut winsize).ok_or(EFAULT)?;
+                process.read(arg, &mut winsize).ok_or(EFAULT)?;
                 let half = |at: usize| u16::from_le_bytes([winsize[at], winsize[at + 1]]);
                 tty.set_size(half(0), half(2));
                 Ok(0)
