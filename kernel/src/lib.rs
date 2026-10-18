@@ -134,8 +134,8 @@ pub fn pre_init(boot_info: &'static mut BootInfo) {
             boot_info.physical_memory_offset.take().expect("No physical memory offset found"),
         );
         let mut mapper = unsafe { mm::init(phys_mem_offset) };
-        // After `arch::init_interrupts`: the bootloader's GDT, which lives down there, is no
-        // longer the one loaded.
+        // After `arch::init_interrupts`: the bootloader's GDT, which lives
+        // down there, is no longer the one loaded.
         mm::clear_lower_half(&mut mapper);
         let mut frame_allocator =
             unsafe { BootInfoFrameAllocator::init(&boot_info.memory_regions) };
