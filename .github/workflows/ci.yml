@@ -83,7 +83,7 @@ jobs:
           # A line for each job: its name, the cargo cache it saves (- for
           # none), and the paths its result depends on besides those.
           JOBS: |
-            lint        lint   rustfmt.toml kernel fullkernel tools user fs vendor
+            lint        lint   rustfmt.toml Makefile kernel fullkernel tools user fs vendor
             test-kernel test   kernel tools user fs vendor userland scripts/boot-test.sh scripts/userland.sh scripts/toolchain.sh scripts/completions.sh
             test-rust   -      kernel tools user fs vendor userland scripts/boot-test.sh scripts/userland.sh scripts/toolchain.sh scripts/rust.sh scripts/completions.sh
             images      images kernel fullkernel user fs vendor userland scripts/build-images.sh scripts/smoke-test.sh scripts/userland.sh scripts/toolchain.sh scripts/rust.sh scripts/completions.sh
@@ -111,25 +111,13 @@ jobs:
             fs/ext4/target
             vendor/bootloader/target
 
-      # vendor/ is upstream code with its own style; only what we write.
+      # Over the Makefile's CRATES, ours and not vendor/'s, each folded
+      # under its name.
       - name: Format
-        run: |
-          for crate in kernel fullkernel tools/boot-test user/probe fs/ext4; do
-            echo "::group::$crate"
-            (cd "$crate" && cargo fmt --check)
-            echo "::endgroup::"
-          done
+        run: make fmt-check
 
-      # `-D warnings` reaches only the crate being linted, so the vendored
-      # bootloader and ps2 are checked but not gated — which is what we want,
-      # and worth knowing before someone goes looking for why.
       - name: Lint
-        run: |
-          for crate in kernel fullkernel tools/boot-test user/probe fs/ext4; do
-            echo "::group::$crate"
-            (cd "$crate" && cargo clippy --all-targets -- -D warnings)
-            echo "::endgroup::"
-          done
+        run: make clippy
 
       # The kernel saves only the general registers of a thread that's in it,
       # so it mustn't touch SSE ones: Rust code for this target can't, and C
@@ -149,8 +137,7 @@ jobs:
       # The ext4 crate's tests run on the host and are judged by e2fsprogs
       # (mke2fs, e2fsck, debugfs), which the runner image has.
       - name: Test ext4
-        working-directory: fs/ext4
-        run: cargo test
+        run: make test-ext4
 
       - name: Save the cargo cache
         uses: ./.github/actions/cargo/save
