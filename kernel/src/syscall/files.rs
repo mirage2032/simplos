@@ -1462,7 +1462,7 @@ pub fn dup3(process: &Process, fd: u64, to: u64, flags: u64, dup2: bool) -> i64 
     })())
 }
 
-/// Write what `fs/ext4` holds in memory, small writes waiting to be made
+/// Write what `lib/ext4` holds in memory, small writes waiting to be made
 /// as one: then every change is on the disk. For `fd`'s file (`fsync`,
 /// `fdatasync`), the file system it's on (`syncfs`), or everything
 /// (`sync`): all one here.
@@ -1544,7 +1544,7 @@ pub fn fchownat(process: &Process, dirfd: u64, path: u64, uid: u64, gid: u64, fl
 /// say `UTIME_NOW`; left as they are for `UTIME_OMIT`. With no path, the
 /// file `dirfd` is open on, as `futimens` asks.
 ///
-/// shortcut: to the second, as `fs/ext4` keeps them; and not to 0, the
+/// shortcut: to the second, as `lib/ext4` keeps them; and not to 0, the
 /// start of 1970, which it takes as leaving the time as it is.
 pub fn utimensat(process: &Process, dirfd: u64, path: u64, times: u64, flags: u64) -> i64 {
     const UTIME_NOW: i64 = (1 << 30) - 1;

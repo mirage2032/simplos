@@ -19,7 +19,7 @@ SHELL := bash
 .DEFAULT_GOAL := help
 
 # Every crate of ours, vendor/'s being upstream code with its own style.
-CRATES := kernel fullkernel tools/boot-test user/probe fs/ext4
+CRATES := kernel fullkernel tools/boot-test user/probe lib/ext4
 
 # GitHub folds each crate's output under its name; elsewhere it's a heading.
 ifdef GITHUB_ACTIONS
@@ -48,7 +48,7 @@ test:
 	cd kernel && cargo test $(ARGS)
 
 test-ext4:
-	cd fs/ext4 && cargo test $(ARGS)
+	cd lib/ext4 && cargo test $(ARGS)
 
 images:
 	scripts/build-images.sh $(ARGS)

@@ -116,7 +116,7 @@ anything else is done on the disk, the file is closed, a program calls
 power going loses that second's at most; but for a file opened `O_SYNC` or
 `O_DSYNC`, whose every write is on the disk as it returns; if the disk
 won't take them, the next `fsync` says so, as Linux's does of what it
-writes back. The work is done by `fs/ext4` (see below), behind a lock that
+writes back. The work is done by `lib/ext4` (see below), behind a lock that
 sleeps whoever waits for it (`thread::SleepLock`), since a call can wait on
 the disk for a long time.
 The disk is trusted: lwext4 is C, parsing it in ring 0, and isn't fuzzed yet.
@@ -688,12 +688,12 @@ the right firmware and the right framebuffer mode.
 | `user/probe/` | a user program: ordinary Rust with `std`, built for Linux (static musl). Both images and every test boot carry it as the bootloader's ramdisk, and the shell's `run` runs it. |
 | `vendor/bootloader/` | [rust-osdev/bootloader](https://github.com/rust-osdev/bootloader) 0.11.17, vendored and patched. |
 | `vendor/ps2/` | the `ps2` crate, with its `x86_64` dependency bumped. |
-| `fs/ext4/` | ext4 (and ext3 and ext2) file systems, read and written with a journal: a Rust interface over the vendored lwext4, tested on the host against e2fsprogs. |
-| `vendor/lwext4/` | [lwext4](https://github.com/gkostka/lwext4), the C library `fs/ext4` uses for now. |
+| `lib/ext4/` | ext4 (and ext3 and ext2) file systems, read and written with a journal: a Rust interface over the vendored lwext4, tested on the host against e2fsprogs. |
+| `vendor/lwext4/` | [lwext4](https://github.com/gkostka/lwext4), the C library `lib/ext4` uses for now. |
 | `scripts/` | `build-images.sh`, `smoke-test.sh`, `boot-test.sh`, `mutants.sh`, `userland.sh`, which builds busybox, uutils, zsh and vim for the disk, `toolchain.sh`, which builds GCC for it, and `rust.sh`, which unpacks Rust for it. |
 
 There is no cargo workspace: `kernel` builds for `x86_64-unknown-none` with
-`build-std`, the host tools and `fs/ext4`'s tests build for the host, `user/probe` builds for
+`build-std`, the host tools and `lib/ext4`'s tests build for the host, `user/probe` builds for
 `x86_64-unknown-linux-musl` (linked by the toolchain's `rust-lld`), and the settings for
 those are mutually exclusive. Each crate has its own `Cargo.toml`, `Cargo.lock`,
 `.cargo/config.toml` and target directory — so a `[patch]` added to one has to
@@ -705,7 +705,7 @@ be added to the others that need it.
 commit `58bcf89` (2022-09-22): its `src/` and `include/` without the mkfs and
 MBR code, which nothing uses. It is GPL-2.0 (its extents and xattr code are
 "GPL-2.0 or later"), like simplos. It has thirteen local fixes, each marked
-`LOCAL PATCH` in the source, all found by `fs/ext4`'s tests:
+`LOCAL PATCH` in the source, all found by `lib/ext4`'s tests:
 
 - **`metadata_csum_seed`, which e2fsprogs 1.47.4's `mke2fs` turns on for
   every ext4** — it refused such a file system, whose metadata checksums all
@@ -756,7 +756,7 @@ MBR code, which nothing uses. It is GPL-2.0 (its extents and xattr code are
   journal, every block changed after, out of disk space or not, stayed in
   memory, where `sync` didn't reach it.
 - **`src/ext4.c`, a name of 255 bytes**, ext4's longest — wasn't found;
-  `fs/ext4` says `NameTooLong` for longer ones, which lwext4 said weren't
+  `lib/ext4` says `NameTooLong` for longer ones, which lwext4 said weren't
   there.
 - **`src/ext4.c`, making a directory on a full disk** — its name went into
   its parent before its index's block was had, and stayed when that couldn't
@@ -780,10 +780,10 @@ replaying a journal (`src/ext4_journal.c`) writes each block once, from its
 cache, before the journal's marked empty, rather than once for each
 transaction it's in.
 
-`fs/ext4` compiles it with the host's C compiler, the same way for the
+`lib/ext4` compiles it with the host's C compiler, the same way for the
 kernel as for its tests on the host: freestanding, with no C library but the
-few headers in `fs/ext4/src/include` and the few functions in
-`fs/ext4/src/libc.c`, and only ever the general registers
+few headers in `lib/ext4/src/include` and the few functions in
+`lib/ext4/src/libc.c`, and only ever the general registers
 (`-mgeneral-regs-only`). That last matters: the kernel saves just the general
 registers of a thread that's in it, so it must never touch SSE ones, which
 hold user programs' state. Compiled without it, an optimised kernel has a
@@ -792,7 +792,7 @@ turns off debug `printf`, picks lwext4's own errno values, gives it `malloc`
 and friends from Rust's allocator, and has it keep up to 512 blocks of each
 file system in memory, where upstream's 8 had every lookup in a big directory
 read it from the disk again: zsh's `compinit` checking its 1185 functions, in
-one directory, took 24 s, and now takes 1.6 s. Nothing outside `fs/ext4` sees
+one directory, took 24 s, and now takes 1.6 s. Nothing outside `lib/ext4` sees
 it, so it can be replaced by Rust code without touching the rest. Its habits that differ from
 Linux's are handled there rather than patched: it would mount a file system
 whose journal needs replaying as if it were clean, make the missing
@@ -804,24 +804,24 @@ unmounting after a failed mount.
 What it still can't do: rename a directory onto an empty one in one
 transaction (it's two), remove a file over 16 MiB in one transaction, keep a
 file that's open once its last name is gone (it would free it under whoever
-has it open: `fs/ext4` gives it another name first), or leave a hole in a
+has it open: `lib/ext4` gives it another name first), or leave a hole in a
 file (writing past the end fills the gap with zeros). A new file's permissions and times are
 set just after it's made, in a transaction of their own. Every call is a
 transaction of its own, in the journal before the call returns, where
 there's one: lwext4's cache then writes the blocks to their places in its
 own time (its write-back mode), or as the file system is unmounted, or as
 nothing else is being done on it (`Ext4::flush`). Without a journal, it
-writes them through. So `fs/ext4` holds a stream of small writes to a file,
+writes them through. So `lib/ext4` holds a stream of small writes to a file,
 and makes them in one call. And it keeps where paths led, to an inode or to
 nothing, as lwext4 would read every directory on the way again: forgotten
 whole as any name is made, moved or removed, and none longer than 1 KiB.
 
-Building and running `fs/ext4`'s tests needs e2fsprogs (`mke2fs`, `e2fsck`,
+Building and running `lib/ext4`'s tests needs e2fsprogs (`mke2fs`, `e2fsck`,
 `debugfs`) and `gzip`. Every test that writes ends with `e2fsck -fn` on the
 result. `tests/journal.rs` replays `tests/linux-crash.img.gz`, a disk Linux's
 own ext4 driver left with changes still in its journal (`tests/linux-crash.sh`,
 run as root, makes it again), and cuts the power at every write a run of
-changes makes, checking that both e2fsck and `fs/ext4` recover from each.
+changes makes, checking that both e2fsck and `lib/ext4` recover from each.
 
 ### The vendored bootloader
 
