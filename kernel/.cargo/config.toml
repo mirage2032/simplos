@@ -16,4 +16,4 @@ panic-abort-tests = true
 # under QEMU. `tools/boot-test` does that and turns how the guest exited back
 # into a pass or a fail. Relative to this crate's directory, which is where
 # cargo invokes the runner from.
-runner = "../scripts/boot-test.sh"
+runner = "../tools/boot-test/runner.sh"

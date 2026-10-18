@@ -19,7 +19,7 @@ SHELL := bash
 .DEFAULT_GOAL := help
 
 # Every crate of ours, vendor/'s being upstream code with its own style.
-CRATES := kernel fullkernel tools/boot-test user/probe lib/ext4
+CRATES := kernel tools user/probe lib/ext4
 
 # GitHub folds each crate's output under its name; elsewhere it's a heading.
 ifdef GITHUB_ACTIONS
@@ -36,13 +36,13 @@ help:
 	@sed -n 's/^#   //p' Makefile
 
 run:
-	cd fullkernel && cargo run -- $(ARGS)
+	cd tools/boot && cargo run -- $(ARGS)
 
 run-bios:
-	cd fullkernel && cargo run -- --bios $(ARGS)
+	cd tools/boot && cargo run -- --bios $(ARGS)
 
 debug:
-	cd fullkernel && cargo run -- --debug $(ARGS)
+	cd tools/boot && cargo run -- --debug $(ARGS)
 
 test:
 	cd kernel && cargo test $(ARGS)

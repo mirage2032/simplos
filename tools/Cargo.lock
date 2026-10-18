@@ -71,6 +71,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "boot"
+version = "0.2.3"
+dependencies = [
+ "bootloader",
+ "ovmf-prebuilt",
+ "probe",
+ "simplos",
+]
+
+[[package]]
+name = "boot-test"
+version = "0.1.0"
+dependencies = [
+ "bootloader",
+ "ovmf-prebuilt",
+ "probe",
+]
+
+[[package]]
 name = "bootloader"
 version = "0.11.17"
 dependencies = [
@@ -496,16 +515,6 @@ dependencies = [
  "uart_16550",
  "x86",
  "x86_64",
-]
-
-[[package]]
-name = "simplos-os"
-version = "0.2.3"
-dependencies = [
- "bootloader",
- "ovmf-prebuilt",
- "probe",
- "simplos",
 ]
 
 [[package]]

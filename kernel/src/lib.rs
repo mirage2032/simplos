@@ -49,7 +49,7 @@ use x86_64::VirtAddr;
 include!(concat!(env!("OUT_DIR"), "/framebuffer.rs"));
 
 /// Where the kernel image is loaded: the top 2 GiB, as is conventional on x86-64.
-/// `fullkernel/build.rs` repeats it for the debugger scripts.
+/// `tools/boot/build.rs` repeats it for the debugger scripts.
 pub const KERNEL_BASE: u64 = 0xFFFF_FFFF_8000_0000;
 
 // `frame_buffer` is deprecated in favour of configuring the mode when the disk

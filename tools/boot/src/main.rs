@@ -97,10 +97,11 @@ fn disk() -> Option<PathBuf> {
     if image.exists() {
         return Some(image);
     }
+    let repository = here.join("../..");
     // Afresh: what an earlier one left would be copied over, and through
     // its links, as vim's xxd went through busybox's /usr/bin/xxd onto
-    // busybox itself.
-    let tree = here.join("target/disk-tree");
+    // busybox itself. Beside the trees it's made of.
+    let tree = repository.join("target/disk-tree");
     let _ = std::fs::remove_dir_all(&tree);
     std::fs::create_dir_all(&tree).ok()?;
     std::fs::write(tree.join("hello.txt"), "hello from the ext4 disk\n").ok()?;
@@ -109,7 +110,6 @@ fn disk() -> Option<PathBuf> {
     // Built the first time: the userland in a few minutes, GCC in a quarter
     // of an hour on a fast machine. Links and modes kept, and what's there replaced rather
     // than written through, as GCC's binutils replace busybox's links.
-    let repository = here.join("..");
     let trees =
         [("userland", "busybox, uutils, zsh or vim"), ("toolchain", "gcc"), ("rust", "cargo")];
     for (what, has) in trees {

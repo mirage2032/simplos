@@ -1,0 +1,40 @@
+# The host's tools, which share a lock, a target directory and
+# .cargo/config.toml: boot, which makes the disk images and runs them, and
+# boot-test, cargo's runner for the kernel's tests. The kernel, the user
+# program and the ext4 crate build for targets of their own, with settings
+# that exclude these (see README's Layout), so they aren't members.
+[workspace]
+members = ["boot", "boot-test"]
+resolver = "3"
+
+# Profiles and patches are the workspace's: cargo ignores a member's.
+
+[profile.dev]
+opt-level = 0
+debug = 2
+
+[profile.dev.build-override]
+opt-level = 0
+debug = 2
+
+# But the file system, lwext4 and all, optimised, as the tests have it:
+# everything on the disk is reached through it, and it's C nobody steps
+# through.
+[profile.dev.package.ext4]
+opt-level = 2
+
+# The kernel is an *artifact build-dependency* of boot, so cargo builds it
+# under `build-override`, not under `[profile.release]`. Without this a release
+# build still ships an unoptimised kernel — which matters most when the guest
+# CPU is an interpreter (TCG, or QEMU compiled to WebAssembly).
+[profile.release.build-override]
+opt-level = 3
+debug = false
+
+# For the kernel, which boot builds: the same as kernel/Cargo.toml's.
+[patch.crates-io]
+ps2 = { path = "../vendor/ps2" }
+
+# Vendored bootloader, patched for a 1920x1080 framebuffer on both firmware paths.
+[patch."https://github.com/rust-osdev/bootloader.git"]
+bootloader_api = { path = "../vendor/bootloader/api" }

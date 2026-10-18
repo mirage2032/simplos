@@ -216,7 +216,7 @@ fn run(
     let mut qemu = Command::new("qemu-system-x86_64");
     if let Firmware::Uefi = firmware {
         // QEMU's default firmware is SeaBIOS; UEFI is OVMF, from the same
-        // crate `fullkernel`'s runner uses, so nothing has to be installed.
+        // crate `tools/boot` uses, so nothing has to be installed.
         qemu.arg("-bios").arg(ovmf_prebuilt::ovmf_pure_efi());
     }
     // The scratch disks' flushes are taken as done (`cache=unsafe`) rather than

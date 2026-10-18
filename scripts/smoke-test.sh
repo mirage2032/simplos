@@ -133,7 +133,7 @@ boot BIOS "$images/bios.img"
 if [[ -n $firmware ]]; then
     boot UEFI "$images/uefi.img" -bios "$firmware"
 else
-    echo "::error::UEFI: no OVMF firmware found; build fullkernel once so ovmf-prebuilt is unpacked."
+    echo "::error::UEFI: no OVMF firmware found; build tools/boot once so ovmf-prebuilt is unpacked."
     status=1
 fi
 

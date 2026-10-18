@@ -83,10 +83,10 @@ jobs:
           # A line for each job: its name, the cargo cache it saves (- for
           # none), and the paths its result depends on besides those.
           JOBS: |
-            lint        lint   rustfmt.toml Makefile kernel fullkernel tools user lib vendor
-            test-kernel test   kernel tools user lib vendor user/rootfs scripts/boot-test.sh user/ports/userland.sh user/ports/toolchain.sh user/ports/completions.sh
-            test-rust   -      kernel tools user lib vendor user/rootfs scripts/boot-test.sh user/ports/userland.sh user/ports/toolchain.sh user/ports/rust.sh user/ports/completions.sh
-            images      images kernel fullkernel user lib vendor user/rootfs scripts/build-images.sh scripts/smoke-test.sh user/ports/userland.sh user/ports/toolchain.sh user/ports/rust.sh user/ports/completions.sh
+            lint        lint   rustfmt.toml Makefile kernel tools user/probe lib vendor
+            test-kernel test   kernel tools/Cargo.toml tools/Cargo.lock tools/.cargo tools/boot-test user/probe user/rootfs lib vendor user/ports/userland.sh user/ports/toolchain.sh user/ports/completions.sh
+            test-rust   -      kernel tools/Cargo.toml tools/Cargo.lock tools/.cargo tools/boot-test user/probe user/rootfs lib vendor user/ports/userland.sh user/ports/toolchain.sh user/ports/rust.sh user/ports/completions.sh
+            images      images kernel tools/Cargo.toml tools/Cargo.lock tools/.cargo tools/boot user lib vendor scripts/build-images.sh scripts/smoke-test.sh
         run: .github/scripts/plan.sh
 
   lint:
@@ -105,8 +105,7 @@ jobs:
           cache: lint
           targets: |
             kernel/target
-            fullkernel/target
-            tools/boot-test/target
+            tools/target
             user/probe/target
             lib/ext4/target
             vendor/bootloader/target
@@ -239,7 +238,7 @@ jobs:
           cache: test
           targets: |
             kernel/target
-            tools/boot-test/target
+            tools/target
             vendor/bootloader/target
 
       - name: Restore the userland
@@ -307,7 +306,7 @@ jobs:
         with:
           cache: images
           targets: |
-            fullkernel/target
+            tools/target
             vendor/bootloader/target
 
       - name: Restore the userland

@@ -5,10 +5,11 @@
 # tool. Cargo reads .cargo/config.toml from the *current* directory, not from
 # the manifest's, so invoking `cargo run --manifest-path tools/boot-test/...`
 # from kernel/ would hand the host build the kernel's `build-std` settings and
-# bare-metal target. Entering the tool's own directory gives it its own config.
+# bare-metal target. Entering the tool's own directory gives it the tools
+# workspace's config.
 set -euo pipefail
 
-root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 # The test binary's path is relative to where cargo invoked us, which is about
 # to stop being the current directory.
@@ -21,5 +22,5 @@ for arg in "$@"; do
     fi
 done
 
-cd "$root/tools/boot-test"
+cd "$here"
 exec cargo run --quiet --release -- "${args[@]}"

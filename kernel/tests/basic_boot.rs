@@ -115,7 +115,7 @@ fn timer_ticks_at_timer_hz() {
 
 #[test_case]
 fn ramdisk_holds_an_x86_64_executable() {
-    // tools/boot-test attaches user/probe to every test boot, as fullkernel
+    // tools/boot-test attaches user/probe to every test boot, as tools/boot
     // does to the real images. Checked by hand here; the loader will parse it.
     let elf = simplos::ramdisk().expect("the image has a ramdisk");
     assert!(elf.len() > 64, "a {}-byte ramdisk", elf.len());

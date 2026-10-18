@@ -27,7 +27,7 @@ self=$root/scripts/mutants.sh
 work=$root/target/mutants
 tree=$work/tree
 out=$work/out
-boot_test=$root/tools/boot-test/target/release/boot-test
+boot_test=$root/tools/target/release/boot-test
 export SIMPLOS_FIRMWARE=${SIMPLOS_FIRMWARE:-bios}
 
 # Boot the test kernels in directory $2 until one fails, and say how that went:
