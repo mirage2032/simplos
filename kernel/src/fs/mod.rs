@@ -5,9 +5,12 @@
 //! Every call into them, through a path or through an open file, holds
 //! [`ROOT`]'s lock ([`lock`]), and whoever waits for it sleeps.
 
-use crate::elf;
-use crate::io::disk;
-use crate::proc;
+pub mod locks;
+pub mod pipe;
+pub mod procfs;
+
+use crate::drivers::disk;
+use crate::process::elf;
 use crate::serial_println;
 use crate::thread::{self, SleepLock, SleepLockGuard};
 use crate::tty::Tty;
@@ -23,7 +26,7 @@ use ext4::{BlockDevice, DirEntry, Error, Ext4, Kind, Metadata};
 /// disk for a long time, so whoever waits for them sleeps.
 pub static ROOT: SleepLock<Option<Ext4>> = SleepLock::new(None);
 
-/// One of `io::disk`'s disks, by its number.
+/// One of `drivers::disk`'s disks, by its number.
 struct Disk {
     index: usize,
     sectors: u64,
@@ -68,8 +71,8 @@ pub fn init() {
         match Ext4::mount_writable(Box::new(Disk { index, sectors: info.sectors })) {
             Ok(fs) => {
                 serial_println!("simplos: ext4 on disk {}", index);
-                fs.watch(crate::cache::changed);
-                crate::cache::clear();
+                fs.watch(crate::mm::page_cache::changed);
+                crate::mm::page_cache::clear();
                 *ROOT.lock() = Some(fs);
                 return;
             }
@@ -96,7 +99,7 @@ pub fn unmount() {
     drop(core::mem::take(&mut *CLOSING.lock()));
     root.take();
     drop(root);
-    crate::cache::clear();
+    crate::mm::page_cache::clear();
 }
 
 /// What a file descriptor refers to. Copies of a descriptor share one, and
@@ -117,7 +120,7 @@ pub enum Handle {
     /// written goes nowhere.
     Random { urandom: bool },
     Pipe {
-        end: crate::pipe::PipeEnd,
+        end: crate::fs::pipe::PipeEnd,
         /// O_NONBLOCK: a read or write that would wait fails instead.
         nonblocking: AtomicBool,
     },
@@ -127,7 +130,11 @@ pub enum Handle {
     /// shortcut: datagram and sequenced-packet sockets as stream ones, the
     /// messages written into them not kept apart; nothing reads more than
     /// one at a time from them here, as Rust's `Command` doesn't.
-    Socket { input: crate::pipe::PipeEnd, output: crate::pipe::PipeEnd, nonblocking: AtomicBool },
+    Socket {
+        input: crate::fs::pipe::PipeEnd,
+        output: crate::fs::pipe::PipeEnd,
+        nonblocking: AtomicBool,
+    },
     File {
         /// Shared with the parts of programs' memory it's mapped into.
         file: Arc<ext4::File>,
@@ -164,7 +171,7 @@ impl Drop for Handle {
     /// F_OFD_SETLK locks go; a directory's entries no longer count.
     fn drop(&mut self) {
         match self {
-            Handle::File { .. } => crate::locks::release_open(self as *const Handle as usize),
+            Handle::File { .. } => crate::fs::locks::release_open(self as *const Handle as usize),
             Handle::Dir { entries, .. } => {
                 DIRS_HELD.fetch_sub(held(entries), Ordering::Relaxed);
             }
@@ -191,7 +198,7 @@ impl Handle {
         path: String,
     ) -> Result<Handle, Error> {
         let bytes = held(&entries);
-        if DIRS_HELD.fetch_add(bytes, Ordering::Relaxed) + bytes > crate::allocator::size() / 4 {
+        if DIRS_HELD.fetch_add(bytes, Ordering::Relaxed) + bytes > crate::mm::heap::size() / 4 {
             DIRS_HELD.fetch_sub(bytes, Ordering::Relaxed);
             return Err(Error::OutOfMemory);
         }
@@ -202,11 +209,11 @@ impl Handle {
         Handle::Tty { tty, nonblocking: AtomicBool::new(false) }
     }
 
-    pub fn pipe(end: crate::pipe::PipeEnd) -> Handle {
+    pub fn pipe(end: crate::fs::pipe::PipeEnd) -> Handle {
         Handle::Pipe { end, nonblocking: AtomicBool::new(false) }
     }
 
-    pub fn socket(input: crate::pipe::PipeEnd, output: crate::pipe::PipeEnd) -> Handle {
+    pub fn socket(input: crate::fs::pipe::PipeEnd, output: crate::fs::pipe::PipeEnd) -> Handle {
         Handle::Socket { input, output, nonblocking: AtomicBool::new(false) }
     }
 
@@ -392,7 +399,7 @@ impl Drop for Tree<'_> {
 }
 
 /// Files let go of where the tree couldn't be taken: by a program's memory,
-/// as the parts of it a file is mapped into go (`memory::Backing`).
+/// as the parts of it a file is mapped into go (`mm::Backing`).
 static CLOSING: spin::Mutex<Vec<Arc<ext4::File>>> = spin::Mutex::new(Vec::new());
 
 /// Let go of `file` the next time the tree is: closing it, if no one else
@@ -426,13 +433,13 @@ impl Tree<'_> {
         }
         match on(path) {
             On::Devices("") => Ok(directory(DEV_INODE, 0o755)),
-            On::Devices("fd") => Ok(directory(proc::inode(path), 0o555)),
+            On::Devices("fd") => Ok(directory(procfs::inode(path), 0o555)),
             On::Devices(name) if let Some(target) = dev_link(name) => {
-                Ok(proc::Node::Link(target.into()).metadata(path))
+                Ok(procfs::Node::Link(target.into()).metadata(path))
             }
             On::Devices(_) => device(path).map(device_metadata).ok_or(Error::NotFound),
             On::Proc(within) => {
-                let node = proc::node(within, self.disk.as_ref()).ok_or(Error::NotFound)?;
+                let node = procfs::node(within, self.disk.as_ref()).ok_or(Error::NotFound)?;
                 Ok(node.metadata(path))
             }
             On::Disk => match self.disk.as_ref() {
@@ -458,7 +465,7 @@ impl Tree<'_> {
                 let named = |name: &str, kind| DirEntry {
                     name: name.into(),
                     kind,
-                    inode: proc::inode(&alloc::format!("dev/{name}")),
+                    inode: procfs::inode(&alloc::format!("dev/{name}")),
                 };
                 entries.push(named("fd", Kind::Directory));
                 for name in ["stdin", "stdout", "stderr"] {
@@ -467,14 +474,14 @@ impl Tree<'_> {
                 (None, entries)
             }
             On::Devices("fd") => match crate::thread::current_process() {
-                Some(process) => (None, proc::descriptors(&process, path)),
+                Some(process) => (None, procfs::descriptors(&process, path)),
                 None => (None, Vec::new()),
             },
             On::Devices(_) => {
                 return Err(self.metadata(path).err().unwrap_or(Error::NotADirectory));
             }
-            On::Proc(within) => match proc::node(within, self.disk.as_ref()) {
-                Some(proc::Node::Dir(entries)) => (None, entries),
+            On::Proc(within) => match procfs::node(within, self.disk.as_ref()) {
+                Some(procfs::Node::Dir(entries)) => (None, entries),
                 Some(_) => return Err(Error::NotADirectory),
                 None => return Err(Error::NotFound),
             },
@@ -491,7 +498,7 @@ impl Tree<'_> {
         if path.is_empty() {
             entries.retain(|entry| entry.name != "dev" && entry.name != "proc");
             entries.push(DirEntry { name: "dev".into(), kind: Kind::Directory, inode: DEV_INODE });
-            let inode = proc::inode("proc");
+            let inode = procfs::inode("proc");
             entries.push(DirEntry { name: "proc".into(), kind: Kind::Directory, inode });
         }
         Ok((dir, entries))
@@ -503,7 +510,7 @@ impl Tree<'_> {
             Handle::File { file, .. } => file.metadata(),
             Handle::Dir { dir: Some(dir), .. } => dir.metadata(),
             Handle::Dir { path, .. } => self.metadata(path),
-            Handle::Proc { path, .. } => Ok(proc::Node::File(Vec::new()).metadata(path)),
+            Handle::Proc { path, .. } => Ok(procfs::Node::File(Vec::new()).metadata(path)),
             special => Ok(self::special(special).expect("not on the disk")),
         }
     }
@@ -514,8 +521,8 @@ impl Tree<'_> {
             On::Devices(name) => dev_link(name)
                 .map(|target| target.as_bytes().to_vec())
                 .ok_or(Error::InvalidArgument),
-            On::Proc(within) => match proc::node(within, self.disk.as_ref()) {
-                Some(proc::Node::Link(target)) => Ok(target),
+            On::Proc(within) => match procfs::node(within, self.disk.as_ref()) {
+                Some(procfs::Node::Link(target)) => Ok(target),
                 Some(_) => Err(Error::InvalidArgument),
                 None => Err(Error::NotFound),
             },
@@ -546,8 +553,8 @@ impl Tree<'_> {
     /// The file in /proc at `path`, as it is now: none if it isn't one.
     pub fn proc_file(&self, path: &str) -> Option<Vec<u8>> {
         match on(path) {
-            On::Proc(within) => match proc::node(within, self.disk.as_ref())? {
-                proc::Node::File(data) => Some(data),
+            On::Proc(within) => match procfs::node(within, self.disk.as_ref())? {
+                procfs::Node::File(data) => Some(data),
                 _ => None,
             },
             _ => None,
@@ -677,7 +684,7 @@ impl elf::Source for Program {
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Option<()> {
         let _tree = lock();
-        let read = crate::cache::read(self.file.as_ref()?, offset, buf).ok()?;
+        let read = crate::mm::page_cache::read(self.file.as_ref()?, offset, buf).ok()?;
         (read == buf.len()).then_some(())
     }
 

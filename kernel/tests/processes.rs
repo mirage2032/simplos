@@ -109,7 +109,7 @@ fn copies_of_a_program_share_its_code() {
     // /bin/big's 24 MiB segment is read-only, so each copy that runs maps
     // the page cache's pages of it, rather than copies of its own: a second
     // takes under 4 MiB. So does a copy made with fork.
-    let free = || simplos::memory::FRAMES.lock().as_ref().unwrap().memory().1;
+    let free = || simplos::mm::FRAMES.lock().as_ref().unwrap().memory().1;
     let start = || {
         let tty = Tty::capture(Box::new(|_: &[u8]| {}));
         let files = vec![Some(Arc::new(fs::Handle::tty(Arc::new(tty)))); 3];

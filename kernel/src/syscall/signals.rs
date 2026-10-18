@@ -4,8 +4,8 @@
 
 use super::files::{Result, ret};
 use super::{EFAULT, EINVAL, EPERM};
+use crate::process::signal::{self, Action, AltStack, COUNT, ERESTARTNOHAND, Info, SI_TKILL};
 use crate::process::{self, Process, Task};
-use crate::signal::{self, Action, AltStack, COUNT, ERESTARTNOHAND, Info, SI_TKILL};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 

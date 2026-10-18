@@ -16,7 +16,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use bootloader_api::{BootInfo, entry_point};
 use core::panic::PanicInfo;
-use simplos::io::hpet;
+use simplos::drivers::hpet;
 use simplos::process;
 use spin::Mutex;
 

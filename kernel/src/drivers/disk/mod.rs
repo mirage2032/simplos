@@ -10,7 +10,7 @@
 pub mod ahci;
 pub mod ata;
 
-use crate::io::hpet;
+use crate::drivers::hpet;
 use crate::serial_println;
 use alloc::string::String;
 use alloc::vec::Vec;

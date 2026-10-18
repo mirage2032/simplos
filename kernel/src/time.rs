@@ -3,10 +3,10 @@
 //! thread sends them as SIGALRM, and their timers (`timer_create`), whose
 //! signals it sends too.
 
-use crate::io::hpet;
-use crate::io::interrupts::pit::TIMER_HZ;
+use crate::arch::pit::TIMER_HZ;
+use crate::drivers::hpet;
 use crate::process;
-use crate::signal::{self, Info};
+use crate::process::signal::{self, Info};
 use crate::thread;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};

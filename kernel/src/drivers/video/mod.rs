@@ -1,6 +1,6 @@
 pub mod vbe;
 
-use crate::io::fwcfg;
+use crate::drivers::fwcfg;
 use crate::serial_println;
 use alloc::vec;
 use alloc::vec::Vec;

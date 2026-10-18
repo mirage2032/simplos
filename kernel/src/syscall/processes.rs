@@ -7,10 +7,10 @@ use super::clocks;
 use super::files::{self, Result, path_at, ret, string_at};
 use super::{CLOCK_MONOTONIC, CLOCK_REALTIME, EFAULT, EINVAL, ENOMEM, ENOSYS, EPERM};
 use super::{deadline, timespec_ms, timespec_ns};
-use crate::futex::{self, Error};
-use crate::memory::USER_END;
+use crate::mm::USER_END;
+use crate::process::futex::{self, Error};
+use crate::process::signal::{ERESTARTNOHAND, ERESTARTSYS};
 use crate::process::{self, Process, Registers, ThreadIds};
-use crate::signal::{ERESTARTNOHAND, ERESTARTSYS};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -98,7 +98,7 @@ pub fn clone(
 }
 
 /// `futex`: on the 32-bit word at `addr`, `op` says what, of what
-/// `futex.rs` does: wait while it's `value`, with `timeout` the `struct
+/// `process/futex.rs` does: wait while it's `value`, with `timeout` the `struct
 /// timespec` there, if it isn't 0, for how long, or with FUTEX_WAIT_BITSET
 /// until when, by CLOCK_MONOTONIC or with FUTEX_CLOCK_REALTIME by that;
 /// wake up to `value` waiters; or wake them and move up to `timeout`'s

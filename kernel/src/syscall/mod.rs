@@ -18,12 +18,12 @@ pub use system::{DEFAULT_LIMITS, LIMITS, RELEASE};
 
 use clocks::{CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_REALTIME};
 
+use crate::arch::gdt;
+use crate::arch::pit::TIMER_HZ;
 use crate::fs::Handle;
-use crate::io::interrupts::gdt;
-use crate::io::interrupts::pit::TIMER_HZ;
-use crate::memory::{Backing, FILE_SHARED, FRAMES, USER_END};
+use crate::mm::{Backing, FILE_SHARED, FRAMES, USER_END};
+use crate::process::signal::{self, ERESTARTNOHAND, Syscall};
 use crate::process::{self, LOWEST, MMAP_END, MMAP_START, Process, Registers, Task, pages};
-use crate::signal::{self, ERESTARTNOHAND, Syscall};
 use crate::{serial_println, thread};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -762,7 +762,7 @@ fn mmap(
 /// asking for too much is told so, rather than ending as it touches it.
 fn affordable(len: u64) -> bool {
     let free = FRAMES.lock().as_ref().map_or(0, |frames| frames.memory().1);
-    len <= free + crate::cache::pages() as u64 * 4096
+    len <= free + crate::mm::page_cache::pages() as u64 * 4096
 }
 
 /// Advice on how the program will use the memory at `addr`: taken, and of

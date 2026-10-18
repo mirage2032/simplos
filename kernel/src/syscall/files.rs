@@ -2,12 +2,12 @@
 //! the ext4 file system or the console.
 
 use super::{EBADF, EFAULT, EINVAL, ENOTTY, EPERM};
+use crate::fs::locks;
+use crate::fs::pipe::{self, PipeEnd, ReadError, WriteError};
 use crate::fs::{self, Device, Handle};
-use crate::locks;
-use crate::pipe::{self, PipeEnd, ReadError, WriteError};
 use crate::process;
+use crate::process::signal::{self, ERESTARTSYS, Info};
 use crate::process::{Fd, Process};
-use crate::signal::{self, ERESTARTSYS, Info};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -312,7 +312,7 @@ fn closed(process: &Process, fd: &Fd) {
 /// `flock`: lock the whole file `fd` is open on, shared (LOCK_SH) or
 /// exclusive (LOCK_EX), waiting until no one else's lock is in the way, or
 /// with LOCK_NB failing with EWOULDBLOCK; or let go of it (LOCK_UN). The lock
-/// is the open file's, as `locks.rs` says.
+/// is the open file's, as `fs/locks.rs` says.
 pub fn flock(process: &Process, fd: u64, operation: u64) -> i64 {
     const LOCK_SH: u64 = 1;
     const LOCK_EX: u64 = 2;
@@ -727,7 +727,7 @@ fn read_data(process: &Process, fd: u64, count: u64, at: Option<u64>) -> Result<
             let _tree = fs::lock();
             let from = at.unwrap_or_else(|| offset.load(Relaxed));
             let mut data = vec![0; count];
-            let read = crate::cache::read(file, from, &mut data).map_err(fs::errno)?;
+            let read = crate::mm::page_cache::read(file, from, &mut data).map_err(fs::errno)?;
             data.truncate(read);
             if at.is_none() {
                 offset.store(from + read as u64, Relaxed);

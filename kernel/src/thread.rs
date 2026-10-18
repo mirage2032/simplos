@@ -16,10 +16,10 @@
 //! a start): a lock a preempted thread was holding would otherwise never come
 //! free.
 
-use crate::io::interrupts::{idt::TIMER_COUNTER, pit::TIMER_HZ};
-use crate::memory::{self, KernelStack};
+use crate::arch::{idt::TIMER_COUNTER, pit::TIMER_HZ};
+use crate::mm::{self, KernelStack};
+use crate::process::signal;
 use crate::process::{self, Process, Task, UserState};
-use crate::signal;
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
@@ -371,7 +371,7 @@ fn switch_to(
     }
     match next.user.as_deref() {
         Some(user) => user.switch_in(),
-        None => memory::use_kernel_page_table(),
+        None => mm::use_kernel_page_table(),
     }
     let mut previous = core::mem::replace(&mut scheduler.current, next);
     // Into the Box, whose contents stay put while the Box itself moves.

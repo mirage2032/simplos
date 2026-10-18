@@ -4,11 +4,11 @@
 //! find by physical address: per port, a command list, a place to drop the
 //! disk's replies (FIS = frame information structure, a SATA packet) and a
 //! command table. All of that, plus a bounce buffer for the data, lives in two
-//! frames from [`crate::memory::alloc_dma_frame`].
+//! frames from [`crate::mm::alloc_dma_frame`].
 
 use super::{DiskError, DiskInfo, SECTOR, parse_identify, words};
-use crate::io::pci;
-use crate::memory::{alloc_dma_frame, phys_ptr};
+use crate::drivers::pci;
+use crate::mm::{alloc_dma_frame, phys_ptr};
 use crate::serial_println;
 use alloc::vec::Vec;
 use core::sync::atomic::{Ordering, fence};

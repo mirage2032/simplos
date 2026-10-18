@@ -15,7 +15,7 @@ extern crate alloc;
 use alloc::vec;
 use bootloader_api::{BootInfo, entry_point};
 use core::panic::PanicInfo;
-use simplos::io::disk::{self, DiskError, SECTOR};
+use simplos::drivers::disk::{self, DiskError, SECTOR};
 
 entry_point!(main, config = &simplos::BOOTLOADER_CONFIG);
 

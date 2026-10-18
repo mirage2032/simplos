@@ -14,7 +14,7 @@
 //! column, no insert mode, and the cursor keys don't change with modes; the
 //! `linux` entry asks for none of these.
 
-use crate::io::video::Display;
+use crate::drivers::video::Display;
 use alloc::format;
 use alloc::vec;
 use alloc::vec::Vec;

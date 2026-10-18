@@ -14,7 +14,7 @@
 
 use bootloader_api::{BootInfo, entry_point};
 use core::panic::PanicInfo;
-use simplos::io::utils::qemu::{QemuExitCode, exit_qemu};
+use simplos::drivers::qemu::{QemuExitCode, exit_qemu};
 use simplos::{serial_print, serial_println};
 use spin::Lazy;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
@@ -24,7 +24,7 @@ static TEST_IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     unsafe {
         idt.double_fault
             .set_handler_fn(test_double_fault_handler)
-            .set_stack_index(simplos::io::interrupts::gdt::DOUBLE_FAULT_IST_INDEX);
+            .set_stack_index(simplos::arch::gdt::DOUBLE_FAULT_IST_INDEX);
     }
     idt
 });
@@ -46,7 +46,7 @@ fn main(_boot_info: &'static mut BootInfo) -> ! {
     // Only the GDT, not the whole `pre_init`: the IST entry it installs is what
     // is under test, and the IDT below has to be this test's own, with nothing
     // but a double fault handler.
-    simplos::io::interrupts::gdt::init_gdt();
+    simplos::arch::gdt::init_gdt();
     TEST_IDT.load();
 
     stack_overflow();

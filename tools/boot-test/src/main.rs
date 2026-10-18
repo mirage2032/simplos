@@ -10,7 +10,7 @@
 //!
 //! The guest's half of that conversation is `isa-debug-exit`: a device whose
 //! only function is that writing to its port makes QEMU exit with a status
-//! derived from the value written. `simplos::io::utils::qemu::exit_qemu` writes
+//! derived from the value written. `simplos::drivers::qemu::exit_qemu` writes
 //! it at the end of a passing run.
 //!
 //! A kernel whose file name starts with `shells` (`tests/shells.rs`) gets the

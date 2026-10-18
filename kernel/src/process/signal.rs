@@ -14,7 +14,7 @@
 //! real-time signals are kept as the others are, one of each at a time,
 //! where Linux queues them.
 
-use crate::io::interrupts::gdt;
+use crate::arch::gdt;
 use crate::process::{self, Process, Registers, Task};
 use crate::thread::{self, WaitQueue};
 use alloc::sync::Arc;

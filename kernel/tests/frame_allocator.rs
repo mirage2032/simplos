@@ -15,7 +15,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 use bootloader_api::{BootInfo, entry_point};
 use core::panic::PanicInfo;
-use simplos::memory::FRAMES;
+use simplos::mm::FRAMES;
 use x86_64::structures::paging::{FrameAllocator, FrameDeallocator};
 
 entry_point!(main, config = &simplos::BOOTLOADER_CONFIG);

@@ -1,7 +1,7 @@
 //! User programs: Linux x86-64 executables, run in ring 3 in an address space
 //! of their own. Each runs on threads of its own, one to start with and more
 //! as it makes them (`spawn_thread`), which share all of it but their
-//! registers, `fs` and signal mask; whose system calls `syscall.rs` handles;
+//! registers, `fs` and signal mask; whose system calls `syscall/` handles;
 //! and which a fault ends, with the rest of their program, without touching
 //! anything else. A program ends as its last thread does, or all at once with
 //! `exit_group` or a fatal signal. It can copy itself (`fork`), replace
@@ -16,14 +16,16 @@
 //!   0x7FFF_FBFF_0000     where the stack can grow down to, as it's used
 //!   0x7FFF_FFFF_0000     the top of the stack, which grows down. The 64 KiB above
 //!                        it are never mapped, so no `syscall` can sit at the very
-//!                        end of the lower half (see `syscall.rs`).
+//!                        end of the lower half (see `syscall/`).
 
-use crate::elf::{self, Elf, Source};
+pub mod elf;
+pub mod futex;
+pub mod init;
+pub mod signal;
+
+use crate::arch::gdt;
 use crate::fs;
-use crate::futex;
-use crate::io::interrupts::gdt;
-use crate::memory::{self, AddressSpace, Backing, Missing, USER_END};
-use crate::signal::{self, AltStack, Info, Signals, ThreadSignals};
+use crate::mm::{self, AddressSpace, Backing, Missing, USER_END};
 use crate::syscall;
 use crate::thread::{self, WaitQueue};
 use crate::time;
@@ -35,6 +37,8 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
+use elf::{Elf, Source};
+use signal::{AltStack, Info, Signals, ThreadSignals};
 use spin::Mutex;
 use x86_64::VirtAddr;
 use x86_64::instructions::interrupts;
@@ -288,7 +292,7 @@ impl Process {
             match copied {
                 Ok(()) => return Some(()),
                 Err(Missing::Never) => return None,
-                Err(Missing::Page(file, index)) => _read = Some(memory::read_page(file, index)?),
+                Err(Missing::Page(file, index)) => _read = Some(mm::read_page(file, index)?),
             }
         }
     }
@@ -302,7 +306,7 @@ impl Process {
             match faulted {
                 Ok(()) => return true,
                 Err(Missing::Never) => return false,
-                Err(Missing::Page(file, index)) => match memory::read_page(file, index) {
+                Err(Missing::Page(file, index)) => match mm::read_page(file, index) {
                     Some(page) => read = Some(page),
                     None => return false,
                 },
@@ -974,7 +978,7 @@ fn leave(status: i32) -> ! {
     let files = core::mem::take(&mut *process.files.lock());
     drop(files);
     drop(tree);
-    crate::locks::release_process(process.id, None);
+    crate::fs::locks::release_process(process.id, None);
     process.status.store(status, Ordering::Release);
     process.exited.wake_all();
     let (code, how) = match status & 0x7f {

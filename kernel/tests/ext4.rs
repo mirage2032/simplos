@@ -19,8 +19,8 @@ use alloc::vec::Vec;
 use bootloader_api::{BootInfo, entry_point};
 use core::panic::PanicInfo;
 use ext4::{Ext4, File, Kind};
+use simplos::drivers::disk;
 use simplos::fs::{self, ROOT};
-use simplos::io::disk;
 use simplos::thread::{self, spawn, yield_now};
 
 entry_point!(main, config = &simplos::BOOTLOADER_CONFIG);
@@ -88,12 +88,12 @@ fn long_paths_looked_up_are_not_kept() {
     // led: 16 MiB of them, more than the heap had free.
     let root = ROOT.lock();
     let fs = root.as_ref().expect("the ext4 disk, mounted");
-    let free = simplos::allocator::free();
+    let free = simplos::mm::heap::free();
     let long = format!("/{}", "x".repeat(250)).repeat(15);
     for i in 0..4096 {
         assert!(fs.metadata(&format!("{i}{long}")).is_err());
     }
-    let kept = free.saturating_sub(simplos::allocator::free());
+    let kept = free.saturating_sub(simplos::mm::heap::free());
     assert!(kept < 1 << 20, "{kept} bytes kept");
 }
 

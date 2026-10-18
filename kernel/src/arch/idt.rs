@@ -1,8 +1,8 @@
-use crate::io::interrupts::pic::InterruptIndex;
-use crate::io::interrupts::{gdt, pic};
-use crate::io::ps2::PS2_CONTROLLER;
+use crate::arch::pic::InterruptIndex;
+use crate::arch::{gdt, pic};
+use crate::drivers::ps2::PS2_CONTROLLER;
+use crate::process::signal::{SIGBUS, SIGFPE, SIGILL, SIGSEGV, SIGTRAP};
 use crate::process::{self, Registers};
-use crate::signal::{SIGBUS, SIGFPE, SIGILL, SIGSEGV, SIGTRAP};
 use crate::{serial_println, thread};
 use core::fmt;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -180,14 +180,14 @@ extern "sysv64" fn timer_interrupt_handler(frame: &TrapFrame) {
     crate::thread::timer_tick();
     // Back to a program, which may have been sent a signal meanwhile.
     if frame.cs & 3 == 3 {
-        crate::signal::on_interrupt_return(|| frame.registers());
+        crate::process::signal::on_interrupt_return(|| frame.registers());
     }
 }
 /// Keys go to `CONSOLE` as the Linux console sends them: Enter as `\r`,
 /// Backspace as DEL, Ctrl and a letter as its control character, and the
 /// arrows, the keys above them and the function keys as escape sequences.
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
-    use crate::io::console::{CONSOLE, CONSOLE_READERS};
+    use crate::tty::console::{CONSOLE, CONSOLE_READERS};
     use pc_keyboard::{DecodedKey, HandleControl, KeyCode, Keyboard, ScancodeSet1, layouts};
 
     static KEYBOARD: Lazy<Mutex<Keyboard<layouts::Us104Key, ScancodeSet1>>> = Lazy::new(|| {

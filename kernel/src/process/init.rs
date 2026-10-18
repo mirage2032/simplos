@@ -7,8 +7,8 @@
 //! through fw_cfg: `-fw_cfg name=opt/simplos/init,string=/bin/sh` for QEMU,
 //! or `none` for the kernel's shell.
 
+use crate::drivers::fwcfg;
 use crate::fs::Handle;
-use crate::io::fwcfg;
 use crate::process::{self, Process};
 use crate::tty::{Termios, Tty};
 use crate::{serial_println, syscall};

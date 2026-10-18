@@ -26,7 +26,7 @@ static HELD: AtomicUsize = AtomicUsize::new(0);
 
 /// How much more a pipe holding `len` bytes takes now.
 fn room(len: usize) -> usize {
-    let left = (crate::allocator::size() / 4).saturating_sub(HELD.load(Ordering::Relaxed));
+    let left = (crate::mm::heap::size() / 4).saturating_sub(HELD.load(Ordering::Relaxed));
     (CAPACITY - len).min(left.max(ALWAYS.saturating_sub(len)))
 }
 
@@ -208,7 +208,7 @@ fn pipes_together_take_no_more_than_a_quarter_of_the_heap() {
             break;
         }
     }
-    let quarter = crate::allocator::size() / 4;
+    let quarter = crate::mm::heap::size() / 4;
     let taken = HELD.load(Ordering::Relaxed) - held;
     assert!(taken <= quarter + 2 * CAPACITY, "{taken} of a quarter of {quarter}");
     // A pipe that has its 4 KiB is full, as poll says; read empty, it gives

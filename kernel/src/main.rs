@@ -11,12 +11,12 @@ use core::panic::PanicInfo;
 use simplos::BOOTLOADER_CONFIG;
 use simplos::CONSOLE;
 use simplos::DISPLAY;
-use simplos::io::console::{self, CONSOLE_READERS};
 use simplos::pre_init;
 use simplos::shell::Shell;
-use simplos::terminal::Terminal;
 use simplos::thread;
 use simplos::tty::Tty;
+use simplos::tty::console::{self, CONSOLE_READERS};
+use simplos::tty::terminal::Terminal;
 
 entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 #[allow(unreachable_code)]
@@ -57,7 +57,7 @@ fn start() -> ! {
         }
     })
     .expect("memory for the keyboard's thread");
-    simplos::init::run(&tty);
+    simplos::process::init::run(&tty);
     Shell::new(tty).run()
 }
 

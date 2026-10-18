@@ -13,8 +13,11 @@
 //! in its foreground: ^C, ^\ and ^Z typed send it SIGINT, SIGQUIT and
 //! SIGTSTP.
 
-use crate::pipe::ReadError;
-use crate::signal::{self, Info};
+pub mod console;
+pub mod terminal;
+
+use crate::fs::pipe::ReadError;
+use crate::process::signal::{self, Info};
 use crate::thread::{self, WaitQueue};
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;

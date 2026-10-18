@@ -1,7 +1,9 @@
-//! Lock-free console buffer for interrupt-safe logging
+//! The console's input, on its way to its terminal: the keys the keyboard
+//! interrupt pushes, as the Linux console sends them, and what the screen
+//! [`answer`]s programs with, until the console's reader takes them for its
+//! [`Tty`](crate::tty::Tty).
 //!
-//! Interrupts can push messages to this buffer without blocking.
-//! The main loop can drain and display these messages.
+//! Lock-free, so that the interrupt never waits for a thread.
 
 use crate::thread::WaitQueue;
 use alloc::string::String;

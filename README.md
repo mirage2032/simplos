@@ -55,8 +55,8 @@ and the vendored bootloader's `bios/stage-2/build.rs` so the UEFI minimum and th
 BIOS cap cannot drift apart.
 
 The runtime request is a different mechanism: the kernel reads
-`opt/simplos/fb` from QEMU's fw_cfg device (`kernel/src/io/fwcfg.rs`) and sets
-the mode itself through the Bochs VBE registers (`kernel/src/io/video/vbe.rs`).
+`opt/simplos/fb` from QEMU's fw_cfg device (`kernel/src/drivers/fwcfg.rs`) and sets
+the mode itself through the Bochs VBE registers (`kernel/src/drivers/video/vbe.rs`).
 
 **It can only make the framebuffer smaller.** The bootloader maps exactly
 `FrameBufferInfo::byte_len` bytes of video memory and nothing later maps more, so
@@ -71,7 +71,7 @@ One 1920x1080 image therefore serves everyone, the browser build included.
 At boot the kernel finds every hard disk on the legacy IDE channels (ATA PIO)
 and on any AHCI (SATA) controller on PCI, logs one `simplos: disk N: ...` line
 for each over serial, and shows the count on screen. Kernel code reads and
-writes raw 512-byte sectors with `io::disk::{list, read, write}`. Both drivers
+writes raw 512-byte sectors with `drivers::disk::{list, read, write}`. Both drivers
 poll, and neither knows which disk it booted from, so `write` will happily
 overwrite the boot image if told to.
 
@@ -122,7 +122,7 @@ the disk for a long time.
 The disk is trusted: lwext4 is C, parsing it in ring 0, and isn't fuzzed yet.
 
 What's read of a file is kept in memory, a page at a time, in the page cache
-(`cache.rs`): read again, it comes from there rather than the disk. Programs
+(`mm/page_cache.rs`): read again, it comes from there rather than the disk. Programs
 map its pages of their code, and of files they map read-only, all of them
 the same frames, so every program running uutils' coreutils, or linked to
 `libc.so`, has one copy of it between them. What's written goes to the file
@@ -136,7 +136,7 @@ out; and
 uutils' 14 MB `coreutils true` took 10 s before it and take 1 s; a second
 `gcc -O2` of a hello world, 10 s before and 0.7 s now.
 
-A program's memory is mapped as it's touched (`memory.rs`). `execve`,
+A program's memory is mapped as it's touched (`mm/`). `execve`,
 `mmap` and `brk` only note what each part of it holds, its code and data
 what part of which file, the rest zeros; a page is mapped the first time
 the program, or a system call for it, touches it, so a program reads in
@@ -170,14 +170,14 @@ Rust's `Command` makes to hear whether a program it forked failed to
 `exec`. `fadvise64` takes advice. The `*at` calls read `AT_FDCWD` as the
 `int` it is, as rustix passes it zero-extended. `preadv` and `pwritev`, and
 `preadv2` and `pwritev2` with their flags, read and write several buffers
-at an offset. Files lock as Linux's do (`locks.rs`): whole, with `flock`,
+at an offset. Files lock as Linux's do (`fs/locks.rs`): whole, with `flock`,
 each lock its open file's, as cargo locks its build; and in ranges of
 bytes, with `fcntl`'s `F_SETLK`, `F_SETLKW` and `F_GETLK`, each its
 process's and gone as it closes any descriptor of the file, as SQLite
 locks, or with the `F_OFD_` ones, its open file's. In the shell, `run cat /hello.txt` has the user program read it, and
 `run` lists its other modes.
 
-`/proc` is made as it's read (`proc.rs`), with the files Linux has there
+`/proc` is made as it's read (`fs/procfs.rs`), with the files Linux has there
 that busybox's `free`, `ps`, `top`, `df` and `mount` read: `meminfo`,
 `uptime`, `loadavg`, `stat`, `mounts` and `version`; `diskstats`, each
 disk's reads and writes since boot; `self`, a link to the
@@ -254,12 +254,12 @@ disk has the user program as `/bin/probe` (a `disk.img` made before this
 doesn't: delete it), so in the shell, `run spawn /bin/probe hello` has it
 run itself again.
 
-A program can have threads, as on Linux (`process.rs`): `clone` with
+A program can have threads, as on Linux (`process/`): `clone` with
 `CLONE_THREAD`, as musl's `pthread_create` and so Rust's `std::thread` ask
 for it, starts one that shares all of the program, its memory, descriptors,
 working directory and signal handlers, with an id (`gettid`), `fs`, SSE
 registers, signal mask and alternate stack of its own. Its threads wait on
-each other with `futex` (`futex.rs`): waits, wakes and requeues, timed or
+each other with `futex` (`process/futex.rs`): waits, wakes and requeues, timed or
 not, with bitsets, which musl's and Rust's mutexes, condition variables and
 `pthread_join` are made of; as a thread ends, `clone`'s
 `CLONE_CHILD_CLEARTID` or `set_tid_address` has 0 written to where it said
@@ -330,14 +330,14 @@ its hash maps' keys, and `/dev/random` and `/dev/urandom` give random bytes
 The screen is a terminal, and the keyboard types into it, as on Linux's
 console: a program's standard input, output and error are the terminal,
 `/dev/tty` too, and what it reads is what's typed. Between them is Linux's
-line discipline (`tty.rs`): in canonical mode, the default, a line is typed
+line discipline (`tty/`): in canonical mode, the default, a line is typed
 and edited first, with Backspace, ^U, ^W, and ^D for the end of file, and
 handed over on Enter; in raw mode each key is ready as it's pressed. A
 program reads and changes the settings, laid out as Linux's `termios`, with
 `ioctl` (`TCGETS`, `TCSETS` and the rest), and asks the size with
 `TIOCGWINSZ`.
 
-The screen (`terminal.rs`) keeps a grid of characters, each with its colours
+The screen (`tty/terminal.rs`) keeps a grid of characters, each with its colours
 and attributes, and a cursor; it draws only the rows that changed, and
 scrolls the whole screen by moving it. It understands the escape sequences
 the Linux console does, as its `linux` terminfo entry lists them, and
@@ -366,7 +366,7 @@ until ^D. For now:
 
 ## Signals
 
-Signals are Linux's (`signal.rs`): a program sends them with `kill`, to a
+Signals are Linux's (`process/signal.rs`): a program sends them with `kill`, to a
 process or a process group, and with `tkill` and `tgkill`, to a thread; its terminal sends ^C's
 SIGINT, ^\'s SIGQUIT and ^Z's SIGTSTP to the group in its foreground; and
 the kernel sends SIGCHLD as a child ends, stops or continues, and SIGPIPE

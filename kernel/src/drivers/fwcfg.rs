@@ -1,7 +1,7 @@
 //! QEMU's firmware configuration device.
 //!
 //! The only thing we ask it for is `opt/simplos/fb`, the framebuffer mode the
-//! host wants (see [`crate::io::video::resolve_mode`]). It is the one channel
+//! host wants (see [`crate::drivers::video::resolve_mode`]). It is the one channel
 //! that can tell a booted kernel something without rebuilding it: QEMU exposes
 //! anything passed as `-fw_cfg name=opt/...,string=...` as a named file here.
 //!

@@ -20,9 +20,10 @@ use alloc::vec::Vec;
 use bootloader_api::{BootInfo, entry_point};
 use core::panic::PanicInfo;
 use simplos::fs::{self, Handle, ROOT};
+use simplos::process::init;
 use simplos::process::{self, Process};
+use simplos::thread;
 use simplos::tty::Tty;
-use simplos::{init, thread};
 use spin::Mutex;
 
 entry_point!(main, config = &simplos::BOOTLOADER_CONFIG);
@@ -40,7 +41,7 @@ fn panic(info: &PanicInfo) -> ! {
 }
 
 /// What the first program gets, as `init` gives it.
-const ENVIRONMENT: [&str; 2] = simplos::init::ENVIRONMENT;
+const ENVIRONMENT: [&str; 2] = simplos::process::init::ENVIRONMENT;
 
 /// Run `argv` on a terminal no one types on: how it ended, and what it
 /// wrote, newlines as they are.

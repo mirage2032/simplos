@@ -1,3 +1,6 @@
+pub mod heap;
+pub mod page_cache;
+
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -48,7 +51,7 @@ static KERNEL_PML4: Once<PhysFrame> = Once::new();
 /// on it, so that freeing a program's page tables never pulls them out from
 /// under whoever is running.
 pub fn use_kernel_page_table() {
-    let kernel = *KERNEL_PML4.get().expect("memory::init ran");
+    let kernel = *KERNEL_PML4.get().expect("mm::init ran");
     if Cr3::read().0 != kernel {
         // Safety: the kernel's page table maps everything the kernel uses.
         unsafe { Cr3::write(kernel, Cr3Flags::empty()) };
@@ -115,7 +118,7 @@ const STACK_PAGES: u64 = 20;
 /// must be done again, or kept, the second time.
 fn reclaiming<T>(mut attempt: impl FnMut() -> Option<T>) -> Option<T> {
     attempt().or_else(|| {
-        crate::cache::shrink();
+        crate::mm::page_cache::shrink();
         attempt()
     })
 }
@@ -290,7 +293,7 @@ pub struct Read {
 
 impl Drop for Read {
     fn drop(&mut self) {
-        crate::cache::release(self.frame);
+        crate::mm::page_cache::release(self.frame);
         crate::fs::close_later(self.file.clone());
     }
 }
@@ -301,7 +304,7 @@ impl Drop for Read {
 pub fn read_page(file: Arc<ext4::File>, index: u64) -> Option<Read> {
     let frame = {
         let _tree = crate::fs::lock();
-        crate::cache::page(&file, index)
+        crate::mm::page_cache::page(&file, index)
     };
     match frame {
         Ok(frame) => Some(Read { file, index, frame }),
@@ -452,7 +455,7 @@ impl AddressSpace {
                 FRAMES.lock().as_mut().ok_or(Missing::Never)?.hold(read.frame);
                 read.frame
             }
-            _ => match crate::cache::kept(&file, index(at)) {
+            _ => match crate::mm::page_cache::kept(&file, index(at)) {
                 Some(frame) => frame,
                 None => return Err(Missing::Page(file, index(at))),
             },
@@ -462,7 +465,7 @@ impl AddressSpace {
             self.map_shared(page, frame, flags).ok_or(Missing::Never)?;
             // And so are those around it the cache has, which the program
             // will likely touch next, rather than with a fault each.
-            let window = crate::cache::AHEAD * 4096;
+            let window = crate::mm::page_cache::AHEAD * 4096;
             let first = (at / window * window).max(start);
             let last = (at / window * window + window).min(end).min(data_end / 4096 * 4096);
             for near in (first..last).step_by(4096) {
@@ -470,7 +473,8 @@ impl AddressSpace {
                 if self.mapped(near).is_some() {
                     continue;
                 }
-                let Some(frame) = crate::cache::kept(&file, index(near.start_address().as_u64()))
+                let Some(frame) =
+                    crate::mm::page_cache::kept(&file, index(near.start_address().as_u64()))
                 else {
                     continue;
                 };
@@ -492,7 +496,7 @@ impl AddressSpace {
             // Safety: the cache's frame, held, and the page's own, just mapped.
             unsafe { core::ptr::copy_nonoverlapping(from, to, len) };
         }
-        crate::cache::release(frame);
+        crate::mm::page_cache::release(frame);
         mapped.ok_or(Missing::Never)
     }
 

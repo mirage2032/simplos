@@ -6,10 +6,10 @@
 //! shortcut: no /proc/PID/maps, environ or the like; add them as programs
 //! ask for them.
 
-use crate::io::disk;
+use crate::drivers::disk;
 use crate::process::{self, CPU_TIME, Process};
 use crate::time::{self, NANOS, TICK};
-use crate::{memory, thread};
+use crate::{mm, thread};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -142,10 +142,10 @@ fn root() -> Vec<DirEntry> {
 /// what the page cache keeps, which it gives back as it's needed, but for
 /// what programs map.
 fn meminfo() -> String {
-    let (total, free) = memory::FRAMES.lock().as_ref().map_or((0, 0), |frames| frames.memory());
+    let (total, free) = mm::FRAMES.lock().as_ref().map_or((0, 0), |frames| frames.memory());
     // Files' pages, kept: given back as memory's needed, as far as programs
     // don't map them.
-    let cached = crate::cache::pages() as u64 * 4096;
+    let cached = crate::mm::page_cache::pages() as u64 * 4096;
     let lines = [
         ("MemTotal", total),
         ("MemFree", free),

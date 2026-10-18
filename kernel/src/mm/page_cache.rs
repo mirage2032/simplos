@@ -1,7 +1,7 @@
 //! The page cache: what's in files, a page at a time as it's read, kept in
 //! frames of its own, so that what's read again comes from memory rather
 //! than the disk, and programs that map the same page of a file share one
-//! frame (`memory::SHARED`), as programs' code is mapped as they start.
+//! frame (`mm::SHARED`), as programs' code is mapped as they start.
 //! What's written goes to the file as it's written, and into whatever pages
 //! of it are kept: ext4 tells of every change to a file, whoever makes it
 //! (`changed`).
@@ -13,7 +13,7 @@
 //! cache's index, which the kernel's heap holds, stays the size `MOST`
 //! makes it, and nothing it does takes more of the heap besides.
 
-use crate::memory::{self, FRAMES};
+use crate::mm::{self, FRAMES};
 use alloc::collections::BTreeMap;
 use alloc::vec;
 use ext4::{Change, Error, File};
@@ -208,7 +208,7 @@ fn fill(file: &File, index: u64) -> Result<PhysFrame, Error> {
 
 /// The 4 KiB in `frame`, through the physical-memory map.
 fn bytes(frame: PhysFrame) -> *mut [u8; PAGE as usize] {
-    memory::phys_ptr(frame.start_address()).expect("physical memory is mapped").cast()
+    mm::phys_ptr(frame.start_address()).expect("physical memory is mapped").cast()
 }
 
 /// Let go of `frame`, a shared one.
@@ -318,9 +318,8 @@ fn forget_oldest(count: usize, idle: bool) {
     let mut frames = FRAMES.lock();
     let Some(frames) = frames.as_mut() else { return };
     let Cache { pages, clock, .. } = &mut *cache;
-    let wanted = |page: &Page, frames: &memory::BootInfoFrameAllocator| {
-        !idle || frames.holders(page.frame) == 1
-    };
+    let wanted =
+        |page: &Page, frames: &mm::BootInfoFrameAllocator| !idle || frames.holders(page.frame) == 1;
     let Some(oldest) =
         pages.values().filter(|page| wanted(page, frames)).map(|page| page.used).min()
     else {

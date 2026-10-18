@@ -35,7 +35,7 @@ pub trait Source {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Option<()>;
 
     /// Its file on the disk, if it's one's, for its pages to be mapped from
-    /// as they're touched (`memory::Backing::File`).
+    /// as they're touched (`mm::Backing::File`).
     fn file(&self) -> Option<Arc<ext4::File>> {
         None
     }

@@ -10,7 +10,7 @@
 # for the library's own tests); without that line, all of them boot:
 #
 #     Test: signals tty
-#     diff --git a/kernel/src/signal.rs b/kernel/src/signal.rs
+#     diff --git a/kernel/src/process/signal.rs b/kernel/src/process/signal.rs
 #     ...
 #
 # The changes are made to the code as it is on disk, committed or not, in a
