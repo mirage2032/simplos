@@ -342,7 +342,8 @@ fn make_ext4(image: &Path, setup: &Setup) -> Result<(), Box<dyn Error + Send + S
     }
     // compinit's record of their completions, once they're all in.
     let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let recorded = Command::new(repository.join("user/ports/completions.sh")).arg(&tree).status()?;
+    let recorded =
+        Command::new(repository.join("user/ports/completions.sh")).arg(&tree).status()?;
     if !recorded.success() {
         return Err(format!("user/ports/completions.sh failed ({recorded})").into());
     }
