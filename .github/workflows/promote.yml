@@ -91,7 +91,7 @@ jobs:
         with:
           cache: images
           targets: |
-            fullkernel/target
+            tools/target
             vendor/bootloader/target
 
       - name: Check there's something to promote
@@ -118,16 +118,16 @@ jobs:
           echo "v$next (since ${previous:-the start})"
 
       # Both crates carry the release version, and their locks follow because
-      # fullkernel depends on the kernel by path. Nothing else may change.
+      # tools/boot depends on the kernel by path. Nothing else may change.
       - name: Bump the version
         env:
           NEXT: ${{ steps.version.outputs.next }}
         run: |
-          for crate in kernel fullkernel; do
+          for crate in kernel tools/boot; do
             sed -i -E "0,/^version = \"[^\"]*\"$/s//version = \"$NEXT\"/" "$crate/Cargo.toml"
-            # Both from inside the crate: fullkernel's manifest uses an artifact
+            # Both from inside the crate: tools/boot's manifest uses an artifact
             # dependency, which cargo refuses to even parse without the `bindeps`
-            # setting in that crate's own .cargo/config.toml.
+            # setting in the tools workspace's .cargo/config.toml.
             (
               cd "$crate"
               cargo update --workspace
@@ -137,8 +137,8 @@ jobs:
               fi
             )
           done
-          expected="fullkernel/Cargo.lock fullkernel/Cargo.toml kernel/Cargo.lock kernel/Cargo.toml"
-          if [[ $(git diff --name-only | sort | xargs) != "$expected" ]]; then
+          expected="kernel/Cargo.lock kernel/Cargo.toml tools/Cargo.lock tools/boot/Cargo.toml"
+          if [[ $(git diff --name-only | LC_ALL=C sort | xargs) != "$expected" ]]; then
             echo "::error::The bump changed more than the versions:"; git diff --stat; exit 1
           fi
 

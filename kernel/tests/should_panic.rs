@@ -10,7 +10,7 @@
 
 use bootloader_api::{BootInfo, entry_point};
 use core::panic::PanicInfo;
-use simplos::io::utils::qemu::{QemuExitCode, exit_qemu};
+use simplos::drivers::qemu::{QemuExitCode, exit_qemu};
 use simplos::{serial_print, serial_println};
 
 entry_point!(main, config = &simplos::BOOTLOADER_CONFIG);

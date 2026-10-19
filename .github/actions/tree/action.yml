@@ -30,7 +30,7 @@ runs:
     - id: key
       shell: bash
       env:
-        KEY: ${{ inputs.name }}-${{ hashFiles(format('scripts/{0}.sh', inputs.name)) }}
+        KEY: ${{ inputs.name }}-${{ hashFiles(format('user/ports/{0}.sh', inputs.name)) }}
       run: |
         echo "key=$KEY" >>"$GITHUB_OUTPUT"
         echo "artifact=tree-$KEY.tar.zst" >>"$GITHUB_OUTPUT"
@@ -80,7 +80,7 @@ runs:
         find "$RUNNER_TEMP/tree" -type f -name "$ARTIFACT" -exec tar -C target -I zstd -xf {} \;
         rm -rf "$RUNNER_TEMP/tree"
         # What the script would have built, as its stamp says.
-        [[ $(cat "target/$NAME/built") == $(sha256sum "scripts/$NAME.sh" | cut -d' ' -f1) ]]
+        [[ $(cat "target/$NAME/built") == $(sha256sum "user/ports/$NAME.sh" | cut -d' ' -f1) ]]
 
     # Or build it, with an older build's downloads if there is one.
     - if: inputs.mode == 'build' && steps.built.outputs.run == ''
@@ -96,7 +96,7 @@ runs:
       shell: bash
       env:
         NAME: ${{ inputs.name }}
-      run: scripts/$NAME.sh
+      run: user/ports/$NAME.sh
 
     # Tar, not the artifact's zip, which would lose the trees' links and modes.
     - if: >-

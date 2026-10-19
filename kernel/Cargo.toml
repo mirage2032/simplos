@@ -37,7 +37,7 @@ ps2 = "0.2.0"
 embedded-graphics = "0.8.1"
 linked_list_allocator = "0.10.5"
 acpi = "5.2.0"
-ext4 = { path = "../fs/ext4" }
+ext4 = { path = "../lib/ext4" }
 [[test]]
 name = "should_panic"
 harness = false

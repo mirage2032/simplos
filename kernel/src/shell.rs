@@ -2,11 +2,12 @@
 //! the console's, whose line discipline has done the editing, and writes
 //! what the commands say back to it.
 
-use crate::io::interrupts::idt::TIMER_COUNTER;
-use crate::io::interrupts::pit::TIMER_HZ;
-use crate::io::{disk, hpet};
+use crate::arch::idt::TIMER_COUNTER;
+use crate::arch::pit::TIMER_HZ;
+use crate::drivers::{disk, hpet};
+use crate::process::{self, init};
 use crate::tty::Tty;
-use crate::{fs, init, process, syscall};
+use crate::{fs, syscall};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;

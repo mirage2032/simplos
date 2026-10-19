@@ -28,7 +28,7 @@ runs:
         cache: false
         # Not the action's `deny`, for every cargo build there is: the
         # bootloader's own builds of its stages, uutils' in
-        # scripts/userland.sh. Lint gives clippy -D warnings itself.
+        # user/ports/userland.sh. Lint gives clippy -D warnings itself.
         build-warnings: ""
 
     # -Zbuild-std's crates are path dependencies, which cargo judges by their

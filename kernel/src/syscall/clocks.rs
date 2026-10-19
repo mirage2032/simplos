@@ -3,8 +3,8 @@
 
 use super::files::{Result, ret};
 use super::{EFAULT, EINVAL};
+use crate::process::signal;
 use crate::process::{Process, Times};
-use crate::signal;
 use crate::thread;
 use crate::time::{self, Alarm, MOST_TIMERS, NANOS, TICK, Timer};
 use core::sync::atomic::Ordering::Relaxed;
@@ -69,7 +69,8 @@ pub fn clock_getres(process: &Process, clock: u64, timespec: u64) -> i64 {
                 | CLOCK_REALTIME_COARSE
                 | CLOCK_MONOTONIC_COARSE
         );
-        let resolution = if fine && crate::io::hpet::elapsed_nanos().is_some() { 1 } else { TICK };
+        let resolution =
+            if fine && crate::drivers::hpet::elapsed_nanos().is_some() { 1 } else { TICK };
         if timespec != 0 {
             put(process, timespec, &split(resolution, false))?;
         }

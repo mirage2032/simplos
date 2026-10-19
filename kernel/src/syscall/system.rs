@@ -6,7 +6,7 @@ use super::files::{Result, ret, string_at};
 use super::signals::other;
 use super::{EFAULT, EINVAL, EPERM};
 use crate::process::{self, Process, Task};
-use crate::{memory, serial_println, time};
+use crate::{mm, serial_println, time};
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -73,7 +73,7 @@ pub fn getrandom(process: &Process, buf: u64, len: u64, flags: u64) -> i64 {
 /// `sysinfo`'s `struct sysinfo`: seconds since boot, the memory there is and
 /// is free, and how many processes, in bytes. Load averages and swap are 0.
 pub fn sysinfo(process: &Process, info: u64) -> i64 {
-    let (total, free) = memory::FRAMES.lock().as_ref().map_or((0, 0), |frames| frames.memory());
+    let (total, free) = mm::FRAMES.lock().as_ref().map_or((0, 0), |frames| frames.memory());
     let mut sysinfo = [0u8; 112];
     sysinfo[..8].copy_from_slice(&(time::since_boot() / time::NANOS).to_le_bytes());
     sysinfo[32..40].copy_from_slice(&total.to_le_bytes());

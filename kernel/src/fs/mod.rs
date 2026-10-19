@@ -1,0 +1,741 @@
+//! File systems, as one tree: at the root, the first ext4 disk found, mounted
+//! to read and write by [`init`], or with no disk an empty directory that
+//! can't be written; and at /dev, the devices.
+//!
+//! Every call into them, through a path or through an open file, holds
+//! [`ROOT`]'s lock ([`lock`]), and whoever waits for it sleeps.
+
+pub mod locks;
+pub mod pipe;
+pub mod procfs;
+
+use crate::drivers::disk;
+use crate::process::elf;
+use crate::serial_println;
+use crate::thread::{self, SleepLock, SleepLockGuard};
+use crate::tty::Tty;
+use alloc::boxed::Box;
+use alloc::collections::VecDeque;
+use alloc::string::String;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use ext4::{BlockDevice, DirEntry, Error, Ext4, Kind, Metadata};
+
+/// The mounted file system, if a disk had one. Calls into it can wait on the
+/// disk for a long time, so whoever waits for them sleeps.
+pub static ROOT: SleepLock<Option<Ext4>> = SleepLock::new(None);
+
+/// One of `drivers::disk`'s disks, by its number.
+struct Disk {
+    index: usize,
+    sectors: u64,
+}
+
+impl BlockDevice for Disk {
+    fn sectors(&self) -> u64 {
+        self.sectors
+    }
+
+    fn read(&mut self, sector: u64, buf: &mut [u8]) -> Result<(), ext4::Error> {
+        disk::read(self.index, sector, buf).map_err(|_| ext4::Error::Io)
+    }
+
+    fn write(&mut self, sector: u64, buf: &[u8]) -> Result<(), ext4::Error> {
+        disk::write(self.index, sector, buf).map_err(|_| ext4::Error::Io)
+    }
+}
+
+/// Mount the first disk with an ext4 (or ext3, or ext2) file system on it,
+/// replaying its journal if it needs it. Disks without one are left alone:
+/// mounting reads their superblock, and gives up there.
+pub fn init() {
+    ext4::set_clock(|| (crate::time::now() / crate::time::NANOS) as u32);
+    // Small writes wait in memory to be made as one (see `ext4`): a second
+    // at most, so the power going loses no more. If they can't be made, the
+    // program's next fsync is told. And a second in which nothing was done
+    // on the disk, its journal's changes are written where they go, so the
+    // power going then leaves nothing to replay. Once, however often the
+    // disk is mounted again.
+    static WRITER: spin::Once = spin::Once::new();
+    WRITER.call_once(|| {
+        thread::spawn(|| {
+            loop {
+                thread::sleep(1000);
+                lock().flush();
+            }
+        })
+        .expect("memory for the disk's writer");
+    });
+    for (index, info) in disk::list().into_iter().enumerate() {
+        match Ext4::mount_writable(Box::new(Disk { index, sectors: info.sectors })) {
+            Ok(fs) => {
+                serial_println!("simplos: ext4 on disk {}", index);
+                fs.watch(crate::mm::page_cache::changed);
+                crate::mm::page_cache::clear();
+                *ROOT.lock() = Some(fs);
+                return;
+            }
+            // Said so, or it looks as if there were no ext4 disk at all.
+            Err(error) if is_ext4(index) => {
+                serial_println!("simplos: disk {}: ext4 that won't mount: {:?}", index, error);
+            }
+            Err(_) => {}
+        }
+    }
+}
+
+/// Whether disk `index` has ext4's (or ext3's, or ext2's) magic number,
+/// 56 bytes into the superblock, which is 1 KiB in.
+fn is_ext4(index: usize) -> bool {
+    let mut sector = [0; disk::SECTOR];
+    disk::read(index, 2, &mut sector).is_ok() && sector[56..58] == 0xef53u16.to_le_bytes()
+}
+
+/// Unmount it, leaving the disk clean: before the machine goes off.
+pub fn unmount() {
+    let mut root = ROOT.lock();
+    // What waits to be closed first: each holds on to the mount.
+    drop(core::mem::take(&mut *CLOSING.lock()));
+    root.take();
+    drop(root);
+    crate::mm::page_cache::clear();
+}
+
+/// What a file descriptor refers to. Copies of a descriptor share one, and
+/// with it the place they're at in a file.
+pub enum Handle {
+    /// A terminal: standard input, output and error, and /dev/tty.
+    Tty {
+        tty: Arc<Tty>,
+        /// O_NONBLOCK: a read that would wait fails instead.
+        nonblocking: AtomicBool,
+    },
+    /// /dev/null: nothing to read, and what's written goes nowhere.
+    Null,
+    /// /dev/zero: as many zeros as are read, and what's written goes nowhere.
+    Zero,
+    /// /dev/random and /dev/urandom, which have been the same since Linux
+    /// 5.6: as many random bytes as are read (`random::fill`), and what's
+    /// written goes nowhere.
+    Random { urandom: bool },
+    Pipe {
+        end: crate::fs::pipe::PipeEnd,
+        /// O_NONBLOCK: a read or write that would wait fails instead.
+        nonblocking: AtomicBool,
+    },
+    /// One of a pair of connected sockets, as `socketpair` makes them: a
+    /// pipe each way, what's written into one read out of the other.
+    ///
+    /// shortcut: datagram and sequenced-packet sockets as stream ones, the
+    /// messages written into them not kept apart; nothing reads more than
+    /// one at a time from them here, as Rust's `Command` doesn't.
+    Socket {
+        input: crate::fs::pipe::PipeEnd,
+        output: crate::fs::pipe::PipeEnd,
+        nonblocking: AtomicBool,
+    },
+    File {
+        /// Shared with the parts of programs' memory it's mapped into.
+        file: Arc<ext4::File>,
+        read: bool,
+        write: bool,
+        /// Every write goes at the end.
+        append: bool,
+        /// O_SYNC's or O_DSYNC's bits, as it was opened with them: every
+        /// write is on the disk before it returns.
+        sync: u64,
+        offset: AtomicU64,
+    },
+    /// A file in /proc, as it was when it was opened.
+    Proc {
+        /// From the root.
+        path: String,
+        data: Vec<u8>,
+        offset: AtomicU64,
+    },
+    Dir {
+        /// The disk's handle on it, if it's on the disk.
+        dir: Option<ext4::Dir>,
+        /// As they were when it was opened, with what's mounted in it.
+        entries: Vec<DirEntry>,
+        /// From the root, for paths relative to it (`openat` and the like).
+        path: String,
+        /// The next entry `getdents64` hands out.
+        next: AtomicUsize,
+    },
+}
+
+impl Drop for Handle {
+    /// The last of an open file's descriptors closed: its `flock` and
+    /// F_OFD_SETLK locks go; a directory's entries no longer count.
+    fn drop(&mut self) {
+        match self {
+            Handle::File { .. } => crate::fs::locks::release_open(self as *const Handle as usize),
+            Handle::Dir { entries, .. } => {
+                DIRS_HELD.fetch_sub(held(entries), Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// What open directories' entries take of the heap, all together: kept to a
+/// quarter of it, as pipes' is, or a program opening a big directory again
+/// and again, and never closing it, would fill it.
+static DIRS_HELD: AtomicUsize = AtomicUsize::new(0);
+
+fn held(entries: &[DirEntry]) -> usize {
+    entries.iter().map(|entry| size_of::<DirEntry>() + entry.name.len()).sum()
+}
+
+impl Handle {
+    /// The directory at `path`, open on `entries`; ENOMEM once open
+    /// directories hold as much as they may.
+    pub fn dir(
+        dir: Option<ext4::Dir>,
+        entries: Vec<DirEntry>,
+        path: String,
+    ) -> Result<Handle, Error> {
+        let bytes = held(&entries);
+        if DIRS_HELD.fetch_add(bytes, Ordering::Relaxed) + bytes > crate::mm::heap::size() / 4 {
+            DIRS_HELD.fetch_sub(bytes, Ordering::Relaxed);
+            return Err(Error::OutOfMemory);
+        }
+        Ok(Handle::Dir { dir, entries, path, next: AtomicUsize::new(0) })
+    }
+
+    pub fn tty(tty: Arc<Tty>) -> Handle {
+        Handle::Tty { tty, nonblocking: AtomicBool::new(false) }
+    }
+
+    pub fn pipe(end: crate::fs::pipe::PipeEnd) -> Handle {
+        Handle::Pipe { end, nonblocking: AtomicBool::new(false) }
+    }
+
+    pub fn socket(input: crate::fs::pipe::PipeEnd, output: crate::fs::pipe::PipeEnd) -> Handle {
+        Handle::Socket { input, output, nonblocking: AtomicBool::new(false) }
+    }
+
+    /// Its O_NONBLOCK, for what can make a program wait: none for the rest.
+    pub fn nonblocking(&self) -> Option<&AtomicBool> {
+        match self {
+            Handle::Tty { nonblocking, .. }
+            | Handle::Pipe { nonblocking, .. }
+            | Handle::Socket { nonblocking, .. } => Some(nonblocking),
+            _ => None,
+        }
+    }
+}
+
+/// What's in /dev: each device's name and inode number. The numbers are
+/// ones ext4 keeps for itself and never shows (its bad-blocks list, quotas
+/// and boot loader), so no file on the disk has them.
+///
+/// shortcut: just these; device nodes on the disk aren't looked at.
+const DEVICES: [(&str, u32); 5] =
+    [("null", 3), ("random", 6), ("tty", 4), ("urandom", 7), ("zero", 5)];
+/// /dev's own.
+const DEV_INODE: u32 = 1;
+
+#[derive(Clone, Copy)]
+pub enum Device {
+    Null,
+    Zero,
+    /// The terminal of whoever opens it.
+    Tty,
+    Random,
+    Urandom,
+}
+
+/// /dev's links to /dev/fd's, as Linux has them to /proc/self/fd's.
+fn dev_link(name: &str) -> Option<&'static str> {
+    match name {
+        "stdin" => Some("fd/0"),
+        "stdout" => Some("fd/1"),
+        "stderr" => Some("fd/2"),
+        _ => None,
+    }
+}
+
+/// What the descriptor at `path` is open on, if it's open: /dev/fd/N, the
+/// calling program's descriptor N, or /proc/PID/fd/N, process PID's.
+/// Opening it is `dup`'s, as FreeBSD's fdescfs has it, where Linux opens the
+/// file anew, with a place of its own in it.
+pub fn descriptor(path: &str) -> Option<Arc<Handle>> {
+    let (process, fd) = match on(path) {
+        On::Devices(name) => (crate::thread::current_process()?, name.strip_prefix("fd/")?),
+        On::Proc(within) => {
+            let (id, fd) = within.split_once("/fd/")?;
+            (crate::process::find(id.parse().ok()?)?, fd)
+        }
+        On::Disk => return None,
+    };
+    let fd: usize = fd.parse().ok()?;
+    let files = process.files.lock();
+    files.get(fd)?.as_ref().map(|fd| fd.handle.clone())
+}
+
+/// Where the link /dev/fd/N or /proc/PID/fd/N to `handle` leads, as on
+/// Linux: the path it was opened by, or what it is.
+///
+/// shortcut: none for a file on the disk, whose handle doesn't keep the
+/// path; add it there when something reads it.
+pub fn link_to(handle: &Handle) -> Option<String> {
+    let path = match handle {
+        Handle::Tty { .. } => "/dev/tty",
+        Handle::Null => "/dev/null",
+        Handle::Zero => "/dev/zero",
+        Handle::Random { urandom: false } => "/dev/random",
+        Handle::Random { urandom: true } => "/dev/urandom",
+        Handle::Pipe { .. } => "pipe:[0]",
+        Handle::Socket { .. } => "socket:[0]",
+        Handle::Proc { path, .. } | Handle::Dir { path, .. } => {
+            return Some(alloc::format!("/{path}"));
+        }
+        Handle::File { .. } => return None,
+    };
+    Some(path.into())
+}
+
+/// The device at `path`, a path from the root, if it's one.
+pub fn device(path: &str) -> Option<Device> {
+    match on(path) {
+        On::Devices("null") => Some(Device::Null),
+        On::Devices("zero") => Some(Device::Zero),
+        On::Devices("tty") => Some(Device::Tty),
+        On::Devices("random") => Some(Device::Random),
+        On::Devices("urandom") => Some(Device::Urandom),
+        _ => None,
+    }
+}
+
+/// What a device is, as `stat` tells it.
+fn device_metadata(device: Device) -> Metadata {
+    let (inode, mode) = match device {
+        Device::Null => (3, 0o020666),
+        Device::Zero => (5, 0o020666),
+        Device::Tty => (4, 0o020620),
+        Device::Random => (6, 0o020666),
+        Device::Urandom => (7, 0o020666),
+    };
+    special_metadata(inode, mode)
+}
+
+/// What a handle that isn't a file on the disk is, as `stat` tells it.
+pub fn special(handle: &Handle) -> Option<Metadata> {
+    match handle {
+        Handle::Tty { .. } => Some(device_metadata(Device::Tty)),
+        Handle::Null => Some(device_metadata(Device::Null)),
+        Handle::Zero => Some(device_metadata(Device::Zero)),
+        Handle::Random { urandom: false } => Some(device_metadata(Device::Random)),
+        Handle::Random { urandom: true } => Some(device_metadata(Device::Urandom)),
+        // A FIFO.
+        Handle::Pipe { .. } => Some(special_metadata(0, 0o010600)),
+        Handle::Socket { .. } => Some(special_metadata(0, 0o140777)),
+        Handle::File { .. } | Handle::Dir { .. } | Handle::Proc { .. } => None,
+    }
+}
+
+/// Devices and pipes: their type goes in `permissions`, as ext4's `Kind`
+/// has nothing for them.
+fn special_metadata(inode: u32, mode: u32) -> Metadata {
+    Metadata { kind: Kind::Other, links: 1, ..directory(inode, mode) }
+}
+
+/// A directory that isn't on the disk.
+fn directory(inode: u32, permissions: u32) -> Metadata {
+    Metadata {
+        inode,
+        kind: Kind::Directory,
+        permissions,
+        links: 2,
+        uid: 0,
+        gid: 0,
+        size: 0,
+        blocks: 0,
+        accessed: 0,
+        modified: 0,
+        changed: 0,
+    }
+}
+
+/// Which file system a path from the root is on: the devices or /proc,
+/// with the path within (`""` for /dev or /proc itself), or else the disk.
+enum On<'p> {
+    Devices(&'p str),
+    Proc(&'p str),
+    Disk,
+}
+
+fn on(path: &str) -> On<'_> {
+    let within = |name: &str| match path.strip_prefix(name)? {
+        "" => Some(""),
+        rest => rest.strip_prefix('/'),
+    };
+    match (within("dev"), within("proc")) {
+        (Some(rest), _) => On::Devices(rest),
+        (_, Some(rest)) => On::Proc(rest),
+        _ => On::Disk,
+    }
+}
+
+/// The whole tree, held: every call into a file system holds it, so that
+/// what a system call looks at stays as it was while it acts on it.
+pub fn lock() -> Tree<'static> {
+    Tree { disk: ROOT.lock() }
+}
+
+pub struct Tree<'a> {
+    disk: SleepLockGuard<'a, Option<Ext4>>,
+}
+
+impl Drop for Tree<'_> {
+    /// Close what `close_later` was given, while the tree is still held.
+    fn drop(&mut self) {
+        let files = core::mem::take(&mut *CLOSING.lock());
+        drop(files);
+    }
+}
+
+/// Files let go of where the tree couldn't be taken: by a program's memory,
+/// as the parts of it a file is mapped into go (`mm::Backing`).
+static CLOSING: spin::Mutex<Vec<Arc<ext4::File>>> = spin::Mutex::new(Vec::new());
+
+/// Let go of `file` the next time the tree is: closing it, if no one else
+/// holds it, as a call into the file system is made, with the tree held.
+/// For where it can't be taken, as it mustn't be waited for with a
+/// program's memory held; the disk's writer takes it every second.
+pub fn close_later(file: Arc<ext4::File>) {
+    CLOSING.lock().push(file);
+}
+
+impl Tree<'_> {
+    /// Write what waits in memory: once this returns, every change is on
+    /// the disk; an error if any that waited couldn't be written, since the
+    /// last time this said.
+    pub fn sync(&self) -> Result<(), Error> {
+        self.disk.as_ref().map_or(Ok(()), Ext4::sync)
+    }
+
+    /// Write what waits in memory, as `sync` does, leaving telling whether
+    /// it could be to it.
+    pub fn flush(&self) {
+        if let Some(disk) = self.disk.as_ref() {
+            disk.flush();
+        }
+    }
+
+    /// What's at `path`, a path from the root.
+    pub fn metadata(&self, path: &str) -> Result<Metadata, Error> {
+        if let Some(handle) = descriptor(path) {
+            return self.handle_metadata(&handle);
+        }
+        match on(path) {
+            On::Devices("") => Ok(directory(DEV_INODE, 0o755)),
+            On::Devices("fd") => Ok(directory(procfs::inode(path), 0o555)),
+            On::Devices(name) if let Some(target) = dev_link(name) => {
+                Ok(procfs::Node::Link(target.into()).metadata(path))
+            }
+            On::Devices(_) => device(path).map(device_metadata).ok_or(Error::NotFound),
+            On::Proc(within) => {
+                let node = procfs::node(within, self.disk.as_ref()).ok_or(Error::NotFound)?;
+                Ok(node.metadata(path))
+            }
+            On::Disk => match self.disk.as_ref() {
+                Some(disk) => disk.metadata(path),
+                // The empty root, with ext4's root's inode number.
+                None if path.is_empty() => Ok(directory(2, 0o755)),
+                None => Err(Error::NotFound),
+            },
+        }
+    }
+
+    /// The directory at `path`: the disk's handle on it if it's on the disk,
+    /// and what's in it, with whatever is mounted there.
+    pub fn open_dir(&self, path: &str) -> Result<(Option<ext4::Dir>, Vec<DirEntry>), Error> {
+        let (dir, mut entries) = match on(path) {
+            On::Devices("") => {
+                let entry = |(name, inode): (&str, u32)| DirEntry {
+                    name: name.into(),
+                    kind: Kind::Other,
+                    inode,
+                };
+                let mut entries: Vec<DirEntry> = DEVICES.into_iter().map(entry).collect();
+                let named = |name: &str, kind| DirEntry {
+                    name: name.into(),
+                    kind,
+                    inode: procfs::inode(&alloc::format!("dev/{name}")),
+                };
+                entries.push(named("fd", Kind::Directory));
+                for name in ["stdin", "stdout", "stderr"] {
+                    entries.push(named(name, Kind::Symlink));
+                }
+                (None, entries)
+            }
+            On::Devices("fd") => match crate::thread::current_process() {
+                Some(process) => (None, procfs::descriptors(&process, path)),
+                None => (None, Vec::new()),
+            },
+            On::Devices(_) => {
+                return Err(self.metadata(path).err().unwrap_or(Error::NotADirectory));
+            }
+            On::Proc(within) => match procfs::node(within, self.disk.as_ref()) {
+                Some(procfs::Node::Dir(entries)) => (None, entries),
+                Some(_) => return Err(Error::NotADirectory),
+                None => return Err(Error::NotFound),
+            },
+            On::Disk => match self.disk.as_ref() {
+                Some(disk) => {
+                    let mut dir = disk.open_dir(path)?;
+                    let entries = dir.take_entries();
+                    (Some(dir), entries)
+                }
+                None if path.is_empty() => (None, Vec::new()),
+                None => return Err(Error::NotFound),
+            },
+        };
+        if path.is_empty() {
+            entries.retain(|entry| entry.name != "dev" && entry.name != "proc");
+            entries.push(DirEntry { name: "dev".into(), kind: Kind::Directory, inode: DEV_INODE });
+            let inode = procfs::inode("proc");
+            entries.push(DirEntry { name: "proc".into(), kind: Kind::Directory, inode });
+        }
+        Ok((dir, entries))
+    }
+
+    /// What `fstat` tells of the file `handle` is open on.
+    pub fn handle_metadata(&self, handle: &Handle) -> Result<Metadata, Error> {
+        match handle {
+            Handle::File { file, .. } => file.metadata(),
+            Handle::Dir { dir: Some(dir), .. } => dir.metadata(),
+            Handle::Dir { path, .. } => self.metadata(path),
+            Handle::Proc { path, .. } => Ok(procfs::Node::File(Vec::new()).metadata(path)),
+            special => Ok(self::special(special).expect("not on the disk")),
+        }
+    }
+
+    /// Where the symbolic link at `path` points, as it was given.
+    pub fn read_link(&self, path: &str) -> Result<Vec<u8>, Error> {
+        match on(path) {
+            On::Devices(name) => dev_link(name)
+                .map(|target| target.as_bytes().to_vec())
+                .ok_or(Error::InvalidArgument),
+            On::Proc(within) => match procfs::node(within, self.disk.as_ref()) {
+                Some(procfs::Node::Link(target)) => Ok(target),
+                Some(_) => Err(Error::InvalidArgument),
+                None => Err(Error::NotFound),
+            },
+            On::Disk => self.disk(path)?.read_link(path),
+        }
+    }
+
+    /// What `statfs` tells of the file system `path` is on: its type, by
+    /// Linux's number for it, and how big it is and how much is free: none
+    /// of it, for those that are only in memory.
+    pub fn statfs(&self, path: &str) -> Result<(u64, ext4::Usage), Error> {
+        const EXT4_SUPER_MAGIC: u64 = 0xEF53;
+        const PROC_SUPER_MAGIC: u64 = 0x9FA0;
+        const TMPFS_MAGIC: u64 = 0x0102_1994;
+        const RAMFS_MAGIC: u64 = 0x8584_58F6;
+        let none =
+            ext4::Usage { block_size: 4096, blocks: 0, free_blocks: 0, inodes: 0, free_inodes: 0 };
+        match on(path) {
+            On::Devices(_) => Ok((TMPFS_MAGIC, none)),
+            On::Proc(_) => Ok((PROC_SUPER_MAGIC, none)),
+            On::Disk => match self.disk.as_ref() {
+                Some(disk) => Ok((EXT4_SUPER_MAGIC, disk.usage()?)),
+                None => Ok((RAMFS_MAGIC, none)),
+            },
+        }
+    }
+
+    /// The file in /proc at `path`, as it is now: none if it isn't one.
+    pub fn proc_file(&self, path: &str) -> Option<Vec<u8>> {
+        match on(path) {
+            On::Proc(within) => match procfs::node(within, self.disk.as_ref())? {
+                procfs::Node::File(data) => Some(data),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The disk, for what only it can do: making, changing and removing
+    /// files. Neither /dev nor the root without a disk can be written.
+    pub fn disk(&self, path: &str) -> Result<&Ext4, Error> {
+        match on(path) {
+            On::Devices(_) | On::Proc(_) => Err(Error::ReadOnly),
+            On::Disk => self.disk.as_ref().ok_or(Error::ReadOnly),
+        }
+    }
+}
+
+/// Where `path`, from the directory `base` (a path from the root, as
+/// `resolve` makes them), really leads, as a path from the root: with each
+/// symbolic link on the way followed, and the last one too if `follow_last`
+/// or a `/` or `/.` comes after it, as on Linux. Every part before the last
+/// has to be a directory once followed, and the last too if a `/` or `/.`
+/// comes after it: ENOENT or ENOTDIR if one isn't. ELOOP after 40 links,
+/// where Linux gives up too.
+pub fn lookup(base: &str, path: &str, follow_last: bool) -> Result<String, i64> {
+    const ENOTDIR: i64 = 20;
+    const ELOOP: i64 = 40;
+    let tree = lock();
+    let mut here: Vec<String> = match path.starts_with('/') {
+        true => Vec::new(),
+        false => base.split('/').filter(|part| !part.is_empty()).map(String::from).collect(),
+    };
+    let mut rest: VecDeque<String> = path.split('/').map(String::from).collect();
+    let mut links = 0;
+    while let Some(part) = rest.pop_front() {
+        match part.as_str() {
+            "" | "." => continue,
+            ".." => {
+                here.pop();
+                continue;
+            }
+            _ => here.push(part),
+        }
+        let last = rest.iter().all(|part| part.is_empty() || part == ".");
+        // With a `/` or `/.` after it, it's a directory, or a link to one,
+        // followed. `file/` was taken as the file, which a typo then
+        // renamed over, emptied or removed.
+        let must_be_dir = last && !rest.is_empty();
+        if last && !follow_last && !must_be_dir {
+            break;
+        }
+        let at = here.join("/");
+        match tree.metadata(&at) {
+            // What isn't there yet can be made, at the end of a path.
+            Err(_) if last => break,
+            Err(error) => return Err(errno(error)),
+            Ok(Metadata { kind: Kind::Symlink, .. }) => {
+                links += 1;
+                if links > 40 {
+                    return Err(ELOOP);
+                }
+                let target = tree.read_link(&at).map_err(errno)?;
+                here.pop();
+                if target.starts_with(b"/") {
+                    here.clear();
+                }
+                let target = String::from_utf8_lossy(&target);
+                target.rsplit('/').for_each(|part| rest.push_front(part.into()));
+            }
+            Ok(Metadata { kind: Kind::Directory, .. }) => {}
+            Ok(_) if last && !must_be_dir => {}
+            Ok(_) => return Err(ENOTDIR),
+        }
+    }
+    Ok(here.join("/"))
+}
+
+/// `path` made absolute against the directory `base`, and with `.`, `..`
+/// and repeated slashes taken out: a path from the root, without the leading
+/// slash, as `Ext4` takes it. By the names alone, which is where a path
+/// leads if nothing on the way is a symbolic link: `lookup` follows them.
+pub fn resolve(base: &str, path: &str) -> String {
+    let mut parts: Vec<&str> = match path.starts_with('/') {
+        true => Vec::new(),
+        false => base.split('/').filter(|part| !part.is_empty()).collect(),
+    };
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            name => parts.push(name),
+        }
+    }
+    parts.join("/")
+}
+
+/// The program file at `path`, a path from the root, open for `execve` and
+/// the kernel to start, which read it a piece at a time: or the errno
+/// saying why not.
+pub fn open_program(path: &str) -> Result<Program, i64> {
+    const EACCES: i64 = 13;
+    let tree = lock();
+    let metadata = tree.metadata(path).map_err(errno)?;
+    // shortcut: anyone's execute bit will do, as there's one user.
+    if metadata.kind != Kind::File || metadata.permissions & 0o111 == 0 {
+        return Err(EACCES);
+    }
+    let file = tree.disk(path).map_err(errno)?.open(path).map_err(errno)?;
+    // Before the program is made: dropping that takes the tree.
+    drop(tree);
+    Ok(Program { file: Some(Arc::new(file)), size: metadata.size })
+}
+
+/// A program's file, open, for its segments to be read from as it's
+/// loaded, through the page cache, or mapped from it as they're touched.
+pub struct Program {
+    /// Always there but as it's dropped, which takes the tree.
+    file: Option<Arc<ext4::File>>,
+    size: u64,
+}
+
+impl elf::Source for Program {
+    fn size(&self) -> u64 {
+        self.size
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Option<()> {
+        let _tree = lock();
+        let read = crate::mm::page_cache::read(self.file.as_ref()?, offset, buf).ok()?;
+        (read == buf.len()).then_some(())
+    }
+
+    fn file(&self) -> Option<Arc<ext4::File>> {
+        self.file.clone()
+    }
+}
+
+impl Drop for Program {
+    fn drop(&mut self) {
+        // Closing a file is a call into the file system.
+        let _tree = lock();
+        drop(self.file.take());
+    }
+}
+
+/// Linux's errno for `error`.
+pub fn errno(error: ext4::Error) -> i64 {
+    use ext4::Error::*;
+    match error {
+        NotPermitted => 1,
+        NotFound => 2,
+        Io | NeedsRecovery => 5,
+        OutOfMemory | TooManyMounts => 12,
+        Busy => 16,
+        AlreadyExists => 17,
+        NotADirectory => 20,
+        IsADirectory => 21,
+        InvalidArgument => 22,
+        NoSpace => 28,
+        ReadOnly => 30,
+        NameTooLong => 36,
+        NotEmpty => 39,
+        Unsupported => 95,
+        Other(errno) => errno.into(),
+    }
+}
+
+#[test_case]
+fn paths_go_to_the_file_system_they_are_on() {
+    assert!(matches!(on("dev"), On::Devices("")));
+    assert!(matches!(on("dev/null"), On::Devices("null")));
+    assert!(matches!(on("devices/x"), On::Disk));
+    assert!(matches!(on(""), On::Disk));
+}
+
+#[test_case]
+fn paths_resolve_against_where_they_start() {
+    assert_eq!(resolve("", "/a//b/./c/"), "a/b/c");
+    assert_eq!(resolve("a/b", "c"), "a/b/c");
+    assert_eq!(resolve("a/b", "../c"), "a/c");
+    assert_eq!(resolve("a", "/../.."), "");
+    assert_eq!(resolve("", "."), "");
+}

@@ -54,7 +54,7 @@ fn boot_mode_is_the_firmware_that_ran() {
     // this is, so detection is checked against the truth, and a run meant for
     // one firmware can't quietly have tested the other.
     let mut name = [0u8; 8];
-    let len = simplos::io::fwcfg::read_file("opt/simplos/firmware", &mut name)
+    let len = simplos::drivers::fwcfg::read_file("opt/simplos/firmware", &mut name)
         .expect("tools/boot-test passes opt/simplos/firmware");
     let expected = core::str::from_utf8(&name[..len]).unwrap().trim_end_matches('\0');
     assert_ne!(simplos::boot_mode(), BootMode::Unknown);
@@ -74,7 +74,7 @@ fn kernel_is_in_the_upper_half() {
     ];
     for address in addresses {
         assert!(
-            address >= simplos::memory::PHYS_MAP_BASE as usize,
+            address >= simplos::mm::PHYS_MAP_BASE as usize,
             "{address:#x} is in the lower half"
         );
     }
@@ -85,7 +85,7 @@ fn lower_half_is_unmapped() {
     // Left to user programs. Anything the kernel still needed there would have
     // faulted long before this test, but a stray mapping wouldn't.
     let (pml4, _) = x86_64::registers::control::Cr3::read();
-    let pml4 = simplos::memory::phys_ptr(pml4.start_address()).unwrap();
+    let pml4 = simplos::mm::phys_ptr(pml4.start_address()).unwrap();
     // Safety: the active PML4, read through the physical-memory map.
     let pml4 = unsafe { &*(pml4 as *const x86_64::structures::paging::PageTable) };
     assert!(pml4.iter().take(256).all(|entry| entry.is_unused()));
@@ -94,8 +94,8 @@ fn lower_half_is_unmapped() {
 #[test_case]
 fn timer_ticks_at_timer_hz() {
     use core::sync::atomic::Ordering::Relaxed;
-    use simplos::io::hpet;
-    use simplos::io::interrupts::{idt::TIMER_COUNTER, pit::TIMER_HZ};
+    use simplos::arch::{idt::TIMER_COUNTER, pit::TIMER_HZ};
+    use simplos::drivers::hpet;
 
     // Count ticks across half a second of HPET time, a separate clock. Loose
     // bounds, since an emulated CPU can take a tick late; the PIT's power-on
@@ -115,7 +115,7 @@ fn timer_ticks_at_timer_hz() {
 
 #[test_case]
 fn ramdisk_holds_an_x86_64_executable() {
-    // tools/boot-test attaches user/probe to every test boot, as fullkernel
+    // tools/boot-test attaches user/probe to every test boot, as tools/boot
     // does to the real images. Checked by hand here; the loader will parse it.
     let elf = simplos::ramdisk().expect("the image has a ramdisk");
     assert!(elf.len() > 64, "a {}-byte ramdisk", elf.len());

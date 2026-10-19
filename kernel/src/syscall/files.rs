@@ -2,12 +2,12 @@
 //! the ext4 file system or the console.
 
 use super::{EBADF, EFAULT, EINVAL, ENOTTY, EPERM};
+use crate::fs::locks;
+use crate::fs::pipe::{self, PipeEnd, ReadError, WriteError};
 use crate::fs::{self, Device, Handle};
-use crate::locks;
-use crate::pipe::{self, PipeEnd, ReadError, WriteError};
 use crate::process;
+use crate::process::signal::{self, ERESTARTSYS, Info};
 use crate::process::{Fd, Process};
-use crate::signal::{self, ERESTARTSYS, Info};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -312,7 +312,7 @@ fn closed(process: &Process, fd: &Fd) {
 /// `flock`: lock the whole file `fd` is open on, shared (LOCK_SH) or
 /// exclusive (LOCK_EX), waiting until no one else's lock is in the way, or
 /// with LOCK_NB failing with EWOULDBLOCK; or let go of it (LOCK_UN). The lock
-/// is the open file's, as `locks.rs` says.
+/// is the open file's, as `fs/locks.rs` says.
 pub fn flock(process: &Process, fd: u64, operation: u64) -> i64 {
     const LOCK_SH: u64 = 1;
     const LOCK_EX: u64 = 2;
@@ -727,7 +727,7 @@ fn read_data(process: &Process, fd: u64, count: u64, at: Option<u64>) -> Result<
             let _tree = fs::lock();
             let from = at.unwrap_or_else(|| offset.load(Relaxed));
             let mut data = vec![0; count];
-            let read = crate::cache::read(file, from, &mut data).map_err(fs::errno)?;
+            let read = crate::mm::page_cache::read(file, from, &mut data).map_err(fs::errno)?;
             data.truncate(read);
             if at.is_none() {
                 offset.store(from + read as u64, Relaxed);
@@ -1462,7 +1462,7 @@ pub fn dup3(process: &Process, fd: u64, to: u64, flags: u64, dup2: bool) -> i64 
     })())
 }
 
-/// Write what `fs/ext4` holds in memory, small writes waiting to be made
+/// Write what `lib/ext4` holds in memory, small writes waiting to be made
 /// as one: then every change is on the disk. For `fd`'s file (`fsync`,
 /// `fdatasync`), the file system it's on (`syncfs`), or everything
 /// (`sync`): all one here.
@@ -1544,7 +1544,7 @@ pub fn fchownat(process: &Process, dirfd: u64, path: u64, uid: u64, gid: u64, fl
 /// say `UTIME_NOW`; left as they are for `UTIME_OMIT`. With no path, the
 /// file `dirfd` is open on, as `futimens` asks.
 ///
-/// shortcut: to the second, as `fs/ext4` keeps them; and not to 0, the
+/// shortcut: to the second, as `lib/ext4` keeps them; and not to 0, the
 /// start of 1970, which it takes as leaving the time as it is.
 pub fn utimensat(process: &Process, dirfd: u64, path: u64, times: u64, flags: u64) -> i64 {
     const UTIME_NOW: i64 = (1 << 30) - 1;

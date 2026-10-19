@@ -2,7 +2,7 @@
 //! in use intact.
 //!
 //! Every `Box`, `Vec` and `String` in the kernel goes through the allocator in
-//! `allocator/fixed_size_block.rs`: unsafe free lists, with a fallback heap for
+//! `mm/heap/fixed_size_block.rs`: unsafe free lists, with a fallback heap for
 //! anything too big for them. A bug there shows up as corruption somewhere
 //! else entirely, so it is caught here instead.
 
@@ -19,7 +19,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use bootloader_api::{BootInfo, entry_point};
 use core::panic::PanicInfo;
-use simplos::allocator;
+use simplos::mm::heap;
 
 entry_point!(main, config = &simplos::BOOTLOADER_CONFIG);
 
@@ -40,7 +40,7 @@ fn freed_blocks_are_reused() {
     let long_lived = Box::new(42u64);
     // More blocks in total than the heap holds: this only finishes if freeing
     // one makes room for the next.
-    for i in 0..allocator::size() / BLOCK + 1000 {
+    for i in 0..heap::size() / BLOCK + 1000 {
         let block = Box::new([i as u8; BLOCK]);
         assert_eq!(block[BLOCK - 1], i as u8);
     }
@@ -59,7 +59,7 @@ fn small_blocks_freed_can_be_had_again_in_one_piece() {
     // Three quarters of what's free, in small blocks, as the page cache's
     // index takes it; then freed, and half of it had again as one buffer,
     // which only works if the blocks went back to be joined up.
-    let free = allocator::free();
+    let free = heap::free();
     let count = free / 4 * 3 / 512;
     let mut blocks = Vec::with_capacity(count);
     for i in 0..count {

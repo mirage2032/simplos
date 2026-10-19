@@ -1,4 +1,4 @@
-//! GCC: gcc and g++, as `scripts/toolchain.sh` builds them and
+//! GCC: gcc and g++, as `user/ports/toolchain.sh` builds them and
 //! `tools/boot-test` puts them on this kernel's disk, as it does for a
 //! kernel whose name starts with `toolchain`, compiling programs on simplos
 //! that then run on it: linked dynamically, to shared libraries musl's

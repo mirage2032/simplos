@@ -10,7 +10,7 @@
 # for the library's own tests); without that line, all of them boot:
 #
 #     Test: signals tty
-#     diff --git a/kernel/src/signal.rs b/kernel/src/signal.rs
+#     diff --git a/kernel/src/process/signal.rs b/kernel/src/process/signal.rs
 #     ...
 #
 # The changes are made to the code as it is on disk, committed or not, in a
@@ -27,7 +27,7 @@ self=$root/scripts/mutants.sh
 work=$root/target/mutants
 tree=$work/tree
 out=$work/out
-boot_test=$root/tools/boot-test/target/release/boot-test
+boot_test=$root/tools/target/release/boot-test
 export SIMPLOS_FIRMWARE=${SIMPLOS_FIRMWARE:-bios}
 
 # Boot the test kernels in directory $2 until one fails, and say how that went:

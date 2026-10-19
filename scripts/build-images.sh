@@ -3,7 +3,7 @@
 # the ext4 disk that goes with them: dist/bios.img, dist/uefi.img and
 # dist/disk.qcow2.
 #
-# `fullkernel`'s build script creates both images inside its OUT_DIR and tells
+# `tools/boot`'s build script creates both images inside its OUT_DIR and tells
 # the crate where they are with UEFI_PATH / BIOS_PATH. OUT_DIR contains a cargo
 # metadata hash that changes whenever the build graph does, and stale hash
 # directories from earlier builds are left behind — this repository has a dozen
@@ -34,7 +34,7 @@ while (($#)); do
 done
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-cd "$root/fullkernel"
+cd "$root/tools/boot"
 
 # `json-render-diagnostics` keeps the machine-readable stream on stdout while
 # still printing warnings and errors as text, so a failing build reads normally.
@@ -45,9 +45,11 @@ echo "Building the disk images (profile: $profile)..." >&2
 messages=$("${build[@]}")
 
 # The build script of this crate, not of its dependencies: the bootloader's own
-# build script exports paths with similar names for the four BIOS stages.
+# build script exports paths with similar names for the four BIOS stages. By
+# its package ID as cargo writes it, whose form differs as the package's name
+# is its directory's or not.
 paths=$(
-    PACKAGE="simplos-os" python3 -c '
+    PACKAGE="$(cargo pkgid)" python3 -c '
 import json, os, sys
 
 wanted = os.environ["PACKAGE"]
@@ -59,7 +61,7 @@ for line in sys.stdin:
         continue
     if message.get("reason") != "build-script-executed":
         continue
-    if f"#{wanted}@" not in message.get("package_id", ""):
+    if message.get("package_id") != wanted:
         continue
     found.update(dict(message.get("env") or []))
 
@@ -76,18 +78,18 @@ install -m 644 "$bios" "$root/$out/bios.img"
 install -m 644 "$uefi" "$root/$out/uefi.img"
 
 # The ext4 disk, made as `cargo run` makes its own (`disk` in
-# fullkernel/src/main.rs; keep the two in step): hello.txt, the user program
+# tools/boot/src/main.rs; keep the two in step): hello.txt, the user program
 # as /bin/probe, the userland, GCC, and Rust's rustc and cargo, and
-# compinit's record of their completions (scripts/completions.sh). Unlike
+# compinit's record of their completions (user/ports/completions.sh). Unlike
 # `cargo run`, they have to build: a release without busybox, uutils, zsh,
 # vim, gcc and cargo isn't one. 2 GiB to the guest, but compressed qcow2
 # holds only what mke2fs wrote, so the file is a fraction of that, and QEMU
 # attaches it as it is: -drive format=qcow2,file=disk.qcow2. The toolchain
 # over the userland replaces what's there rather than writing through it,
 # as binutils replace busybox's links.
-"$root/scripts/userland.sh"
-"$root/scripts/toolchain.sh"
-"$root/scripts/rust.sh"
+"$root/user/ports/userland.sh"
+"$root/user/ports/toolchain.sh"
+"$root/user/ports/rust.sh"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 mkdir -p "$work/tree/bin"
@@ -96,7 +98,7 @@ cp "$probe" "$work/tree/bin/probe"
 cp -a "$root/target/userland/root/." "$work/tree/"
 cp -a --remove-destination "$root/target/toolchain/root/." "$work/tree/"
 cp -a --remove-destination "$root/target/rust/root/." "$work/tree/"
-"$root/scripts/completions.sh" "$work/tree"
+"$root/user/ports/completions.sh" "$work/tree"
 # Inode tables zeroed now, and marked so: lwext4 would zero each group's as
 # it first allocates in it, 10 MiB through the journal on the first write.
 # Zeros cost the compressed qcow2 nothing.

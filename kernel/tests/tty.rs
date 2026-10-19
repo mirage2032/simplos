@@ -18,7 +18,7 @@ use alloc::vec::Vec;
 use bootloader_api::{BootInfo, entry_point};
 use core::panic::PanicInfo;
 use simplos::fs::{self, Handle};
-use simplos::init;
+use simplos::process::init;
 use simplos::process::{self, Process};
 use simplos::thread;
 use simplos::tty::{Termios, Tty};

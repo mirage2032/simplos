@@ -18,6 +18,7 @@ use alloc::vec::Vec;
 use bootloader_api::{BootInfo, entry_point};
 use core::panic::PanicInfo;
 use simplos::fs::{self, Handle, ROOT};
+use simplos::mm::page_cache;
 use simplos::process;
 use simplos::tty::Tty;
 use spin::Mutex;
@@ -72,7 +73,7 @@ fn run_with(
 
 /// A pipe's two ends, ready for a program's descriptors.
 fn pipe() -> (Option<Arc<Handle>>, Option<Arc<Handle>>) {
-    let (read, write) = simplos::pipe::new();
+    let (read, write) = simplos::fs::pipe::new();
     (Some(Arc::new(Handle::pipe(read))), Some(Arc::new(Handle::pipe(write))))
 }
 
@@ -370,20 +371,17 @@ fn a_file_read_again_is_read_from_memory() {
     // comes from the disk; removed, it's not kept.
     let contents: String = (0..64 << 10).map(|i| char::from(b'a' + (i % 26) as u8)).collect();
     write("cached.txt", contents.as_bytes());
-    let sectors = || simplos::io::disk::list().iter().map(|disk| disk.sectors_read).sum::<u64>();
-    let kept = simplos::cache::pages();
+    let sectors =
+        || simplos::drivers::disk::list().iter().map(|disk| disk.sectors_read).sum::<u64>();
+    let kept = page_cache::pages();
     assert_eq!(run(&["cat", "/cached.txt"]), ok(&contents));
-    assert!(
-        simplos::cache::pages() >= kept + 16,
-        "{} pages kept, from {kept}",
-        simplos::cache::pages()
-    );
+    assert!(page_cache::pages() >= kept + 16, "{} pages kept, from {kept}", page_cache::pages());
     let read = sectors();
     assert_eq!(run(&["cat", "/cached.txt"]), ok(&contents));
     assert_eq!(sectors() - read, 0, "sectors read from the disk the second time");
     // Gone, it takes them with it.
     ROOT.lock().as_ref().unwrap().remove_file("cached.txt").unwrap();
-    assert!(simplos::cache::pages() <= kept, "{} pages kept, from {kept}", simplos::cache::pages());
+    assert!(page_cache::pages() <= kept, "{} pages kept, from {kept}", page_cache::pages());
 }
 
 #[test_case]
@@ -394,12 +392,12 @@ fn a_page_read_in_brings_those_around_it() {
     write("ahead.bin", &contents);
     let file = ROOT.lock().as_ref().unwrap().open("ahead.bin").unwrap();
     let tree = fs::lock();
-    let kept = |index| simplos::cache::kept(&file, index).map(simplos::cache::release).is_some();
+    let kept = |index| page_cache::kept(&file, index).map(page_cache::release).is_some();
     assert!(!kept(3));
-    simplos::cache::release(simplos::cache::page(&file, 3).unwrap());
+    page_cache::release(page_cache::page(&file, 3).unwrap());
     assert!((0..16).all(kept) && !kept(16), "not read ahead as far as it should be");
     let mut read = vec![0; 16 * 4096];
-    assert_eq!(simplos::cache::read(&file, 0, &mut read), Ok(read.len()));
+    assert_eq!(page_cache::read(&file, 0, &mut read), Ok(read.len()));
     assert!(read == contents[..read.len()], "read ahead wrong");
     drop(file);
     drop(tree);

@@ -16,8 +16,8 @@ use alloc::vec::Vec;
 use bootloader_api::{BootInfo, entry_point};
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use simplos::io::hpet;
-use simplos::memory::STACKS_START;
+use simplos::drivers::hpet;
+use simplos::mm::STACKS_START;
 use simplos::thread::{SleepLock, WaitQueue, sleep, spawn, yield_now};
 use spin::Mutex;
 

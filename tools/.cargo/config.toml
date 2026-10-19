@@ -1,0 +1,12 @@
+[unstable]
+# boot's build script takes the kernel and the user program as artifact
+# dependencies, and the vendored bootloader's own dev-dependencies use them
+# too, so even reading its manifest needs this.
+bindeps = true
+
+# Link the user program with the rust-lld that ships with the toolchain rather
+# than the host's `cc` (rustc's default for Linux targets), so producing a Linux
+# binary doesn't depend on the host's C toolchain: macOS's `cc` can't link one.
+# Through rustflags because cargo ignores `linker` for artifact dependencies.
+[target.x86_64-unknown-linux-musl]
+rustflags = ["-C", "linker=rust-lld"]
